@@ -1,0 +1,7 @@
+[project]
+name = "astrbot-plugin-gpt-image2"
+version = "0.1.0"
+description = "AstrBot GPT Image2 绘图插件"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
