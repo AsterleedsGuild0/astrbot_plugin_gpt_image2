@@ -54,13 +54,18 @@
 可以使用仓库内脚本生成 WebUI 可导入的插件压缩包：
 
 ```bash
+uv sync
 python scripts/package_plugin.py
 ```
+
+如果使用 VSCode，也可以在 Run and Debug 面板选择
+`Package AstrBot plugin` 手动触发打包。该配置使用项目 `.venv`，首次使用前请先运行
+`uv sync` 安装开发依赖。
 
 默认输出：
 
 ```text
-dist/astrbot_plugin_gpt_image2_233.zip
+dist/astrbot_plugin_gpt_image2_233-v0.0.2.zip
 ```
 
 然后在 AstrBot WebUI 的插件页面中上传该 zip 文件安装。
@@ -71,11 +76,16 @@ dist/astrbot_plugin_gpt_image2_233.zip
 
 打包脚本只包含插件交付所需文件，不会包含 `.opencode/`、`tmp/`、`astrbot_main/`、`.git/` 等本地开发材料。
 
+每次打包验证或发布前应先同步更新版本号，默认 zip 文件名会自动包含
+`metadata.yaml` 中的版本号，便于区分测试包和发布包。
+
 ## 开发
 
 ```bash
-# 安装依赖
+# 安装运行依赖和开发打包依赖
 uv sync
+
+# 仅安装插件运行依赖
 # 或
 pip install -r requirements.txt
 ```
@@ -83,6 +93,7 @@ pip install -r requirements.txt
 ## 依赖
 
 - `httpx>=0.27.0` — 异步 HTTP 客户端
+- `pyyaml>=6.0.2` — 开发依赖，仅用于本地打包读取 `metadata.yaml`
 
 ## 注意事项
 

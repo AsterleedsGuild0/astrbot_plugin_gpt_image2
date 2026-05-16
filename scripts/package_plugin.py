@@ -29,16 +29,29 @@ PACKAGE_FILES = [
 ]
 
 
-def read_plugin_name() -> str:
+def read_metadata() -> dict:
     metadata_path = ROOT / "metadata.yaml"
     with metadata_path.open("r", encoding="utf-8") as file:
         metadata = yaml.safe_load(file)
     if not isinstance(metadata, dict):
         raise ValueError("metadata.yaml must contain a YAML object")
+    return metadata
+
+
+def read_plugin_name() -> str:
+    metadata = read_metadata()
     plugin_name = metadata.get("name")
     if not isinstance(plugin_name, str) or not plugin_name.strip():
         raise ValueError("metadata.yaml must define a non-empty name")
     return plugin_name.strip()
+
+
+def read_plugin_version() -> str:
+    metadata = read_metadata()
+    version = metadata.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("metadata.yaml must define a non-empty version")
+    return version.strip()
 
 
 def build_archive(output: Path, *, flat: bool) -> Path:
@@ -66,7 +79,8 @@ def build_archive(output: Path, *, flat: bool) -> Path:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     plugin_name = read_plugin_name()
-    default_output = DIST_DIR / f"{plugin_name}.zip"
+    plugin_version = read_plugin_version()
+    default_output = DIST_DIR / f"{plugin_name}-{plugin_version}.zip"
     parser = argparse.ArgumentParser(
         description="Package the AstrBot GPT Image2 plugin into a zip archive.",
     )
