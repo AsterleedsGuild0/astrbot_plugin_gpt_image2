@@ -32,7 +32,7 @@ from .image_utils import (
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.0.1",
+    "0.0.2",
 )
 class GPTImage2Plugin(Star):
     def __init__(self, context: Context, config: dict) -> None:
