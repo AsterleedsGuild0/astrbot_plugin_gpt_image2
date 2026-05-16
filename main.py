@@ -13,7 +13,7 @@ from time import perf_counter
 import traceback
 
 from astrbot.api import logger
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Image as CompImage, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -71,6 +71,27 @@ class GPTImage2Plugin(Star):
             f"format={params.output_format} n={params.n} "
             f"compression={params.output_compression or '-'}"
         )
+
+    async def _send_processing_ack(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        action: str,
+    ) -> None:
+        """主动发送处理中提示，避免在 handler 中途 yield 打断处理流程。"""
+        try:
+            await event.send(MessageChain().message(text))
+            logger.debug(
+                "[GPTImage2] processing acknowledgement sent "
+                f"action={action} {self._event_context(event)}"
+            )
+        except Exception as e:
+            logger.warning(
+                "[GPTImage2] processing acknowledgement failed "
+                f"action={action} {self._event_context(event)} "
+                f"error={type(e).__name__}: {e}"
+            )
 
     def _get_client(self) -> GPTImageClient:
         """从配置创建 API 客户端"""
@@ -296,12 +317,10 @@ class GPTImage2Plugin(Star):
             f"{self._event_context(event)} mode={api_mode} prompt_len={len(prompt)} "
             f"{self._params_summary(params)} save_outputs={self.config.get('save_outputs', True)}"
         )
-        yield event.plain_result(
-            f"✅ 已收到文生图请求，正在使用 {api_mode} 模式生成图片，请稍候…"
-        )
-        logger.debug(
-            "[GPTImage2] draw start acknowledgement sent "
-            f"{self._event_context(event)} mode={api_mode}"
+        await self._send_processing_ack(
+            event,
+            f"✅ 已收到文生图请求，正在使用 {api_mode} 模式生成图片，请稍候…",
+            action="draw",
         )
 
         try:
@@ -399,13 +418,11 @@ class GPTImage2Plugin(Star):
             f"input_images={len(images)} {self._params_summary(params)} "
             f"save_outputs={self.config.get('save_outputs', True)}"
         )
-        yield event.plain_result(
+        await self._send_processing_ack(
+            event,
             f"✅ 已收到图像编辑请求，已识别 {len(images)} 张参考图，"
-            f"正在使用 {api_mode} 模式处理，请稍候…"
-        )
-        logger.debug(
-            "[GPTImage2] edit start acknowledgement sent "
-            f"{self._event_context(event)} mode={api_mode} input_images={len(images)}"
+            f"正在使用 {api_mode} 模式处理，请稍候…",
+            action="edit",
         )
 
         try:
