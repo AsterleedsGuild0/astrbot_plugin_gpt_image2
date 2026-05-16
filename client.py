@@ -3,6 +3,7 @@
 职责：
 - 封装 Images API 文生图与图像编辑
 - 封装 Responses API 图像生成工具调用
+- 封装 Responses API Plan 文本/图文规划调用
 - 解析 API 返回
 - 归一化错误信息
 """
@@ -498,12 +499,125 @@ class GPTImageClient:
             )
 
         if not results:
-            raw = json.dumps(data, ensure_ascii=False)[:500]
-            raise RuntimeError(
-                f"API 返回结构异常：未找到 image_generation_call 结果。原始响应：{raw}"
+            output_types = [
+                item.get("type") for item in output if isinstance(item, dict)
+            ]
+            logger.warning(
+                "[GPTImage2] Responses API parse failed no image_generation_call "
+                f"keys={list(data.keys())} output_types={output_types}"
             )
+            raise RuntimeError("API 返回结构异常：未找到 image_generation_call 结果")
 
         return results
+
+    # ── Responses API（Plan 模式） ──────────────────────────────
+
+    async def plan_responses(
+        self,
+        input_data: list[dict] | str,
+        model: str | None = None,
+        *,
+        temperature: float = 0.7,
+        max_output_tokens: int = 700,
+    ) -> str:
+        """Plan 模式专用：调用 Responses API 做文本/多模态对话。
+
+        不传 tools，避免规划阶段触发 image_generation。只解析文本输出。
+        """
+        url = f"{self.base_url}/responses"
+        body: dict[str, object] = {
+            "model": model or self.responses_model,
+            "input": input_data,
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+        }
+
+        start = perf_counter()
+        logger.info(
+            "[GPTImage2] plan Responses request start "
+            f"url={url} model={body['model']} input_items={self._input_len(input_data)} "
+            f"timeout={self.timeout}s"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    url,
+                    headers={
+                        **self._headers(),
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+        except httpx.HTTPError as e:
+            elapsed = self._elapsed_ms(start)
+            logger.warning(
+                "[GPTImage2] plan Responses request failed "
+                f"elapsed_ms={elapsed} error={type(e).__name__}: {e}"
+            )
+            raise RuntimeError(f"网络请求失败：{e}") from e
+
+        elapsed = self._elapsed_ms(start)
+        logger.debug(
+            "[GPTImage2] plan Responses response received "
+            f"status={resp.status_code} elapsed_ms={elapsed} "
+            f"response_bytes={len(resp.content)}"
+        )
+
+        if not resp.is_success:
+            logger.warning(
+                "[GPTImage2] plan Responses returned error "
+                f"status={resp.status_code} elapsed_ms={elapsed}"
+            )
+            raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
+
+        data = resp.json()
+        content = self._parse_plan_responses_text(data)
+
+        logger.info(
+            "[GPTImage2] plan Responses request success "
+            f"elapsed_ms={elapsed} response_chars={len(content)}"
+        )
+        return content
+
+    @staticmethod
+    def _input_len(input_data: list[dict] | str) -> int:
+        return len(input_data) if isinstance(input_data, list) else 1
+
+    def _parse_plan_responses_text(self, data: dict) -> str:
+        """解析 Responses API 中的 assistant 文本输出。"""
+        output_text = data.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        output = data.get("output")
+        if not isinstance(output, list) or not output:
+            raise RuntimeError("API 返回结构异常：output 为空或非数组")
+
+        texts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") not in {"output_text", "text"}:
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+
+        if texts:
+            return "\n".join(texts)
+
+        output_types = [item.get("type") for item in output if isinstance(item, dict)]
+        logger.warning(
+            "[GPTImage2] plan Responses parse failed no text output "
+            f"keys={list(data.keys())} output_types={output_types}"
+        )
+        raise RuntimeError("API 返回结构异常：未找到文本输出")
 
     # ── 工具方法 ────────────────────────────────────────────────
 

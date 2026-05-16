@@ -40,6 +40,17 @@ def get_ext(mime: str) -> str:
     return EXT_MAP.get(mime, "png")
 
 
+def guess_image_mime(image: Image) -> str:
+    """根据 Image 元数据尽量推断 MIME，失败时回退 png。"""
+    source = getattr(image, "path", "") or getattr(image, "url", "") or image.file or ""
+    source = str(source).split("?", 1)[0].lower()
+    if source.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if source.endswith(".webp"):
+        return "image/webp"
+    return "image/png"
+
+
 def extract_images_from_chain(
     chain: list,
     max_images: int = 4,
@@ -91,8 +102,9 @@ async def image_to_data_url(image: Image) -> str:
         str: data:image/{fmt};base64,{data}
     """
     b64 = await image.convert_to_base64()
-    # convert_to_base64 返回的是纯 base64，不加前缀
-    mime = get_mime("png")  # fallback
+    if b64.startswith("data:"):
+        return b64
+    mime = guess_image_mime(image)
     return f"data:{mime};base64,{b64}"
 
 

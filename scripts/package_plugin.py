@@ -21,6 +21,7 @@ PACKAGE_FILES = [
     "main.py",
     "client.py",
     "image_utils.py",
+    "plan.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",

@@ -84,5 +84,44 @@
     "description": "保存生成结果",
     "type": "bool",
     "default": true
+  },
+  "plan_enabled": {
+    "description": "启用 Plan 模式",
+    "type": "bool",
+    "default": true
+  },
+  "plan_model": {
+    "description": "Plan 模式 Responses 模型",
+    "type": "string",
+    "default": "gpt-5.4"
+  },
+  "plan_timeout": {
+    "description": "Plan 会话超时时间（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "用户空闲超时；模型思考和生图处理期间会自动延长"
+  },
+  "plan_max_rounds": {
+    "description": "Plan 最大对话轮数",
+    "type": "int",
+    "default": 6
+  },
+  "plan_use_custom_api": {
+    "description": "Plan 模式使用独立 API 配置",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后 plan_base_url 必须支持 /responses"
+  },
+  "plan_base_url": {
+    "description": "Plan 独立 Responses API Base URL",
+    "type": "string",
+    "default": "",
+    "hint": "仅在启用 plan_use_custom_api 时生效，不要以 /responses 结尾"
+  },
+  "plan_api_key": {
+    "description": "Plan 独立 API Key",
+    "type": "string",
+    "default": "",
+    "hint": "仅在启用 plan_use_custom_api 时生效"
   }
 }

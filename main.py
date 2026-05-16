@@ -3,11 +3,16 @@
 命令组 /image2：
   /image2 draw <prompt>  文生图
   /image2 edit <prompt>  从消息/引用消息提取图片并编辑
+  /image2 plan           进入 Plan 多轮会话，辅助优化生图提示词
+  /image2 plan confirm   在 Plan 中确认生成图片
+  /image2 plan quit      退出 Plan 会话
+  /image2 mode [模式]    查看/切换 API 模式（管理员）
   /image2 help           展示用法和配置摘要
 """
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from time import perf_counter
 import traceback
@@ -17,7 +22,12 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Image as CompImage, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-from astrbot.core.utils.session_waiter import SessionController, session_waiter
+from astrbot.core.utils.session_waiter import (
+    SessionController,
+    SessionFilter,
+    USER_SESSIONS,
+    session_waiter,
+)
 
 from .client import GPTImageClient, ImageParams, ImageResult
 from .image_utils import (
@@ -27,20 +37,38 @@ from .image_utils import (
     image_to_file_path,
     save_base64_to_file,
 )
+from .plan import (
+    PLAN_SYSTEM_PROMPT,
+    PlanConfig,
+    PlanSession,
+    remove_final_prompt_section,
+    parse_final_prompt,
+)
+
+
+class SenderSessionFilter(SessionFilter):
+    """按会话来源 + 发送者隔离 Plan 会话，避免群聊串扰。"""
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        sender_id = event.get_sender_id() or "-"
+        return f"{event.unified_msg_origin}:sender:{sender_id}"
 
 
 @register(
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.0.2",
+    "0.1.0",
 )
 class GPTImage2Plugin(Star):
+    PLAN_WAITER_TIMEOUT_GRACE = 10
+
     def __init__(self, context: Context, config: dict) -> None:
         super().__init__(context)
         self.config = config
         self.plugin_name = "astrbot_plugin_gpt_image2"
         self._output_dir: str | None = None
+        self._plan_sessions: dict[str, PlanSession] = {}
 
     # ── 工具方法 ────────────────────────────────────────────────
 
@@ -64,6 +92,12 @@ class GPTImage2Plugin(Star):
             f"group={event.get_group_id() or '-'} "
             f"sender={event.get_sender_id() or '-'}"
         )
+
+    @staticmethod
+    def _plan_session_id(event: AstrMessageEvent) -> str:
+        """Plan 会话 ID：按会话来源和发送者隔离，避免群聊串扰。"""
+        sender_id = event.get_sender_id() or "-"
+        return f"{event.unified_msg_origin}:sender:{sender_id}"
 
     @staticmethod
     def _params_summary(params: ImageParams) -> str:
@@ -94,8 +128,34 @@ class GPTImage2Plugin(Star):
                 f"error={type(e).__name__}: {e}"
             )
 
+    async def _send_proactive_message(
+        self,
+        session_origin: str,
+        text: str,
+        *,
+        action: str,
+    ) -> bool:
+        """主动向会话发送消息，用于超时等已脱离原始请求的场景。"""
+        try:
+            sent = await self.context.send_message(
+                session_origin,
+                MessageChain().message(text),
+            )
+            logger.debug(
+                "[GPTImage2] proactive message sent "
+                f"action={action} session_origin={session_origin} sent={sent}"
+            )
+            return bool(sent)
+        except Exception as e:
+            logger.warning(
+                "[GPTImage2] proactive message failed "
+                f"action={action} session_origin={session_origin} "
+                f"error={type(e).__name__}: {e}"
+            )
+            return False
+
     def _get_client(self) -> GPTImageClient:
-        """从配置创建 API 客户端"""
+        """从配置创建图片 API 客户端"""
         api_key = self.config.get("api_key", "")
         if not api_key:
             raise ValueError("未配置 API Key。请在插件设置中填入 API Key。")
@@ -208,6 +268,321 @@ class GPTImage2Plugin(Star):
             saved.append(item)
         return saved
 
+    # ── Plan 模式工具方法 ──────────────────────────────────────
+
+    def _get_plan_config(self) -> PlanConfig:
+        """从全局配置提取 Plan 配置。"""
+        return PlanConfig.from_config(self.config)
+
+    def _get_plan_client(self, plan_config: PlanConfig) -> GPTImageClient:
+        """创建 Plan 模式专用的 API 客户端（用于 /responses）。
+
+        当 plan_use_custom_api=true 时使用独立 api_key/base_url，
+        缺失则 fallback 到全局配置。
+        """
+        if plan_config.use_custom_api:
+            api_key = plan_config.api_key or self.config.get("api_key", "")
+            base_url = plan_config.base_url or self.config.get(
+                "base_url", "https://api.openai.com/v1"
+            )
+        else:
+            api_key = self.config.get("api_key", "")
+            base_url = self.config.get("base_url", "https://api.openai.com/v1")
+
+        if not api_key:
+            raise ValueError("未配置 API Key。请在插件设置中填入 API Key。")
+
+        return GPTImageClient(
+            api_key=api_key,
+            base_url=base_url,
+            model=self.config.get("model", "gpt-image-2"),
+            responses_model=self.config.get("responses_model", "gpt-5.5"),
+            timeout=self.config.get("timeout", 600),
+            response_format_b64_json=self.config.get("response_format_b64_json", True),
+        )
+
+    def _cleanup_plan(self, session_id: str) -> None:
+        """清理指定会话的 Plan 状态。"""
+        old = self._plan_sessions.pop(session_id, None)
+        if old is not None:
+            current_task = asyncio.current_task()
+            if (
+                old.timeout_task
+                and not old.timeout_task.done()
+                and old.timeout_task is not current_task
+            ):
+                old.timeout_task.cancel()
+            logger.debug(
+                f"[GPTImage2] plan session cleaned up session={session_id} "
+                f"rounds={old.round_count}"
+            )
+
+    @staticmethod
+    def _waiter_timeout(timeout: int) -> int:
+        """session_waiter 超时略晚于 watchdog，避免抢先吞掉主动通知。"""
+        return timeout + GPTImage2Plugin.PLAN_WAITER_TIMEOUT_GRACE
+
+    @staticmethod
+    def _stop_active_plan_waiter(session_id: str) -> bool:
+        """停止 session_waiter，释放等待中的 Plan handler。"""
+        waiter = USER_SESSIONS.get(session_id)
+        if waiter is None:
+            return False
+        controller = getattr(waiter, "session_controller", None)
+        if controller is None:
+            return False
+        controller.stop()
+        return True
+
+    def _reset_plan_timeout_watchdog(
+        self,
+        session_id: str,
+        session_origin: str,
+        timeout: int,
+    ) -> None:
+        """重置 Plan 空闲超时 watchdog，主动通知不依赖 session_waiter 返回。"""
+        session = self._plan_sessions.get(session_id)
+        if session is None:
+            return
+
+        if session.timeout_task and not session.timeout_task.done():
+            session.timeout_task.cancel()
+
+        session.timeout_generation += 1
+        generation = session.timeout_generation
+
+        async def _watchdog() -> None:
+            try:
+                logger.info(
+                    "[GPTImage2] plan timeout watchdog armed "
+                    f"session={session_id} generation={generation} timeout={timeout}s"
+                )
+                await asyncio.sleep(timeout)
+                current = self._plan_sessions.get(session_id)
+                if current is None or current.timeout_generation != generation:
+                    return
+
+                logger.info(
+                    "[GPTImage2] plan timeout watchdog fired "
+                    f"session={session_id} generation={generation} timeout={timeout}s"
+                )
+                sent = await self._send_proactive_message(
+                    session_origin,
+                    "⌛ Plan 会话等待超时，已自动退出。",
+                    action="plan-timeout-watchdog",
+                )
+                if not sent:
+                    logger.warning(
+                        "[GPTImage2] plan timeout watchdog notification not sent "
+                        f"session={session_id} session_origin={session_origin}"
+                    )
+                stopped = self._stop_active_plan_waiter(session_id)
+                logger.debug(
+                    "[GPTImage2] plan timeout watchdog stopped waiter "
+                    f"session={session_id} stopped={stopped}"
+                )
+                self._cleanup_plan(session_id)
+            except asyncio.CancelledError:
+                logger.debug(
+                    "[GPTImage2] plan timeout watchdog cancelled "
+                    f"session={session_id} generation={generation}"
+                )
+            except Exception as e:
+                logger.error(
+                    "[GPTImage2] plan timeout watchdog error "
+                    f"session={session_id} error={type(e).__name__}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
+
+        session.timeout_task = asyncio.create_task(_watchdog())
+
+    async def terminate(self) -> None:
+        """插件卸载/重载时清理 Plan 会话与 watchdog。"""
+        for session_id in list(self._plan_sessions):
+            self._cleanup_plan(session_id)
+
+    @staticmethod
+    def _has_active_plan_waiter(session_id: str) -> bool:
+        """判断 session_waiter 中是否仍有活跃 Plan 等待器。"""
+        return session_id in USER_SESSIONS
+
+    def _get_plan_processing_timeout(self, plan_config: PlanConfig) -> int:
+        """Plan 处理阶段超时，覆盖模型思考和生图耗时。"""
+        try:
+            api_timeout = int(self.config.get("timeout", 600))
+        except (TypeError, ValueError):
+            api_timeout = 600
+        return max(plan_config.timeout, api_timeout + 60)
+
+    def _get_max_input_images(self) -> int:
+        """读取最多参考图数量。"""
+        try:
+            return max(1, int(self.config.get("max_input_images", 4)))
+        except (TypeError, ValueError):
+            return 4
+
+    @staticmethod
+    def _build_plan_user_content(text: str, image_data_urls: list[str]) -> str | list:
+        """构建 Responses API 用户输入内容。"""
+        if not image_data_urls:
+            return text
+
+        content: list[dict[str, str]] = [{"type": "input_text", "text": text}]
+        for data_url in image_data_urls:
+            content.append({"type": "input_image", "image_url": data_url})
+        return content
+
+    async def _collect_plan_reference_images(
+        self,
+        event: AstrMessageEvent,
+        session: PlanSession,
+    ) -> list[str]:
+        """从 Plan 消息中收集参考图，返回本轮新增 data URLs。"""
+        remaining = self._get_max_input_images() - len(session.reference_data_urls)
+        if remaining <= 0:
+            return []
+
+        images = extract_images_from_event(event.get_messages(), remaining)
+        if not images:
+            return []
+
+        data_urls: list[str] = []
+        for idx, image in enumerate(images, start=1):
+            try:
+                data_url = await image_to_data_url(image)
+            except Exception as e:
+                logger.warning(
+                    "[GPTImage2] plan reference image conversion failed "
+                    f"{self._event_context(event)} index={idx} "
+                    f"error={type(e).__name__}: {e}"
+                )
+                continue
+            session.reference_images.append(image)
+            session.reference_data_urls.append(data_url)
+            data_urls.append(data_url)
+            logger.debug(
+                "[GPTImage2] plan reference image collected "
+                f"{self._event_context(event)} index={idx} chars={len(data_url)} "
+                f"total={len(session.reference_data_urls)}"
+            )
+        return data_urls
+
+    async def _generate_draw_chain(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        action: str = "draw",
+        reference_images: list | None = None,
+        reference_data_urls: list[str] | None = None,
+        send_ack: bool = True,
+    ) -> list:
+        """生成图片并返回消息组件链。
+
+        封装：客户端创建 → 处理中 ACK → API 调用 → 链构建。
+        失败时通过 event.send() 发送错误提示，返回空列表。
+
+        Args:
+            event: 用于回应的消息事件（draw handler 或 waiter 的 next_event）
+            prompt: 生图提示词
+            action: 日志标识，'draw' 或 'plan'
+            reference_images: 参考图 Image 组件，存在时走编辑/参考图生成路径
+            reference_data_urls: 参考图 data URLs，Responses API 使用
+            send_ack: 是否在 API 调用前主动发送处理中提示
+
+        Returns:
+            消息组件列表（可空），供 caller yield chain_result 或 event.send
+        """
+        try:
+            client = self._get_client()
+        except ValueError as e:
+            await event.send(MessageChain().message(str(e)))
+            return []
+
+        params = self._get_params()
+        api_mode = self.config.get("api_mode", "images")
+        reference_images = reference_images or []
+        reference_data_urls = reference_data_urls or []
+        reference_count = max(len(reference_images), len(reference_data_urls))
+
+        if send_ack:
+            if reference_count:
+                ack_text = (
+                    f"✅ 已识别 {reference_count} 张参考图，正在使用 {api_mode} "
+                    "模式生成图片，请稍候…"
+                )
+            else:
+                ack_text = f"✅ 正在使用 {api_mode} 模式生成图片，请稍候…"
+
+            await self._send_processing_ack(
+                event,
+                ack_text,
+                action=action,
+            )
+
+        started = perf_counter()
+        try:
+            if reference_count and api_mode == "images":
+                image_paths: list[str] = []
+                if reference_images:
+                    for idx, image in enumerate(reference_images, start=1):
+                        path = await image_to_file_path(image)
+                        image_paths.append(path)
+                        logger.debug(
+                            "[GPTImage2] reference image converted to file "
+                            f"action={action} index={idx} path={path} "
+                            f"bytes={self._file_size(path)}"
+                        )
+                else:
+                    output_dir = self._get_output_dir()
+                    for idx, data_url in enumerate(reference_data_urls, start=1):
+                        path = save_base64_to_file(data_url, output_dir, "png")
+                        image_paths.append(path)
+                        logger.debug(
+                            "[GPTImage2] reference data URL saved to file "
+                            f"action={action} index={idx} path={path} "
+                            f"bytes={self._file_size(path)}"
+                        )
+                results = await client.edit_images_api(prompt, image_paths, params)
+            elif reference_count:
+                data_urls = list(reference_data_urls)
+                if not data_urls:
+                    for idx, image in enumerate(reference_images, start=1):
+                        data_url = await image_to_data_url(image)
+                        data_urls.append(data_url)
+                        logger.debug(
+                            "[GPTImage2] reference image converted to data URL "
+                            f"action={action} index={idx} chars={len(data_url)}"
+                        )
+                results = await client.edit_responses_api(prompt, data_urls, params)
+            elif api_mode == "images":
+                results = await client.generate_images_api(prompt, params)
+            else:
+                results = await client.generate_responses_api(prompt, params)
+        except RuntimeError as e:
+            logger.warning(f"[GPTImage2] draw API failed action={action} error={e}")
+            await event.send(MessageChain().message(f"GPT Image2 调用失败：{e}"))
+            return []
+        except Exception as e:
+            logger.error(
+                "[GPTImage2] draw unexpected error "
+                f"action={action} error={type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            await event.send(MessageChain().message(f"GPT Image2 调用失败：{e}"))
+            return []
+
+        logger.info(
+            "[GPTImage2] draw API success "
+            f"action={action} results={len(results)} elapsed_ms={self._elapsed_ms(started)}"
+        )
+
+        chain = self._build_image_chain(results, params)
+        if not chain:
+            await event.send(
+                MessageChain().message("GPT Image2 未返回任何可显示的图片。")
+            )
+        return chain
+
     # ── 命令组 ──────────────────────────────────────────────────
 
     @filter.command_group("image2")
@@ -224,7 +599,9 @@ class GPTImage2Plugin(Star):
             "命令：",
             "  /image2 draw <提示词>    文生图",
             "  /image2 edit <提示词>    编辑图片（附带图片或引用图片消息）",
-            "  /image2 plan draw        进入 Plan 模式原型（多轮消息验证）",
+            "  /image2 plan             进入 Plan 多轮图文会话，辅助优化生图提示词",
+            "  /image2 plan confirm     在 Plan 中确认生成（自动带参考图）",
+            "  /image2 plan quit        退出 Plan 会话（cancel 也可用）",
             "  /image2 mode [模式]      查看/切换 API 模式（管理员）",
             "  /image2 help             显示本帮助",
             "",
@@ -238,6 +615,8 @@ class GPTImage2Plugin(Star):
         lines.append(f"  API 模式        : {cfg.get('api_mode', 'images')}")
         lines.append(f"  Images 模型     : {cfg.get('model', 'gpt-image-2')}")
         lines.append(f"  Responses 模型  : {cfg.get('responses_model', 'gpt-5.5')}")
+        lines.append(f"  Plan 模型       : {cfg.get('plan_model', 'gpt-5.4')}")
+        lines.append(f"  Plan 空闲超时   : {cfg.get('plan_timeout', 300)} 秒")
         lines.append(f"  图片尺寸        : {cfg.get('size', 'auto')}")
         lines.append(f"  图片质量        : {cfg.get('quality', 'auto')}")
         lines.append(f"  输出格式        : {cfg.get('output_format', 'png')}")
@@ -290,93 +669,391 @@ class GPTImage2Plugin(Star):
             f"API 模式已从 {current_mode} 切换为 {next_mode}，{suffix}"
         )
 
-    @image2.group("plan")
-    def plan() -> None:
-        """图像设计 Plan 模式命令组"""
-        pass
+    # ── Plan 模式 ────────────────────────────────────────────
 
-    @plan.command("draw")
-    async def plan_draw(self, event: AstrMessageEvent):
-        """进入 Plan 模式原型：验证同会话普通消息接管"""
+    @image2.command("plan")
+    async def plan(self, event: AstrMessageEvent, action: str | None = None):
+        """Plan 多轮图文会话：辅助用户优化生图提示词"""
+        action = str(action or "").strip().lower()
+        session_id = self._plan_session_id(event)
+
+        if action == "confirm":
+            if self._has_active_plan_waiter(session_id):
+                return
+            if session_id in self._plan_sessions:
+                self._cleanup_plan(session_id)
+                yield event.plain_result(
+                    "Plan 会话已失效，请重新使用 /image2 plan 进入。"
+                )
+            else:
+                yield event.plain_result(
+                    "当前没有进行中的 Plan 会话。请先使用 /image2 plan 进入。"
+                )
+            return
+
+        if action in {"quit", "cancel"}:
+            if self._has_active_plan_waiter(session_id):
+                return
+            had_session = session_id in self._plan_sessions
+            self._cleanup_plan(session_id)
+            logger.info(
+                "[GPTImage2] plan quit external trigger "
+                f"{self._event_context(event)} action={action} had_session={had_session}"
+            )
+            yield event.plain_result(
+                "已尝试退出 Plan 会话。如果没有响应中的 Plan 会话，则当前无需操作。"
+            )
+            return
+
+        if action:
+            yield event.plain_result(
+                "Plan 子命令无效。用法：/image2 plan、/image2 plan confirm、"
+                "/image2 plan quit"
+            )
+            return
+
         if not bool(self.config.get("plan_enabled", True)):
             yield event.plain_result("Plan 模式当前未启用。")
             return
 
+        plan_config = self._get_plan_config()
+        processing_timeout = self._get_plan_processing_timeout(plan_config)
+        owner_sender_id = event.get_sender_id() or ""
+
+        # 防止同一会话重复进入
+        if session_id in self._plan_sessions:
+            yield event.plain_result(
+                "当前会话已有进行中的 Plan 会话。"
+                "请先使用 /image2 plan confirm 或 /image2 plan quit 结束当前会话。"
+            )
+            return
+
+        # 提前验证 Plan 客户端配置（快速失败）
         try:
-            plan_timeout = int(self.config.get("plan_timeout", 300))
-        except (TypeError, ValueError):
-            plan_timeout = 300
-        plan_timeout = max(30, plan_timeout)
+            plan_client = self._get_plan_client(plan_config)
+        except ValueError as e:
+            yield event.plain_result(str(e))
+            return
+
+        # 创建会话，并记录随 plan 命令附带/引用的参考图。
+        session = PlanSession(owner_sender_id=owner_sender_id)
+        self._plan_sessions[session_id] = session
+        await self._collect_plan_reference_images(event, session)
+        self._reset_plan_timeout_watchdog(
+            session_id,
+            event.unified_msg_origin,
+            plan_config.timeout,
+        )
 
         logger.info(
-            "[GPTImage2] plan prototype start "
-            f"{self._event_context(event)} goal=draw timeout={plan_timeout}s"
-        )
-        yield event.plain_result(
-            "🧠 已进入 Plan 模式原型（文生图）。\n"
-            "请直接发送下一条普通文本消息，我会验证是否能在同一会话中接住它。\n"
-            "发送 /image2 plan cancel 可退出本轮原型验证。"
+            "[GPTImage2] plan start "
+            f"{self._event_context(event)} timeout={plan_config.timeout}s "
+            f"processing_timeout={processing_timeout}s "
+            f"max_rounds={plan_config.max_rounds} model={plan_config.model}"
         )
 
-        @session_waiter(timeout=plan_timeout, record_history_chains=False)
+        await event.send(
+            MessageChain().message(
+                "🧠 已进入 Plan 模式。\n"
+                "请直接发送文字或参考图描述你想要的图像，我会用 Responses API 帮你优化提示词。\n"
+                f"当前已记录 {len(session.reference_data_urls)} 张参考图。\n"
+                f"空闲超过 {plan_config.timeout} 秒会自动退出 Plan 模式。\n"
+                "发送 /image2 plan confirm 用当前提示词生成图片。\n"
+                "发送 /image2 plan quit 退出。"
+            )
+        )
+
+        @session_waiter(
+            timeout=self._waiter_timeout(plan_config.timeout),
+            record_history_chains=False,
+        )
         async def plan_waiter(
             controller: SessionController,
             next_event: AstrMessageEvent,
         ) -> None:
             text = next_event.message_str.strip()
-            logger.info(
-                "[GPTImage2] plan prototype received follow-up "
-                f"{self._event_context(next_event)} text_len={len(text)}"
-            )
-
-            if not text:
-                await next_event.send(
-                    MessageChain().message("请发送一段文字描述你的图像需求。")
-                )
-                controller.keep(timeout=plan_timeout, reset_timeout=True)
+            next_session_id = self._plan_session_id(next_event)
+            if next_session_id != session_id:
                 return
 
-            if text.lower() in {"/image2 plan cancel", "image2 plan cancel"}:
+            # 收到同一 Plan 会话内的任何输入后，先延长 watchdog，避免处理阶段误报空闲超时。
+            self._reset_plan_timeout_watchdog(
+                session_id,
+                next_event.unified_msg_origin,
+                processing_timeout,
+            )
+
+            # ── 退出 ────────────────────────────────────────
+            if text.lower() in {
+                "/image2 plan quit",
+                "image2 plan quit",
+                "/image2 plan cancel",
+                "image2 plan cancel",
+            }:
+                await next_event.send(MessageChain().message("✅ 已退出 Plan 模式。"))
+                self._cleanup_plan(session_id)
+                controller.stop()
+                return
+
+            # ── 确认生成 ────────────────────────────────────
+            if text.lower() in {"/image2 plan confirm", "image2 plan confirm"}:
+                session = self._plan_sessions.get(session_id)
+                if session and session.final_prompt:
+                    controller.keep(
+                        timeout=processing_timeout,
+                        reset_timeout=True,
+                    )
+                    self._reset_plan_timeout_watchdog(
+                        session_id,
+                        next_event.unified_msg_origin,
+                        processing_timeout,
+                    )
+                    reference_count = max(
+                        len(session.reference_images),
+                        len(session.reference_data_urls),
+                    )
+                    api_mode = self.config.get("api_mode", "images")
+                    if reference_count:
+                        confirm_ack = (
+                            "✅ 已确认 Plan 提示词，"
+                            f"正在使用 {api_mode} 模式携带 {reference_count} 张参考图生成图片，"
+                            "请稍候…"
+                        )
+                    else:
+                        confirm_ack = (
+                            "✅ 已确认 Plan 提示词，"
+                            f"正在使用 {api_mode} 模式生成图片，请稍候…"
+                        )
+                    await self._send_processing_ack(
+                        next_event,
+                        confirm_ack,
+                        action="plan-confirm",
+                    )
+                    chain = await self._generate_draw_chain(
+                        next_event,
+                        session.final_prompt,
+                        action="plan",
+                        reference_images=session.reference_images,
+                        reference_data_urls=session.reference_data_urls,
+                        send_ack=False,
+                    )
+                    if chain:
+                        await next_event.send(MessageChain(chain=chain))
+                else:
+                    await next_event.send(
+                        MessageChain().message(
+                            "还没有准备好的提示词。"
+                            "请继续描述你的图像需求，"
+                            "或发送 /image2 plan quit 退出。"
+                        )
+                    )
+                    controller.keep(
+                        timeout=self._waiter_timeout(plan_config.timeout),
+                        reset_timeout=True,
+                    )
+                    self._reset_plan_timeout_watchdog(
+                        session_id,
+                        next_event.unified_msg_origin,
+                        plan_config.timeout,
+                    )
+                    return
+                self._cleanup_plan(session_id)
+                controller.stop()
+                return
+
+            # ── 其他 /image2 命令：拦截提示 ─────────────────
+            if text.lower().startswith("/image2") or text.lower().startswith("image2"):
                 await next_event.send(
-                    MessageChain().message("✅ 已退出 Plan 模式原型。")
+                    MessageChain().message(
+                        "当前处于 Plan 会话中。"
+                        "请先使用 /image2 plan confirm 生成图片"
+                        "或 /image2 plan quit 退出。"
+                    )
+                )
+                controller.keep(
+                    timeout=self._waiter_timeout(plan_config.timeout),
+                    reset_timeout=True,
+                )
+                self._reset_plan_timeout_watchdog(
+                    session_id,
+                    next_event.unified_msg_origin,
+                    plan_config.timeout,
+                )
+                return
+
+            # ── 普通文本/参考图：调用 Responses API 规划 ─────
+            session = self._plan_sessions.get(session_id)
+            if session is None:
+                await next_event.send(
+                    MessageChain().message(
+                        "Plan 会话已失效，请重新使用 /image2 plan 进入。"
+                    )
                 )
                 controller.stop()
                 return
 
-            await next_event.send(
-                MessageChain().message(
-                    "✅ Plan 模式原型已接收到你的补充：\n"
-                    f"{text}\n\n"
-                    "本轮只验证同会话普通消息接管，暂未调用模型或生成图片。"
-                )
+            controller.keep(timeout=processing_timeout, reset_timeout=True)
+            self._reset_plan_timeout_watchdog(
+                session_id,
+                next_event.unified_msg_origin,
+                processing_timeout,
             )
-            controller.stop()
+
+            new_reference_urls = await self._collect_plan_reference_images(
+                next_event,
+                session,
+            )
+
+            # ── 空文本 ──────────────────────────────────────
+            if not text and not new_reference_urls:
+                await next_event.send(
+                    MessageChain().message("请发送文字描述或参考图来说明你的图像需求。")
+                )
+                controller.keep(
+                    timeout=self._waiter_timeout(plan_config.timeout),
+                    reset_timeout=True,
+                )
+                self._reset_plan_timeout_watchdog(
+                    session_id,
+                    next_event.unified_msg_origin,
+                    plan_config.timeout,
+                )
+                return
+
+            if not text:
+                text = (
+                    f"我刚刚发送了 {len(new_reference_urls)} 张参考图。"
+                    "请结合这些参考图继续帮我明确图像需求。"
+                )
+
+            session.round_count += 1
+
+            # 构造 Responses API input
+            messages = list(session.history)
+            if not messages:
+                messages.append({"role": "developer", "content": PLAN_SYSTEM_PROMPT})
+
+            image_urls_for_message = new_reference_urls
+            if not session.history and session.reference_data_urls:
+                image_urls_for_message = list(session.reference_data_urls)
+
+            user_message = {
+                "role": "user",
+                "content": self._build_plan_user_content(text, image_urls_for_message),
+            }
+            messages.append(user_message)
+
+            # 检查轮数上限
+            reached_max = session.round_count >= plan_config.max_rounds
+            if reached_max:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Please provide the final image generation prompt "
+                            "using [FINAL_PROMPT] format now."
+                        ),
+                    }
+                )
+
+            # 调用 Responses API 规划
+            try:
+                reply = await plan_client.plan_responses(
+                    messages,
+                    model=plan_config.model,
+                )
+            except RuntimeError as e:
+                logger.warning(
+                    "[GPTImage2] plan Responses failed "
+                    f"{self._event_context(next_event)} round={session.round_count} "
+                    f"error={e}"
+                )
+                await next_event.send(
+                    MessageChain().message(
+                        f"模型调用失败：{e}\n请重试或发送 /image2 plan quit 退出。"
+                    )
+                )
+                controller.keep(
+                    timeout=self._waiter_timeout(plan_config.timeout),
+                    reset_timeout=True,
+                )
+                self._reset_plan_timeout_watchdog(
+                    session_id,
+                    next_event.unified_msg_origin,
+                    plan_config.timeout,
+                )
+                return
+
+            # 解析 final prompt
+            final_prompt = parse_final_prompt(reply)
+            session.history = messages + [{"role": "assistant", "content": reply}]
+            if final_prompt:
+                session.final_prompt = final_prompt
+
+            # 构建展示文本：用户说明保持中文，最终 prompt 可中英混合，
+            # 需要出现在图中的文字应保留原文。
+            display = remove_final_prompt_section(reply)
+            if final_prompt:
+                summary = display or "我已根据你的描述和参考图整理好图像需求。"
+                display = (
+                    f"✅ 我已整理好图像需求。\n\n{summary}\n\n"
+                    f"将用于生成的提示词：\n{final_prompt}\n\n"
+                    "发送 /image2 plan confirm 生成图片，"
+                    "或 /image2 plan quit 退出。"
+                )
+            elif reached_max:
+                display += (
+                    "\n\n已达到最大对话轮数。"
+                    "但模型还没有给出可确认的最终提示词。"
+                    "请继续补充一句关键信息让我再次整理，"
+                    "或发送 /image2 plan quit 退出。"
+                )
+
+            await next_event.send(MessageChain().message(display))
+            controller.keep(
+                timeout=self._waiter_timeout(plan_config.timeout),
+                reset_timeout=True,
+            )
+            self._reset_plan_timeout_watchdog(
+                session_id,
+                next_event.unified_msg_origin,
+                plan_config.timeout,
+            )
 
         try:
-            await plan_waiter(event)
+            await plan_waiter(event, session_filter=SenderSessionFilter())
         except TimeoutError:
             logger.info(
-                "[GPTImage2] plan prototype timeout "
-                f"{self._event_context(event)} timeout={plan_timeout}s"
+                "[GPTImage2] plan timeout "
+                f"{self._event_context(event)} timeout={plan_config.timeout}s"
             )
-            yield event.plain_result("⌛ Plan 模式原型等待超时，已自动退出。")
+            sent = await self._send_proactive_message(
+                event.unified_msg_origin,
+                "⌛ Plan 会话等待超时，已自动退出。",
+                action="plan-timeout",
+            )
+            if not sent:
+                await event.send(
+                    MessageChain().message("⌛ Plan 会话等待超时，已自动退出。")
+                )
         except Exception as e:
             logger.error(
-                "[GPTImage2] plan prototype error "
+                "[GPTImage2] plan error "
                 f"{self._event_context(event)} error={type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}"
             )
-            yield event.plain_result(f"Plan 模式原型发生错误：{e}")
+            sent = await self._send_proactive_message(
+                event.unified_msg_origin,
+                f"Plan 模式发生错误：{e}",
+                action="plan-error",
+            )
+            if not sent:
+                await event.send(MessageChain().message(f"Plan 模式发生错误：{e}"))
         finally:
+            self._cleanup_plan(session_id)
             event.stop_event()
 
-    @plan.command("cancel")
-    async def plan_cancel(self, event: AstrMessageEvent):
-        """取消 Plan 模式原型"""
-        yield event.plain_result(
-            "如果当前处于 Plan 会话中，请直接发送 /image2 plan cancel 退出；"
-            "如果没有响应中的 Plan 会话，则当前无需取消。"
-        )
+    # ── 文生图 / 编辑 ──────────────────────────────────────────
 
     @image2.command("draw")
     async def draw(self, event: AstrMessageEvent):
@@ -393,56 +1070,16 @@ class GPTImage2Plugin(Star):
             return
 
         prompt = prompt.strip()
-
-        try:
-            client = self._get_client()
-        except ValueError as e:
-            yield event.plain_result(str(e))
-            return
-
-        params = self._get_params()
         api_mode = self.config.get("api_mode", "images")
+
         logger.info(
             "[GPTImage2] draw start "
             f"{self._event_context(event)} mode={api_mode} prompt_len={len(prompt)} "
-            f"{self._params_summary(params)} save_outputs={self.config.get('save_outputs', True)}"
-        )
-        await self._send_processing_ack(
-            event,
-            f"✅ 已收到文生图请求，正在使用 {api_mode} 模式生成图片，请稍候…",
-            action="draw",
+            f"{self._params_summary(self._get_params())} "
+            f"save_outputs={self.config.get('save_outputs', True)}"
         )
 
-        try:
-            if api_mode == "images":
-                results = await client.generate_images_api(prompt, params)
-            else:
-                results = await client.generate_responses_api(prompt, params)
-        except RuntimeError as e:
-            logger.warning(
-                "[GPTImage2] draw API failed "
-                f"{self._event_context(event)} mode={api_mode} "
-                f"elapsed_ms={self._elapsed_ms(started)} error={e}"
-            )
-            yield event.plain_result(f"GPT Image2 调用失败：{e}")
-            return
-        except Exception as e:
-            logger.error(
-                "[GPTImage2] draw unexpected error "
-                f"{self._event_context(event)} mode={api_mode} "
-                f"elapsed_ms={self._elapsed_ms(started)} error={type(e).__name__}: {e}\n"
-                f"{traceback.format_exc()}"
-            )
-            yield event.plain_result(f"GPT Image2 调用失败：{e}")
-            return
-
-        logger.info(
-            "[GPTImage2] draw API success "
-            f"{self._event_context(event)} mode={api_mode} results={len(results)} "
-            f"elapsed_ms={self._elapsed_ms(started)}"
-        )
-
-        chain = self._build_image_chain(results, params)
+        chain = await self._generate_draw_chain(event, prompt, action="draw")
         if chain:
             logger.info(
                 "[GPTImage2] draw reply ready "
@@ -453,9 +1090,8 @@ class GPTImage2Plugin(Star):
         else:
             logger.warning(
                 "[GPTImage2] draw returned no displayable images "
-                f"{self._event_context(event)} results={len(results)}"
+                f"{self._event_context(event)} prompt_len={len(prompt)}"
             )
-            yield event.plain_result("GPT Image2 未返回任何可显示的图片。")
 
     @image2.command("edit")
     async def edit(self, event: AstrMessageEvent):
