@@ -1,24 +1,350 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
+"""GPT Image2 AstrBot 插件
+
+命令组 /image2：
+  /image2 draw <prompt>  文生图
+  /image2 edit <prompt>  从消息/引用消息提取图片并编辑
+  /image2 help           展示用法和配置摘要
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
 from astrbot.api import logger
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.message_components import Image as CompImage, Plain
+from astrbot.api.star import Context, Star, register
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+from .client import GPTImageClient, ImageParams, ImageResult
+from .image_utils import (
+    ensure_output_dir,
+    extract_images_from_event,
+    image_to_data_url,
+    image_to_file_path,
+    save_base64_to_file,
+)
+
+
+@register(
+    "gpt_image2",
+    "233",
+    "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
+    "0.0.1",
+)
+class GPTImage2Plugin(Star):
+    def __init__(self, context: Context, config: dict) -> None:
         super().__init__(context)
+        self.config = config
+        self.plugin_name = "astrbot_plugin_gpt_image2"
+        self._output_dir: str | None = None
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+    # ── 工具方法 ────────────────────────────────────────────────
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+    def _get_client(self) -> GPTImageClient:
+        """从配置创建 API 客户端"""
+        api_key = self.config.get("api_key", "")
+        if not api_key:
+            raise ValueError("未配置 API Key。请在插件设置中填入 API Key。")
 
-    async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        return GPTImageClient(
+            api_key=api_key,
+            base_url=self.config.get("base_url", "https://api.openai.com/v1"),
+            model=self.config.get("model", "gpt-image-2"),
+            responses_model=self.config.get("responses_model", "gpt-5.5"),
+            timeout=self.config.get("timeout", 600),
+            response_format_b64_json=self.config.get("response_format_b64_json", True),
+        )
+
+    def _get_params(self) -> ImageParams:
+        """从配置创建参数模型"""
+        return ImageParams(
+            size=self.config.get("size", "auto"),
+            quality=self.config.get("quality", "auto"),
+            output_format=self.config.get("output_format", "png"),
+            moderation=self.config.get("moderation", "auto"),
+            n=self.config.get("n", 1),
+            output_compression=self._get_output_compression(),
+        )
+
+    def _get_output_compression(self) -> int | None:
+        """读取输出压缩配置；0 或空值表示不发送。"""
+        value = self.config.get("output_compression", 0)
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _get_output_dir(self) -> str:
+        """获取输出目录（惰性创建）"""
+        if self._output_dir is None:
+            plugin_name = getattr(self, "name", self.plugin_name)
+            plugin_data_dir = (
+                Path(get_astrbot_data_path()) / "plugin_data" / plugin_name
+            )
+            self._output_dir = ensure_output_dir(str(plugin_data_dir))
+        return self._output_dir
+
+    def _extract_prompt(self, event: AstrMessageEvent, subcommand: str) -> str:
+        """从原始消息中提取子命令后的完整提示词。"""
+        message = event.message_str.strip()
+        prefixes = (
+            f"/image2 {subcommand}",
+            f"image2 {subcommand}",
+        )
+        for prefix in prefixes:
+            if message.startswith(prefix):
+                return message[len(prefix) :].strip()
+
+        parts = message.split(maxsplit=2)
+        if len(parts) >= 3 and parts[-2] == subcommand:
+            return parts[-1].strip()
+        return ""
+
+    def _save_config(self) -> bool:
+        """保存插件配置。"""
+        save_config = getattr(self.config, "save_config", None)
+        if callable(save_config):
+            save_config()
+            return True
+        return False
+
+    def _save_results(
+        self,
+        results: list[ImageResult],
+        params: ImageParams,
+    ) -> list[dict]:
+        """保存结果并返回 (filepath_or_url, revised_prompt) 列表
+
+        如果 save_outputs 为 True 且结果包含 b64_json，先保存到本地。
+        URL 结果直接返回 URL。
+        """
+        save = bool(self.config.get("save_outputs", True))
+        output_dir = self._get_output_dir() if save else None
+        out_fmt = params.output_format
+
+        saved: list[dict] = []
+        for r in results:
+            item: dict[str, str | None] = {
+                "path": None,
+                "url": None,
+                "revised_prompt": r.revised_prompt,
+            }
+            if r.b64_json and save and output_dir:
+                filepath = save_base64_to_file(r.b64_json, output_dir, out_fmt)
+                item["path"] = filepath
+            elif r.b64_json and not save:
+                item["b64_json"] = r.b64_json
+            elif r.url:
+                item["url"] = r.url
+            saved.append(item)
+        return saved
+
+    # ── 命令组 ──────────────────────────────────────────────────
+
+    @filter.command_group("image2")
+    def image2() -> None:
+        """GPT Image2 绘图命令组"""
+        pass
+
+    @image2.command("help")
+    async def help(self, event: AstrMessageEvent):
+        """展示用法和配置摘要"""
+        lines = [
+            "📋 GPT Image2 插件使用说明",
+            "",
+            "命令：",
+            "  /image2 draw <提示词>    文生图",
+            "  /image2 edit <提示词>    编辑图片（附带图片或引用图片消息）",
+            "  /image2 mode [模式]      查看/切换 API 模式（管理员）",
+            "  /image2 help             显示本帮助",
+            "",
+            "当前配置：",
+        ]
+
+        cfg = self.config
+        api_key_set = "已设置" if cfg.get("api_key") else "未设置"
+        lines.append(f"  API Key         : {api_key_set}")
+        lines.append(f"  Base URL        : {cfg.get('base_url', '未设置')}")
+        lines.append(f"  API 模式        : {cfg.get('api_mode', 'images')}")
+        lines.append(f"  Images 模型     : {cfg.get('model', 'gpt-image-2')}")
+        lines.append(f"  Responses 模型  : {cfg.get('responses_model', 'gpt-5.5')}")
+        lines.append(f"  图片尺寸        : {cfg.get('size', 'auto')}")
+        lines.append(f"  图片质量        : {cfg.get('quality', 'auto')}")
+        lines.append(f"  输出格式        : {cfg.get('output_format', 'png')}")
+        lines.append(f"  生成数量 n      : {cfg.get('n', 1)}")
+        lines.append(
+            f"  保存输出        : {'是' if cfg.get('save_outputs', True) else '否'}"
+        )
+
+        yield event.plain_result("\n".join(lines))
+
+    @image2.command("mode")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def mode(self, event: AstrMessageEvent, mode: str | None = None):
+        """查看或切换 API 模式（管理员）"""
+        current_mode = self.config.get("api_mode", "images")
+        if mode is None or not str(mode).strip():
+            yield event.plain_result(
+                "当前 API 模式："
+                f"{current_mode}\n"
+                "可用模式：images / responses\n"
+                "用法：/image2 mode <images|responses>"
+            )
+            return
+
+        next_mode = str(mode).strip().lower()
+        if next_mode not in {"images", "responses"}:
+            yield event.plain_result(
+                "API 模式无效。可用模式：images / responses\n"
+                "用法：/image2 mode <images|responses>"
+            )
+            return
+
+        if next_mode == current_mode:
+            yield event.plain_result(f"API 模式已经是：{current_mode}")
+            return
+
+        self.config["api_mode"] = next_mode
+        saved = self._save_config()
+        suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
+        yield event.plain_result(
+            f"API 模式已从 {current_mode} 切换为 {next_mode}，{suffix}"
+        )
+
+    @image2.command("draw")
+    async def draw(self, event: AstrMessageEvent):
+        """文生图"""
+        prompt = self._extract_prompt(event, "draw")
+        if not prompt or not prompt.strip():
+            yield event.plain_result(
+                "请提供图片描述提示词。用法：/image2 draw <提示词>"
+            )
+            return
+
+        prompt = prompt.strip()
+
+        try:
+            client = self._get_client()
+        except ValueError as e:
+            yield event.plain_result(str(e))
+            return
+
+        params = self._get_params()
+        api_mode = self.config.get("api_mode", "images")
+
+        try:
+            if api_mode == "images":
+                results = await client.generate_images_api(prompt, params)
+            else:
+                results = await client.generate_responses_api(prompt, params)
+        except RuntimeError as e:
+            yield event.plain_result(f"GPT Image2 调用失败：{e}")
+            return
+        except Exception as e:
+            logger.error(f"GPT Image2 draw 异常: {e}")
+            yield event.plain_result(f"GPT Image2 调用失败：{e}")
+            return
+
+        chain = self._build_image_chain(results, params)
+        if chain:
+            yield event.chain_result(chain)
+        else:
+            yield event.plain_result("GPT Image2 未返回任何可显示的图片。")
+
+    @image2.command("edit")
+    async def edit(self, event: AstrMessageEvent):
+        """从当前消息或引用消息提取图片后编辑"""
+        prompt = self._extract_prompt(event, "edit")
+        if not prompt or not prompt.strip():
+            yield event.plain_result(
+                "请提供编辑提示词。用法：/image2 edit <提示词>"
+                "（请附带图片或引用包含图片的消息）"
+            )
+            return
+
+        prompt = prompt.strip()
+        messages = event.get_messages()
+        max_input = int(self.config.get("max_input_images", 4))
+        images = extract_images_from_event(messages, max_input)
+
+        if not images:
+            yield event.plain_result(
+                "没有找到可编辑的图片。请附带图片，"
+                "或引用一条包含图片的消息后使用 /image2 edit <提示词>。"
+            )
+            return
+
+        try:
+            client = self._get_client()
+        except ValueError as e:
+            yield event.plain_result(str(e))
+            return
+
+        params = self._get_params()
+        api_mode = self.config.get("api_mode", "images")
+
+        try:
+            if api_mode == "images":
+                # Images API 编辑：使用本地文件路径
+                image_paths: list[str] = []
+                for img in images:
+                    path = await image_to_file_path(img)
+                    image_paths.append(path)
+                results = await client.edit_images_api(prompt, image_paths, params)
+            else:
+                # Responses API 编辑：使用 data URL
+                data_urls: list[str] = []
+                for img in images:
+                    data_url = await image_to_data_url(img)
+                    data_urls.append(data_url)
+                results = await client.edit_responses_api(prompt, data_urls, params)
+        except RuntimeError as e:
+            yield event.plain_result(f"GPT Image2 调用失败：{e}")
+            return
+        except Exception as e:
+            logger.error(f"GPT Image2 edit 异常: {e}")
+            yield event.plain_result(f"GPT Image2 调用失败：{e}")
+            return
+
+        chain = self._build_image_chain(results, params)
+        if chain:
+            yield event.chain_result(chain)
+        else:
+            yield event.plain_result("GPT Image2 未返回任何可显示的图片。")
+
+    # ── 回复构建 ────────────────────────────────────────────────
+
+    def _build_image_chain(
+        self,
+        results: list[ImageResult],
+        params: ImageParams,
+    ) -> list:
+        """构建包含图片和 revised_prompt 的消息链"""
+        if not results:
+            return []
+
+        saved = self._save_results(results, params)
+        chain: list = []
+
+        for idx, item in enumerate(saved):
+            rp = item.get("revised_prompt")
+            if rp:
+                chain.append(Plain(f"📝 改写提示词：{rp}\n"))
+
+            path = item.get("path")
+            url = item.get("url")
+            b64 = item.get("b64_json")
+
+            if path:
+                chain.append(CompImage.fromFileSystem(path))
+            elif url:
+                chain.append(CompImage.fromURL(url))
+            elif b64:
+                chain.append(CompImage.fromBase64(b64))
+            else:
+                chain.append(Plain(f"[第 {idx + 1} 张图片：无法获取]"))
+                continue
+
+        return chain
