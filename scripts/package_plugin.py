@@ -41,7 +41,7 @@ def read_plugin_name() -> str:
     return plugin_name.strip()
 
 
-def build_archive(output: Path, *, include_root_dir: bool) -> Path:
+def build_archive(output: Path, *, flat: bool) -> Path:
     plugin_name = read_plugin_name()
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -50,9 +50,15 @@ def build_archive(output: Path, *, include_root_dir: bool) -> Path:
         raise FileNotFoundError(f"Missing package file(s): {', '.join(missing)}")
 
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        if not flat:
+            # AstrBot v4.24.2 WebUI upload installation treats the first zip entry
+            # as the extracted root directory, so keep an explicit directory entry
+            # before any file entries.
+            archive.writestr(f"{plugin_name}/", "")
+
         for relative in PACKAGE_FILES:
             source = ROOT / relative
-            archive_name = f"{plugin_name}/{relative}" if include_root_dir else relative
+            archive_name = relative if flat else f"{plugin_name}/{relative}"
             archive.write(source, archive_name)
 
     return output
@@ -72,11 +78,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=f"Output zip path. Defaults to {default_output}",
     )
     parser.add_argument(
-        "--include-root-dir",
+        "--flat",
         action="store_true",
         help=(
-            "Put files under a top-level directory named after metadata.name. "
-            "AstrBot supports both flat and rooted archives."
+            "Build a legacy flat archive without the top-level plugin directory. "
+            "Do not use this for AstrBot WebUI upload installation on v4.24.2."
         ),
     )
     return parser.parse_args(argv)
@@ -84,7 +90,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    output = build_archive(args.output, include_root_dir=args.include_root_dir)
+    output = build_archive(args.output, flat=args.flat)
     print(output)
     return 0
 

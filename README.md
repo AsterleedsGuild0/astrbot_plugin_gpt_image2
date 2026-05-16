@@ -62,6 +62,10 @@ dist/astrbot_plugin_gpt_image2_233.zip
 
 然后在 AstrBot WebUI 的插件页面中上传该 zip 文件安装。
 
+打包脚本默认会将插件文件放在 `astrbot_plugin_gpt_image2_233/`
+顶层目录下，并显式写入该目录条目，以兼容 AstrBot v4.24.2
+的 WebUI 上传安装逻辑。
+
 打包脚本只包含插件交付所需文件，不会包含 `.opencode/`、`tmp/`、`astrbot_main/`、`.git/` 等本地开发材料。
 
 ## 开发
