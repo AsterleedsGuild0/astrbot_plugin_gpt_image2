@@ -6,6 +6,7 @@
 
 - **文生图**：通过 `/image2 draw <提示词>` 生成图片
 - **图像编辑**：通过 `/image2 edit <提示词>` 编辑图片（支持当前消息或引用消息中的图片）
+- **Plan 模式**：通过 `/image2 plan` 进入多轮图文对话，AI 辅助优化生图提示词
 - **API 兼容**：支持 OpenAI 兼容 Images API 和 Responses API 两种模式
 - **灵活配置**：支持模型、尺寸、质量、输出格式等参数配置
 
@@ -15,15 +16,22 @@
 | --- | --- |
 | `/image2 draw <提示词>` | 文生图 |
 | `/image2 edit <提示词>` | 编辑图片（需附带图片或引用包含图片的消息） |
-| `/image2 plan draw` | 进入 Plan 模式原型（多轮消息接管验证） |
+| `/image2 plan` | 进入 Plan 多轮图文会话，AI 辅助优化生图提示词 |
+| `/image2 plan confirm` | 在 Plan 中确认生成图片 |
+| `/image2 plan quit` | 退出当前 Plan 会话（`cancel` 也可用） |
 | `/image2 mode [images\|responses]` | 查看或切换 API 模式（仅管理员） |
 | `/image2 help` | 显示用法和当前配置摘要 |
 
-`draw` 和 `edit` 命令在参数校验通过后会先回复一条“已收到，正在处理”的提示，
-随后再发送最终生成/编辑结果。
-
-`plan draw` 当前是 v0.1.0 的最小原型，只用于验证进入 Plan 后是否能接收
-同会话下一条普通文本消息，暂不会调用模型或生成图片。
+- `draw` 和 `edit` 命令在参数校验通过后会先回复一条
+  "已收到，正在处理"的提示，随后再发送最终生成/编辑结果。
+- `plan` 进入 Plan 模式后，AI 会通过 Responses API 引导你完善图像描述。
+  对话中可以发送参考图；确认时若已有参考图，会自动走图像编辑/参考图生成流程。
+  Plan 会用中文与你交流，最终生图提示词可中英混合；如果图像中需要出现中文字符、标题或标语，会要求模型保留原文，不翻译成英文。
+  在准备好时会展示中文摘要，并标注将用于生成的提示词。
+  你可以发送 `/image2 plan confirm` 确认生成图片，或 `/image2 plan quit` 退出。
+  确认后会先回复正在生成的提示，再发送最终图片结果。
+- Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），
+  可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
 
 ## 配置
 
@@ -46,6 +54,13 @@
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
+| `plan_enabled` | bool | `true` | 启用 Plan 模式 |
+| `plan_model` | string | `gpt-5.4` | Plan 模式 Responses 模型 |
+| `plan_timeout` | int | `300` | Plan 用户空闲超时时间（秒） |
+| `plan_max_rounds` | int | `6` | Plan 最大对话轮数 |
+| `plan_use_custom_api` | bool | `false` | Plan 模式使用独立 API 配置 |
+| `plan_base_url` | string | `` | Plan 独立 Responses API Base URL |
+| `plan_api_key` | string | `` | Plan 独立 API Key |
 
 ## 安装
 
@@ -69,7 +84,7 @@ python scripts/package_plugin.py
 默认输出：
 
 ```text
-dist/astrbot_plugin_gpt_image2_233-v0.0.2.zip
+dist/astrbot_plugin_gpt_image2_233-v0.1.0.zip
 ```
 
 然后在 AstrBot WebUI 的插件页面中上传该 zip 文件安装。
@@ -104,6 +119,9 @@ pip install -r requirements.txt
 - 请确保 `base_url` 指向正确的 OpenAI 兼容 API 端点，不要包含 `images/generations` 等路径后缀
 - 建议开启 `response_format_b64_json`，避免图片 URL 过期导致发送失败
 - API Key 仅在运行时使用，不会在日志或错误消息中泄漏
+- Plan 模式使用 `/responses`，日志中不会打印完整 prompt、参考图 base64 或 API Key。
+- Plan 等待用户输入时使用独立 watchdog 按 `plan_timeout` 主动超时；模型思考和生图处理期间会自动延长超时。
+- Plan 会话空闲超时后会主动向当前会话发送退出提示，并清理当前 Plan 会话。
 
 ## 许可证
 
