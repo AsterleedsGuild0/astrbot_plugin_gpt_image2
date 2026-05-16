@@ -12,10 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from time import perf_counter
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from astrbot.api import logger
 
 
 @dataclass
@@ -68,6 +70,17 @@ class GPTImageClient:
             "Authorization": f"Bearer {self.api_key}",
         }
 
+    @staticmethod
+    def _elapsed_ms(start: float) -> int:
+        return int((perf_counter() - start) * 1000)
+
+    @staticmethod
+    def _result_summary(results: list[ImageResult]) -> str:
+        b64_count = sum(1 for item in results if item.b64_json)
+        url_count = sum(1 for item in results if item.url)
+        revised_count = sum(1 for item in results if item.revised_prompt)
+        return f"results={len(results)} b64={b64_count} url={url_count} revised={revised_count}"
+
     def _build_error_msg(self, status_code: int, body: Any) -> str:
         """构建不泄露 API Key 的错误消息"""
         try:
@@ -116,18 +129,49 @@ class GPTImageClient:
         if self.response_format_b64_json:
             body["response_format"] = "b64_json"
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(
-                url,
-                headers={**self._headers(), "Content-Type": "application/json"},
-                json=body,
+        start = perf_counter()
+        logger.info(
+            "[GPTImage2] Images API generate request start "
+            f"url={url} model={self.model} prompt_len={len(prompt)} "
+            f"size={params.size} quality={params.quality} "
+            f"format={params.output_format} n={params.n} timeout={self.timeout}s"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    url,
+                    headers={**self._headers(), "Content-Type": "application/json"},
+                    json=body,
+                )
+        except httpx.HTTPError as e:
+            elapsed = self._elapsed_ms(start)
+            logger.warning(
+                "[GPTImage2] Images API generate request failed "
+                f"elapsed_ms={elapsed} error={type(e).__name__}: {e}"
             )
+            raise RuntimeError(f"网络请求失败：{e}") from e
+
+        elapsed = self._elapsed_ms(start)
+        logger.debug(
+            "[GPTImage2] Images API generate response received "
+            f"status={resp.status_code} elapsed_ms={elapsed} "
+            f"response_bytes={len(resp.content)}"
+        )
 
         if not resp.is_success:
+            logger.warning(
+                "[GPTImage2] Images API generate returned error "
+                f"status={resp.status_code} elapsed_ms={elapsed}"
+            )
             raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
 
         data = resp.json()
-        return self._parse_images_api_response(data)
+        results = self._parse_images_api_response(data)
+        logger.info(
+            "[GPTImage2] Images API generate request success "
+            f"elapsed_ms={elapsed} {self._result_summary(results)}"
+        )
+        return results
 
     async def edit_images_api(
         self,
@@ -158,9 +202,11 @@ class GPTImageClient:
             multipart_data["response_format"] = "b64_json"
 
         files: list[tuple[str, tuple[str, bytes, str]]] = []
+        file_sizes: list[int] = []
         for idx, path in enumerate(image_paths):
             with open(path, "rb") as f:
                 file_bytes = f.read()
+            file_sizes.append(len(file_bytes))
             ext = self._guess_ext(path)
             mime_ext = "jpeg" if ext == "jpg" else ext
             files.append(
@@ -170,19 +216,52 @@ class GPTImageClient:
                 )
             )
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(
-                url,
-                headers=self._headers(),
-                data=multipart_data,
-                files=files,
+        start = perf_counter()
+        logger.info(
+            "[GPTImage2] Images API edit request start "
+            f"url={url} model={self.model} prompt_len={len(prompt)} "
+            f"input_images={len(image_paths)} input_bytes={sum(file_sizes)} "
+            f"size={params.size} quality={params.quality} "
+            f"format={params.output_format} n={params.n} timeout={self.timeout}s"
+        )
+        logger.debug(f"[GPTImage2] Images API edit input file sizes={file_sizes}")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    url,
+                    headers=self._headers(),
+                    data=multipart_data,
+                    files=files,
+                )
+        except httpx.HTTPError as e:
+            elapsed = self._elapsed_ms(start)
+            logger.warning(
+                "[GPTImage2] Images API edit request failed "
+                f"elapsed_ms={elapsed} error={type(e).__name__}: {e}"
             )
+            raise RuntimeError(f"网络请求失败：{e}") from e
+
+        elapsed = self._elapsed_ms(start)
+        logger.debug(
+            "[GPTImage2] Images API edit response received "
+            f"status={resp.status_code} elapsed_ms={elapsed} "
+            f"response_bytes={len(resp.content)}"
+        )
 
         if not resp.is_success:
+            logger.warning(
+                "[GPTImage2] Images API edit returned error "
+                f"status={resp.status_code} elapsed_ms={elapsed}"
+            )
             raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
 
         data = resp.json()
-        return self._parse_images_api_response(data)
+        results = self._parse_images_api_response(data)
+        logger.info(
+            "[GPTImage2] Images API edit request success "
+            f"elapsed_ms={elapsed} {self._result_summary(results)}"
+        )
+        return results
 
     def _parse_images_api_response(self, data: dict | list) -> list[ImageResult]:
         """解析 Images API 返回
@@ -259,6 +338,11 @@ class GPTImageClient:
                 prompt, image_data_urls, params, action
             )
 
+        logger.info(
+            "[GPTImage2] Responses API batch request start "
+            f"action={action} n={n} input_images={len(image_data_urls)}"
+        )
+        start = perf_counter()
         tasks = [
             self._call_responses_api(prompt, image_data_urls, params, action)
             for _ in range(n)
@@ -275,8 +359,16 @@ class GPTImageClient:
                 continue
             results.extend(item)
         if results:
+            logger.info(
+                "[GPTImage2] Responses API batch request success "
+                f"elapsed_ms={self._elapsed_ms(start)} {self._result_summary(results)}"
+            )
             return results
         if first_error:
+            logger.warning(
+                "[GPTImage2] Responses API batch request failed "
+                f"elapsed_ms={self._elapsed_ms(start)} error={first_error}"
+            )
             raise first_error
         raise RuntimeError("Responses API 并发请求均未返回图片")
 
@@ -320,18 +412,50 @@ class GPTImageClient:
             "tool_choice": "required",
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(
-                url,
-                headers={**self._headers(), "Content-Type": "application/json"},
-                json=body,
+        start = perf_counter()
+        logger.info(
+            "[GPTImage2] Responses API request start "
+            f"url={url} model={self.responses_model} action={action} "
+            f"prompt_len={len(prompt)} input_images={len(image_data_urls)} "
+            f"size={params.size} quality={params.quality} "
+            f"format={params.output_format} timeout={self.timeout}s"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    url,
+                    headers={**self._headers(), "Content-Type": "application/json"},
+                    json=body,
+                )
+        except httpx.HTTPError as e:
+            elapsed = self._elapsed_ms(start)
+            logger.warning(
+                "[GPTImage2] Responses API request failed "
+                f"action={action} elapsed_ms={elapsed} error={type(e).__name__}: {e}"
             )
+            raise RuntimeError(f"网络请求失败：{e}") from e
+
+        elapsed = self._elapsed_ms(start)
+        logger.debug(
+            "[GPTImage2] Responses API response received "
+            f"action={action} status={resp.status_code} elapsed_ms={elapsed} "
+            f"response_bytes={len(resp.content)}"
+        )
 
         if not resp.is_success:
+            logger.warning(
+                "[GPTImage2] Responses API returned error "
+                f"action={action} status={resp.status_code} elapsed_ms={elapsed}"
+            )
             raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
 
         data = resp.json()
-        return self._parse_responses_api_response(data)
+        results = self._parse_responses_api_response(data)
+        logger.info(
+            "[GPTImage2] Responses API request success "
+            f"action={action} elapsed_ms={elapsed} {self._result_summary(results)}"
+        )
+        return results
 
     def _parse_responses_api_response(self, data: dict) -> list[ImageResult]:
         """解析 Responses API 返回
