@@ -18,6 +18,9 @@
 | `/image2 mode [images\|responses]` | 查看或切换 API 模式（仅管理员） |
 | `/image2 help` | 显示用法和当前配置摘要 |
 
+`draw` 和 `edit` 命令在参数校验通过后会先回复一条“已收到，正在处理”的提示，
+随后再发送最终生成/编辑结果。
+
 ## 配置
 
 在 AstrBot WebUI 插件配置页面中设置以下参数：

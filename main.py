@@ -296,6 +296,13 @@ class GPTImage2Plugin(Star):
             f"{self._event_context(event)} mode={api_mode} prompt_len={len(prompt)} "
             f"{self._params_summary(params)} save_outputs={self.config.get('save_outputs', True)}"
         )
+        yield event.plain_result(
+            f"✅ 已收到文生图请求，正在使用 {api_mode} 模式生成图片，请稍候…"
+        )
+        logger.debug(
+            "[GPTImage2] draw start acknowledgement sent "
+            f"{self._event_context(event)} mode={api_mode}"
+        )
 
         try:
             if api_mode == "images":
@@ -391,6 +398,14 @@ class GPTImage2Plugin(Star):
             f"{self._event_context(event)} mode={api_mode} prompt_len={len(prompt)} "
             f"input_images={len(images)} {self._params_summary(params)} "
             f"save_outputs={self.config.get('save_outputs', True)}"
+        )
+        yield event.plain_result(
+            f"✅ 已收到图像编辑请求，已识别 {len(images)} 张参考图，"
+            f"正在使用 {api_mode} 模式处理，请稍候…"
+        )
+        logger.debug(
+            "[GPTImage2] edit start acknowledgement sent "
+            f"{self._event_context(event)} mode={api_mode} input_images={len(images)}"
         )
 
         try:
