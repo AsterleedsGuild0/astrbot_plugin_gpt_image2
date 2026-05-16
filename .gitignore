@@ -209,5 +209,14 @@ __marimo__/
 # 临时目录
 tmp/
 
+# 构建产物
+dist/
+
 # AstrBot 本体 - 用于本地插件测试
 astrbot_main/
+
+# opencode
+.opencode/
+
+# macOS
+.DS_Store
