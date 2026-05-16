@@ -17,6 +17,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Image as CompImage, Plain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 from .client import GPTImageClient, ImageParams, ImageResult
 from .image_utils import (
@@ -223,6 +224,7 @@ class GPTImage2Plugin(Star):
             "命令：",
             "  /image2 draw <提示词>    文生图",
             "  /image2 edit <提示词>    编辑图片（附带图片或引用图片消息）",
+            "  /image2 plan draw        进入 Plan 模式原型（多轮消息验证）",
             "  /image2 mode [模式]      查看/切换 API 模式（管理员）",
             "  /image2 help             显示本帮助",
             "",
@@ -286,6 +288,94 @@ class GPTImage2Plugin(Star):
         suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
         yield event.plain_result(
             f"API 模式已从 {current_mode} 切换为 {next_mode}，{suffix}"
+        )
+
+    @image2.group("plan")
+    def plan() -> None:
+        """图像设计 Plan 模式命令组"""
+        pass
+
+    @plan.command("draw")
+    async def plan_draw(self, event: AstrMessageEvent):
+        """进入 Plan 模式原型：验证同会话普通消息接管"""
+        if not bool(self.config.get("plan_enabled", True)):
+            yield event.plain_result("Plan 模式当前未启用。")
+            return
+
+        try:
+            plan_timeout = int(self.config.get("plan_timeout", 300))
+        except (TypeError, ValueError):
+            plan_timeout = 300
+        plan_timeout = max(30, plan_timeout)
+
+        logger.info(
+            "[GPTImage2] plan prototype start "
+            f"{self._event_context(event)} goal=draw timeout={plan_timeout}s"
+        )
+        yield event.plain_result(
+            "🧠 已进入 Plan 模式原型（文生图）。\n"
+            "请直接发送下一条普通文本消息，我会验证是否能在同一会话中接住它。\n"
+            "发送 /image2 plan cancel 可退出本轮原型验证。"
+        )
+
+        @session_waiter(timeout=plan_timeout, record_history_chains=False)
+        async def plan_waiter(
+            controller: SessionController,
+            next_event: AstrMessageEvent,
+        ) -> None:
+            text = next_event.message_str.strip()
+            logger.info(
+                "[GPTImage2] plan prototype received follow-up "
+                f"{self._event_context(next_event)} text_len={len(text)}"
+            )
+
+            if not text:
+                await next_event.send(
+                    MessageChain().message("请发送一段文字描述你的图像需求。")
+                )
+                controller.keep(timeout=plan_timeout, reset_timeout=True)
+                return
+
+            if text.lower() in {"/image2 plan cancel", "image2 plan cancel"}:
+                await next_event.send(
+                    MessageChain().message("✅ 已退出 Plan 模式原型。")
+                )
+                controller.stop()
+                return
+
+            await next_event.send(
+                MessageChain().message(
+                    "✅ Plan 模式原型已接收到你的补充：\n"
+                    f"{text}\n\n"
+                    "本轮只验证同会话普通消息接管，暂未调用模型或生成图片。"
+                )
+            )
+            controller.stop()
+
+        try:
+            await plan_waiter(event)
+        except TimeoutError:
+            logger.info(
+                "[GPTImage2] plan prototype timeout "
+                f"{self._event_context(event)} timeout={plan_timeout}s"
+            )
+            yield event.plain_result("⌛ Plan 模式原型等待超时，已自动退出。")
+        except Exception as e:
+            logger.error(
+                "[GPTImage2] plan prototype error "
+                f"{self._event_context(event)} error={type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            yield event.plain_result(f"Plan 模式原型发生错误：{e}")
+        finally:
+            event.stop_event()
+
+    @plan.command("cancel")
+    async def plan_cancel(self, event: AstrMessageEvent):
+        """取消 Plan 模式原型"""
+        yield event.plain_result(
+            "如果当前处于 Plan 会话中，请直接发送 /image2 plan cancel 退出；"
+            "如果没有响应中的 Plan 会话，则当前无需取消。"
         )
 
     @image2.command("draw")
