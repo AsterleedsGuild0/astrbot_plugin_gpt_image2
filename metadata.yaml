@@ -5,5 +5,5 @@ version: v0.0.1 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: "233" # 作者
 repo: https://github.com/233Official/astrbot_plugin_gpt_image2 # 插件的仓库地址
 support_platforms:
-  - aiocqhttp
-astrbot_version: ">=4.16,<5"
+- aiocqhttp
+astrbot_version: ">=4.24.5,<5"
