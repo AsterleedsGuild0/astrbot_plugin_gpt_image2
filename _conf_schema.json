@@ -1,0 +1,88 @@
+{
+  "api_key": {
+    "description": "API Key",
+    "type": "string",
+    "hint": "第三方 OpenAI 兼容 API Key",
+    "obvious_hint": true
+  },
+  "base_url": {
+    "description": "API Base URL",
+    "type": "string",
+    "default": "https://api.openai.com/v1",
+    "hint": "例如 https://api.example.com/v1，不要以 images/generations 结尾"
+  },
+  "api_mode": {
+    "description": "API 模式",
+    "type": "string",
+    "default": "images",
+    "options": ["images", "responses"],
+    "labels": ["Images API", "Responses API"]
+  },
+  "model": {
+    "description": "Images API 模型",
+    "type": "string",
+    "default": "gpt-image-2"
+  },
+  "responses_model": {
+    "description": "Responses API 模型",
+    "type": "string",
+    "default": "gpt-5.5"
+  },
+  "size": {
+    "description": "图片尺寸",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "1024x1024", "1536x1024", "1024x1536"]
+  },
+  "quality": {
+    "description": "图片质量",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "low", "medium", "high"]
+  },
+  "output_format": {
+    "description": "输出格式",
+    "type": "string",
+    "default": "png",
+    "options": ["png", "jpeg", "webp"]
+  },
+  "moderation": {
+    "description": "内容审核强度",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "low"]
+  },
+  "output_compression": {
+    "description": "输出压缩质量",
+    "type": "int",
+    "default": 0,
+    "hint": "仅在输出格式不是 png 时生效；0 表示不发送该参数"
+  },
+  "n": {
+    "description": "生成数量",
+    "type": "int",
+    "default": 1,
+    "hint": "Responses API 模式下会并发多次请求"
+  },
+  "timeout": {
+    "description": "请求超时时间（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "response_format_b64_json": {
+    "description": "请求返回 Base64 图片",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启，可避免图片 URL 过期或访问失败"
+  },
+  "max_input_images": {
+    "description": "最多输入参考图数量",
+    "type": "int",
+    "default": 4
+  },
+  "save_outputs": {
+    "description": "保存生成结果",
+    "type": "bool",
+    "default": true
+  }
+}
