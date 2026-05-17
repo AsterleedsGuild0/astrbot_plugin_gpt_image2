@@ -51,12 +51,64 @@ from .plan import (
 )
 
 
-class SenderSessionFilter(SessionFilter):
-    """按会话来源 + 发送者隔离 Plan 会话，避免群聊串扰。"""
+class PlanSessionFilter(SessionFilter):
+    """只拦截当前发送者的 Plan 前缀消息，普通群聊消息放行。"""
 
     def filter(self, event: AstrMessageEvent) -> str:
         sender_id = event.get_sender_id() or "-"
-        return f"{event.unified_msg_origin}:sender:{sender_id}"
+        session_id = f"{event.unified_msg_origin}:sender:{sender_id}"
+        text = (event.message_str or "").strip().lower()
+        if self._should_capture(event, text):
+            return session_id
+        return f"{session_id}:pass"
+
+    @classmethod
+    def _should_capture(cls, event: AstrMessageEvent, text: str) -> bool:
+        if cls.extract_plan_input(event) is not None:
+            return True
+        return text.startswith("/image2") or text.startswith("image2")
+
+    @classmethod
+    def extract_plan_input(cls, event: AstrMessageEvent) -> str | None:
+        """Extract `/plan ...` from Plain components, falling back to message_str."""
+        for comp in event.get_messages():
+            if isinstance(comp, Plain):
+                parsed = cls.strip_plan_prefix(comp.text or "")
+                if parsed is not None:
+                    return parsed
+
+        parsed = cls.strip_plan_prefix(event.message_str or "")
+        if parsed is not None:
+            return parsed
+
+        return cls.strip_embedded_plan_prefix(event.message_str or "")
+
+    @staticmethod
+    def strip_plan_prefix(text: str) -> str | None:
+        value = text.strip()
+        lower = value.lower()
+        if lower == "/plan":
+            return ""
+        if not lower.startswith("/plan"):
+            return None
+        rest = value[len("/plan") :]
+        if rest and not rest[0].isspace():
+            return None
+        return rest.strip()
+
+    @classmethod
+    def strip_embedded_plan_prefix(cls, text: str) -> str | None:
+        """Handle adapters that render image placeholders before the Plain text."""
+        value = text.strip()
+        for marker in ("\n/plan", " /plan", "]/plan", "] /plan"):
+            index = value.lower().find(marker)
+            if index < 0:
+                continue
+            start = index + len(marker) - len("/plan")
+            parsed = cls.strip_plan_prefix(value[start:])
+            if parsed is not None:
+                return parsed
+        return None
 
 
 @register(
@@ -106,6 +158,16 @@ class GPTImage2Plugin(Star):
         return f"{event.unified_msg_origin}:sender:{sender_id}"
 
     @staticmethod
+    def _strip_plan_prefix(text: str) -> str | None:
+        """提取 `/plan ...` 后面的 Plan 输入；非 Plan 前缀返回 None。"""
+        return PlanSessionFilter.strip_plan_prefix(text)
+
+    @staticmethod
+    def _extract_plan_input(event: AstrMessageEvent) -> str | None:
+        """从消息链中提取 `/plan ...` 内容，支持图片在前、文字在后的消息。"""
+        return PlanSessionFilter.extract_plan_input(event)
+
+    @staticmethod
     def _params_summary(params: ImageParams) -> str:
         return (
             f"size={params.size} quality={params.quality} "
@@ -119,10 +181,16 @@ class GPTImage2Plugin(Star):
         text: str,
         *,
         action: str,
+        prefer_image: bool | None = None,
     ) -> None:
         """主动发送处理中提示，避免在 handler 中途 yield 打断处理流程。"""
         try:
-            await self._send_text(event, text, action=action)
+            await self._send_text(
+                event,
+                text,
+                action=action,
+                prefer_image=prefer_image,
+            )
             logger.debug(
                 "[GPTImage2] processing acknowledgement sent "
                 f"action={action} {self._event_context(event)}"
@@ -1066,6 +1134,9 @@ class GPTImage2Plugin(Star):
             "- `/image2 draw <提示词>` — 文生图\n"
             "- `/image2 edit <提示词>` — 编辑图片（附带图片或引用图片消息）\n"
             "- `/image2 plan` — 进入 Plan 多轮图文会话，辅助优化生图提示词\n"
+            "- `/plan <描述>` — 在 Plan 会话中继续交流（群聊普通消息不会被拦截）\n"
+            "- `/plan confirm` — 在 Plan 会话中确认生成\n"
+            "- `/plan quit` — 退出当前 Plan 会话\n"
             "- `/image2 plan confirm` — 在 Plan 中确认生成（自动带参考图）\n"
             "- `/image2 plan quit` — 退出 Plan 会话（`cancel` 也可用）\n"
             "- `/image2 mode [模式]` — 查看/切换 API 模式（管理员）\n"
@@ -1194,6 +1265,9 @@ class GPTImage2Plugin(Star):
                 "## ⚠️ Plan 子命令无效\n\n"
                 "用法：\n"
                 "- `/image2 plan` — 进入 Plan\n"
+                "- `/plan <描述>` — 在 Plan 会话中继续交流\n"
+                "- `/plan confirm` — 确认生成\n"
+                "- `/plan quit` — 退出\n"
                 "- `/image2 plan confirm` — 确认生成\n"
                 "- `/image2 plan quit` — 退出",
                 action="plan-invalid-action",
@@ -1217,8 +1291,8 @@ class GPTImage2Plugin(Star):
             yield await self._text_result(
                 event,
                 "## ⚠️ 已有进行中的 Plan 会话\n\n"
-                "请先使用 `/image2 plan confirm` 生成图片\n"
-                "或 `/image2 plan quit` 退出当前会话。",
+                "请先使用 `/plan confirm` 或 `/image2 plan confirm` 生成图片\n"
+                "或 `/plan quit` 退出当前会话。",
                 action="plan-duplicate",
             )
             return
@@ -1250,12 +1324,14 @@ class GPTImage2Plugin(Star):
         await self._send_text(
             event,
             "## 🧠 已进入 Plan 模式\n\n"
-            "请直接发送文字或参考图描述你想要的图像，"
+            "群聊中只有带 `/plan` 前缀的消息会进入 Plan 交流，"
+            "不带前缀的普通消息会正常发给群友。\n\n"
+            "请发送 `/plan <图像需求>`，或在发送参考图时附带 `/plan`，"
             "我会用 Responses API 帮你优化提示词。\n\n"
             f"- 当前参考图：**{len(session.reference_data_urls)}** 张\n"
             f"- 空闲超时：**{plan_config.timeout}** 秒\n\n"
-            "发送 `/image2 plan confirm` 用当前提示词生成图片。\n"
-            "发送 `/image2 plan quit` 退出。",
+            "发送 `/plan confirm` 或 `/image2 plan confirm` 用当前提示词生成图片。\n"
+            "发送 `/plan quit` 或 `/image2 plan quit` 退出。",
             action="plan-enter",
         )
 
@@ -1267,7 +1343,12 @@ class GPTImage2Plugin(Star):
             controller: SessionController,
             next_event: AstrMessageEvent,
         ) -> None:
-            text = next_event.message_str.strip()
+            raw_text = next_event.message_str.strip()
+            text_lower = raw_text.lower()
+            plan_input_text = self._extract_plan_input(next_event)
+            plan_input_lower = (
+                plan_input_text.strip().lower() if plan_input_text is not None else ""
+            )
             next_session_id = self._plan_session_id(next_event)
             if next_session_id != session_id:
                 return
@@ -1280,12 +1361,12 @@ class GPTImage2Plugin(Star):
             )
 
             # ── 退出 ────────────────────────────────────────
-            if text.lower() in {
+            if text_lower in {
                 "/image2 plan quit",
                 "image2 plan quit",
                 "/image2 plan cancel",
                 "image2 plan cancel",
-            }:
+            } or plan_input_lower in {"quit", "cancel"}:
                 await self._send_text(
                     next_event,
                     "## ✅ 已退出 Plan 模式",
@@ -1296,7 +1377,14 @@ class GPTImage2Plugin(Star):
                 return
 
             # ── 确认生成 ────────────────────────────────────
-            if text.lower() in {"/image2 plan confirm", "image2 plan confirm"}:
+            if (
+                text_lower
+                in {
+                    "/image2 plan confirm",
+                    "image2 plan confirm",
+                }
+                or plan_input_lower == "confirm"
+            ):
                 session = self._plan_sessions.get(session_id)
                 if session and session.final_prompt:
                     controller.keep(
@@ -1350,12 +1438,34 @@ class GPTImage2Plugin(Star):
                     )
                     if chain:
                         await next_event.send(MessageChain(chain=chain))
+                        self._cleanup_plan(session_id)
+                        controller.stop()
+                        return
+
+                    await self._send_text(
+                        next_event,
+                        "## 🔁 Plan 会话已保留\n\n"
+                        "本次生图没有成功，但已整理好的完整提示词和参考图仍然保留。\n\n"
+                        "- 你可以稍后再次发送 `/plan confirm` 重试生成\n"
+                        "- 或发送 `/plan quit` 退出当前 Plan 会话",
+                        action="plan-confirm-retry-available",
+                    )
+                    controller.keep(
+                        timeout=self._waiter_timeout(plan_config.timeout),
+                        reset_timeout=True,
+                    )
+                    self._reset_plan_timeout_watchdog(
+                        session_id,
+                        next_event.unified_msg_origin,
+                        plan_config.timeout,
+                    )
+                    return
                 else:
                     await self._send_text(
                         next_event,
                         "## ⚠️ 还没有准备好的提示词\n\n"
-                        "请继续描述你的图像需求，"
-                        "或发送 `/image2 plan quit` 退出。",
+                        "请使用 `/plan <图像需求>` 继续描述，"
+                        "或发送 `/plan quit` 退出。",
                         action="plan-confirm-no-prompt",
                     )
                     controller.keep(
@@ -1368,17 +1478,14 @@ class GPTImage2Plugin(Star):
                         plan_config.timeout,
                     )
                     return
-                self._cleanup_plan(session_id)
-                controller.stop()
-                return
 
             # ── 其他 /image2 命令：拦截提示 ─────────────────
-            if text.lower().startswith("/image2") or text.lower().startswith("image2"):
+            if text_lower.startswith("/image2") or text_lower.startswith("image2"):
                 await self._send_text(
                     next_event,
                     "## ⚠️ 当前处于 Plan 会话中\n\n"
-                    "请先使用 `/image2 plan confirm` 生成图片\n"
-                    "或 `/image2 plan quit` 退出。",
+                    "请先使用 `/plan confirm` 或 `/image2 plan confirm` 生成图片\n"
+                    "或 `/plan quit` 退出。",
                     action="plan-command-blocked",
                 )
                 controller.keep(
@@ -1392,7 +1499,20 @@ class GPTImage2Plugin(Star):
                 )
                 return
 
+            if plan_input_text is None:
+                controller.keep(
+                    timeout=self._waiter_timeout(plan_config.timeout),
+                    reset_timeout=True,
+                )
+                self._reset_plan_timeout_watchdog(
+                    session_id,
+                    next_event.unified_msg_origin,
+                    plan_config.timeout,
+                )
+                return
+
             # ── 普通文本/参考图：调用 Responses API 规划 ─────
+            text = plan_input_text
             session = self._plan_sessions.get(session_id)
             if session is None:
                 await self._send_text(
@@ -1419,7 +1539,8 @@ class GPTImage2Plugin(Star):
             if not text and not new_reference_urls:
                 await self._send_text(
                     next_event,
-                    "请发送文字描述或参考图来说明你的图像需求。",
+                    "## ⚠️ Plan 输入为空\n\n"
+                    "请使用 `/plan <描述>` 发送文字，或在发送参考图时附带 `/plan`。",
                     action="plan-empty-input",
                 )
                 controller.keep(
@@ -1438,6 +1559,20 @@ class GPTImage2Plugin(Star):
                     f"我刚刚发送了 {len(new_reference_urls)} 张参考图。"
                     "请结合这些参考图继续帮我明确图像需求。"
                 )
+
+            if new_reference_urls:
+                ack_text = (
+                    f"✅ 已收到 Plan 输入和 {len(new_reference_urls)} 张参考图，"
+                    "正在请求模型整理，请稍候…"
+                )
+            else:
+                ack_text = "✅ 已收到 Plan 输入，正在请求模型整理，请稍候…"
+            await self._send_processing_ack(
+                next_event,
+                ack_text,
+                action="plan-input-ack",
+                prefer_image=False,
+            )
 
             session.round_count += 1
 
@@ -1483,7 +1618,8 @@ class GPTImage2Plugin(Star):
                 )
                 await self._send_text(
                     next_event,
-                    f"## ⚠️ 模型调用失败\n\n`{e}`\n\n请重试或发送 `/image2 plan quit` 退出。",
+                    f"## ⚠️ 模型调用失败\n\n`{e}`\n\n"
+                    "请使用 `/plan <内容>` 重试，或发送 `/plan quit` 退出。",
                     action="plan-model-error",
                 )
                 controller.keep(
@@ -1512,15 +1648,15 @@ class GPTImage2Plugin(Star):
                     f"## ✅ 我已整理好图像需求\n\n"
                     f"{summary}\n\n"
                     "完整生成提示词已保存，确认生成时会单独发送。\n"
-                    "发送 `/image2 plan confirm` 生成图片，"
-                    "或 `/image2 plan quit` 退出。"
+                    "发送 `/plan confirm` 生成图片，"
+                    "或 `/plan quit` 退出。"
                 )
             elif reached_max:
                 display += (
                     "\n\n**已达到最大对话轮数。**"
                     "但模型还没有给出可确认的最终提示词。"
-                    "请继续补充一句关键信息让我再次整理，"
-                    "或发送 `/image2 plan quit` 退出。"
+                    "请使用 `/plan <补充信息>` 继续补充，"
+                    "或发送 `/plan quit` 退出。"
                 )
 
             await self._send_text(next_event, display, action="plan-display")
@@ -1535,7 +1671,7 @@ class GPTImage2Plugin(Star):
             )
 
         try:
-            await plan_waiter(event, session_filter=SenderSessionFilter())
+            await plan_waiter(event, session_filter=PlanSessionFilter())
         except TimeoutError:
             logger.info(
                 "[GPTImage2] plan timeout "

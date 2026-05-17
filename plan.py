@@ -72,7 +72,7 @@ PLAN_SYSTEM_PROMPT = (
     "Critical tool rule: You are in a planning-only conversation. You must not "
     "call image_generation, create images, invoke tools, or return any tool call. "
     "Return text only. The actual image generation will happen later after the "
-    "user sends /image2 plan confirm.\n\n"
+    "user sends /plan confirm or /image2 plan confirm.\n\n"
     "Rules:\n"
     "1. Only return textual planning content. Never trigger image generation or "
     "any tool call in Plan mode.\n"

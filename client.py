@@ -84,15 +84,16 @@ class GPTImageClient:
 
     def _build_error_msg(self, status_code: int, body: Any) -> str:
         """构建不泄露 API Key 的错误消息"""
+        if status_code == 524:
+            return (
+                "HTTP 524 服务商网关等待模型响应超时。"
+                "请稍后重试；如果你正在 Plan 模式中，可以再次发送 "
+                "`/plan confirm` 或 `/image2 plan confirm` 复用已整理好的提示词。"
+            )
         try:
             if isinstance(body, str) and body:
                 stripped = body.lstrip()
                 lower = stripped[:80].lower()
-                if status_code == 524:
-                    return (
-                        "HTTP 524 服务商网关等待模型响应超时。"
-                        "请稍后重试，或换用更快的 Plan 模型/减少参考图。"
-                    )
                 if lower.startswith("<!doctype html") or lower.startswith("<html"):
                     return (
                         f"HTTP {status_code} 上游服务返回了 HTML 错误页。"
