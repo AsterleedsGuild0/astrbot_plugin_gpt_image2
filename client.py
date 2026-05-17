@@ -86,6 +86,18 @@ class GPTImageClient:
         """构建不泄露 API Key 的错误消息"""
         try:
             if isinstance(body, str) and body:
+                stripped = body.lstrip()
+                lower = stripped[:80].lower()
+                if status_code == 524:
+                    return (
+                        "HTTP 524 服务商网关等待模型响应超时。"
+                        "请稍后重试，或换用更快的 Plan 模型/减少参考图。"
+                    )
+                if lower.startswith("<!doctype html") or lower.startswith("<html"):
+                    return (
+                        f"HTTP {status_code} 上游服务返回了 HTML 错误页。"
+                        "请稍后重试，或检查服务商状态。"
+                    )
                 try:
                     body = json.loads(body)
                 except json.JSONDecodeError:
@@ -101,6 +113,8 @@ class GPTImageClient:
                     return f"HTTP {status_code} {body['message']}"
         except Exception:
             pass
+        if status_code == 429:
+            return "HTTP 429 请求过于频繁或额度不足，请稍后重试。"
         return f"HTTP {status_code}"
 
     # ── Images API ──────────────────────────────────────────────
@@ -522,7 +536,7 @@ class GPTImageClient:
     ) -> str:
         """Plan 模式专用：调用 Responses API 做文本/多模态对话。
 
-        不传 tools，避免规划阶段触发 image_generation。只解析文本输出。
+        显式禁用工具调用，避免规划阶段触发 image_generation。只解析文本输出。
         """
         url = f"{self.base_url}/responses"
         body: dict[str, object] = {
@@ -530,6 +544,9 @@ class GPTImageClient:
             "input": input_data,
             "temperature": temperature,
             "max_output_tokens": max_output_tokens,
+            "tools": [],
+            "tool_choice": "none",
+            "parallel_tool_calls": False,
         }
 
         start = perf_counter()
@@ -617,6 +634,11 @@ class GPTImageClient:
             "[GPTImage2] plan Responses parse failed no text output "
             f"keys={list(data.keys())} output_types={output_types}"
         )
+        if "image_generation_call" in output_types:
+            raise RuntimeError(
+                "Plan 模型返回了图像生成工具调用，而不是文本规划结果。"
+                "请重试，或换用纯文本/多模态理解模型作为 Plan 模型。"
+            )
         raise RuntimeError("API 返回结构异常：未找到文本输出")
 
     # ── 工具方法 ────────────────────────────────────────────────
