@@ -89,7 +89,25 @@
     "description": "文本回复转图片",
     "type": "bool",
     "default": true,
-    "hint": "开启后插件文本回复会优先使用 AstrBot 文转图发送，失败时自动回退纯文本"
+    "hint": "开启后插件文本回复优先使用 image2 自包含 Markdown 卡片模板，不加载外部 JS/CDN；失败后再依次尝试 AstrBot 本地 Markdown、插件内置兜底和纯文本"
+  },
+  "text_image_width": {
+    "description": "兜底文本图片宽度",
+    "type": "int",
+    "default": 1200,
+    "hint": "仅用于插件内置兜底文转图，单位像素"
+  },
+  "text_image_font_size": {
+    "description": "兜底文本图片字号",
+    "type": "int",
+    "default": 32,
+    "hint": "仅用于插件内置兜底文转图"
+  },
+  "text_image_font_path": {
+    "description": "兜底文本图片字体路径",
+    "type": "string",
+    "default": "",
+    "hint": "仅用于插件内置兜底文转图；为空时自动选择系统中文字体"
   },
   "plan_enabled": {
     "description": "启用 Plan 模式",
