@@ -8,7 +8,7 @@
 - **图像编辑**：通过 `/image2 edit <提示词>` 编辑图片（支持当前消息或引用消息中的图片）
 - **Plan 模式**：通过 `/image2 plan` 进入多轮图文对话，AI 辅助优化生图提示词
 - **文本转图片**：插件文本回复默认优先使用 image2 自包含 Markdown 卡片模板，
-  不加载外部 JS/CDN；失败后再分层兜底
+  不加载外部 JS/CDN；失败后直接使用插件内置 Pillow 兜底
 - **API 兼容**：支持 OpenAI 兼容 Images API 和 Responses API 两种模式
 - **灵活配置**：支持模型、尺寸、质量、输出格式等参数配置
 
@@ -36,7 +36,7 @@
   可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
 - 文本回复默认开启文转图（`render_text_as_image`）：优先使用插件自带的
   image2 Markdown 卡片模板。模板在 Python 侧把 Markdown 转成 HTML，渲染时不加载外部
-  JS/CDN；失败后会依次尝试 AstrBot 本地 Markdown 渲染、插件内置兜底渲染和普通文本。
+  JS/CDN；失败后直接使用插件内置 Pillow 兜底渲染，仍失败则回退普通文本。
 
 ## 配置
 
@@ -59,7 +59,7 @@
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
-| `render_text_as_image` | bool | `true` | image2 卡片模板优先，失败后分层兜底 |
+| `render_text_as_image` | bool | `true` | image2 卡片模板优先，失败后 Pillow 兜底 |
 | `text_image_width` | int | `1200` | 插件内置兜底文转图输出宽度（像素） |
 | `text_image_font_size` | int | `32` | 插件内置兜底文转图字体大小 |
 | `text_image_font_path` | string | `` | 可选自定义兜底字体文件路径 |
@@ -145,14 +145,14 @@ pip install -r requirements.txt
 - 请确保 `base_url` 指向正确的 OpenAI 兼容 API 端点，不要包含 `images/generations` 等路径后缀
 - 建议开启 `response_format_b64_json`，避免图片 URL 过期导致发送失败
 - API Key 仅在运行时使用，不会在日志或错误消息中泄漏
-- Plan 模式使用 `/responses`，日志中不会打印完整 prompt、参考图 base64 或 API Key。
+- Plan 模式使用 `/responses`，请求会显式禁用工具调用，避免规划阶段中途触发图像生成；
+  日志中不会打印完整 prompt、参考图 base64 或 API Key。
 - Plan 等待用户输入时使用独立 watchdog 按 `plan_timeout` 主动超时；模型思考和生图处理期间会自动延长超时。
 - Plan 会话空闲超时后会主动向当前会话发送退出提示，并清理当前 Plan 会话。
 - Plan 中间交互不会展示完整生成提示词；完整提示词只会在 `/image2 plan confirm` 时单独转成图片发送。
 - `render_text_as_image` 开启时，插件文本回复优先调用 image2 自包含 Markdown 卡片模板，
-  避免依赖 jsdelivr 等外部 JS/CDN。卡片模板失败后会尝试 AstrBot 本地 Markdown 渲染；
-  二者都失败时才调用插件内置兜底渲染，兜底图片保存到
-  `data/plugin_data/{plugin_name}/text_images/`；全部失败时会回退为普通文本。
+  避免依赖 jsdelivr 等外部 JS/CDN。卡片模板失败后会直接调用插件内置 Pillow 兜底渲染，
+  兜底图片保存到 `data/plugin_data/{plugin_name}/text_images/`；全部失败时会回退为普通文本。
 - 插件内置兜底渲染会按以下顺序寻找中文字体：`text_image_font_path`、环境变量
   `GPT_IMAGE2_TEXT_FONT`、Linux `fc-match`、常见 macOS/Linux/Windows 字体路径。
   如果仍找不到可用中文字体，会在回复中提示配置 `text_image_font_path`。

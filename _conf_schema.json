@@ -89,7 +89,7 @@
     "description": "文本回复转图片",
     "type": "bool",
     "default": true,
-    "hint": "开启后插件文本回复优先使用 image2 自包含 Markdown 卡片模板，不加载外部 JS/CDN；失败后再依次尝试 AstrBot 本地 Markdown、插件内置兜底和纯文本"
+    "hint": "开启后插件文本回复优先使用 image2 自包含 Markdown 卡片模板，不加载外部 JS/CDN；失败后直接使用插件内置 Pillow 兜底，仍失败则回退纯文本"
   },
   "text_image_width": {
     "description": "兜底文本图片宽度",

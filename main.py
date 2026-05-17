@@ -13,15 +13,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 from pathlib import Path
 from time import perf_counter
 import traceback
+import uuid
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Image as CompImage, Plain
 from astrbot.api.star import Context, Star, register
-from astrbot.core import html_renderer
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.session_waiter import (
     SessionController,
@@ -29,6 +31,7 @@ from astrbot.core.utils.session_waiter import (
     USER_SESSIONS,
     session_waiter,
 )
+from PIL import Image as PILImage
 
 from .card_renderer import build_markdown_card
 from .client import GPTImageClient, ImageParams, ImageResult
@@ -143,7 +146,7 @@ class GPTImage2Plugin(Star):
         action: str,
         prefer_image: bool | None = None,
     ) -> MessageChain:
-        """构建文本回复消息链；优先使用插件自带 HTML 卡片，失败后分层兜底。"""
+        """构建文本回复消息链；优先使用 image2 卡片，失败后用内置 Pillow 兜底。"""
         use_image = self._render_text_as_image_enabled()
         if prefer_image is not None:
             use_image = prefer_image
@@ -152,13 +155,6 @@ class GPTImage2Plugin(Star):
             card_chain = await self._build_image2_card_chain(text, action=action)
             if card_chain is not None:
                 return card_chain
-
-            astrbot_chain = await self._build_astrbot_text_image_chain(
-                text,
-                action=action,
-            )
-            if astrbot_chain is not None:
-                return astrbot_chain
 
             try:
                 image_path = render_text_to_image(
@@ -205,17 +201,18 @@ class GPTImage2Plugin(Star):
         except Exception as e:
             logger.warning(
                 "[GPTImage2] image2 markdown card render failed, "
-                "fallback to AstrBot renderer "
+                "fallback to built-in renderer "
                 f"action={action} error={type(e).__name__}: {e}"
             )
             return None
 
+        rendered = self._crop_image2_card_rendered(rendered, action=action)
         chain = self._message_chain_from_rendered_text_image(rendered, action=action)
         if chain is None:
             logger.warning(
                 "[GPTImage2] image2 markdown card returned invalid image, "
-                "fallback to AstrBot renderer "
-                f"action={action} type={type(rendered).__name__}"
+                "fallback to built-in renderer "
+                f"action={action} {self._rendered_image_diagnostic(rendered)}"
             )
             return None
 
@@ -225,89 +222,146 @@ class GPTImage2Plugin(Star):
         )
         return chain
 
-    async def _build_astrbot_text_image_chain(
-        self,
-        text: str,
-        *,
-        action: str,
-    ) -> MessageChain | None:
-        """使用 AstrBot 文转图；远程无效时先尝试本地 Markdown 渲染。"""
-        remote_chain = await self._build_astrbot_remote_text_image_chain(
-            text,
-            action=action,
-        )
-        if remote_chain is not None:
-            return remote_chain
-
-        return await self._build_astrbot_local_text_image_chain(text, action=action)
-
-    async def _build_astrbot_remote_text_image_chain(
-        self,
-        text: str,
-        *,
-        action: str,
-    ) -> MessageChain | None:
-        """使用 AstrBot 当前激活的远程/模板 T2I。"""
+    def _crop_image2_card_rendered(self, rendered: object, *, action: str) -> object:
+        """Crop viewport-height blank space from image2 card renders when possible."""
         try:
-            rendered = await self.text_to_image(text, return_url=False)
+            if isinstance(rendered, bytes):
+                cropped = self._crop_card_image_bytes(rendered)
+                if cropped is not None:
+                    logger.info(
+                        "[GPTImage2] image2 markdown card cropped bytes "
+                        f"action={action} before={len(rendered)} after={len(cropped)}"
+                    )
+                    return cropped
+                return rendered
+
+            if not isinstance(rendered, str) or not rendered.strip():
+                return rendered
+
+            value = rendered.strip()
+            if value.startswith("base64://"):
+                payload = value.removeprefix("base64://")
+                try:
+                    image_bytes = base64.b64decode(payload)
+                except Exception:
+                    return rendered
+                cropped = self._crop_card_image_bytes(image_bytes)
+                if cropped is None:
+                    return rendered
+                logger.info(
+                    "[GPTImage2] image2 markdown card cropped base64 "
+                    f"action={action} before_chars={len(payload)} after={len(cropped)}"
+                )
+                return cropped
+
+            if value.startswith("http://") or value.startswith("https://"):
+                return rendered
+
+            source = Path(
+                value.removeprefix("file:///")
+                if value.startswith("file:///")
+                else value
+            )
+            if not source.is_file() or not self._is_valid_image_file(str(source)):
+                return rendered
+
+            cropped = self._crop_card_image_file(source)
+            if cropped is None:
+                return rendered
+
+            logger.info(
+                "[GPTImage2] image2 markdown card cropped file "
+                f"action={action} source={source} target={cropped}"
+            )
+            return str(cropped)
         except Exception as e:
-            logger.warning(
-                "[GPTImage2] AstrBot remote text-to-image failed, "
-                "fallback to AstrBot local renderer "
+            logger.debug(
+                "[GPTImage2] image2 markdown card crop skipped "
                 f"action={action} error={type(e).__name__}: {e}"
             )
+            return rendered
+
+    def _crop_card_image_file(self, source: Path) -> Path | None:
+        with PILImage.open(source) as image:
+            cropped = self._crop_card_image(image)
+        if cropped is None:
             return None
 
-        chain = self._message_chain_from_rendered_text_image(rendered, action=action)
-        if chain is None:
-            logger.warning(
-                "[GPTImage2] AstrBot remote text-to-image returned invalid image, "
-                "fallback to AstrBot local renderer "
-                f"action={action} type={type(rendered).__name__}"
-            )
+        target = Path(self._get_text_image_dir()) / f"card-{uuid.uuid4().hex}.png"
+        cropped.save(target, format="PNG", optimize=True)
+        return target
+
+    def _crop_card_image_bytes(self, data: bytes) -> bytes | None:
+        with PILImage.open(io.BytesIO(data)) as image:
+            cropped = self._crop_card_image(image)
+        if cropped is None:
             return None
 
-        logger.info(
-            "[GPTImage2] AstrBot remote text-to-image rendered "
-            f"action={action} type={type(rendered).__name__}"
-        )
-        return chain
+        output = io.BytesIO()
+        cropped.save(output, format="PNG", optimize=True)
+        return output.getvalue()
 
-    async def _build_astrbot_local_text_image_chain(
-        self,
-        text: str,
-        *,
-        action: str,
-    ) -> MessageChain | None:
-        """使用 AstrBot 本地 Markdown T2I，保留 Markdown 标题/列表等基础样式。"""
-        try:
-            rendered = await html_renderer.render_t2i(
-                text,
-                use_network=False,
-                return_url=False,
-            )
-        except Exception as e:
-            logger.warning(
-                "[GPTImage2] AstrBot local text-to-image failed, "
-                "fallback to built-in renderer "
-                f"action={action} error={type(e).__name__}: {e}"
-            )
+    @staticmethod
+    def _crop_card_image(image: PILImage.Image) -> PILImage.Image | None:
+        """Trim bottom viewport blank space while keeping a small card margin."""
+        width, height = image.size
+        if height < 360 or width < 320:
             return None
 
-        chain = self._message_chain_from_rendered_text_image(rendered, action=action)
-        if chain is None:
-            logger.warning(
-                "[GPTImage2] AstrBot local text-to-image returned invalid image, "
-                "fallback to built-in renderer "
-                f"action={action} type={type(rendered).__name__}"
-            )
+        rgb = image.convert("RGB")
+        left = max(0, int(width * 0.05))
+        right = min(width, int(width * 0.95))
+        step = max(4, (right - left) // 160)
+        xs = list(range(left, right, step)) or [width // 2]
+
+        def average_row(y: int) -> tuple[float, float, float]:
+            totals = [0, 0, 0]
+            for x in xs:
+                pixel = rgb.getpixel((x, y))
+                if isinstance(pixel, tuple):
+                    red = int(pixel[0] if pixel[0] is not None else 0)
+                    green = int(pixel[1] if pixel[1] is not None else 0)
+                    blue = int(pixel[2] if pixel[2] is not None else 0)
+                else:
+                    red = green = blue = int(pixel if pixel is not None else 0)
+                totals[0] += red
+                totals[1] += green
+                totals[2] += blue
+            count = len(xs)
+            return totals[0] / count, totals[1] / count, totals[2] / count
+
+        bottom_rows = range(max(0, height - 20), height)
+        bg_totals = [0.0, 0.0, 0.0]
+        bg_count = 0
+        for y in bottom_rows:
+            row = average_row(y)
+            bg_totals[0] += row[0]
+            bg_totals[1] += row[1]
+            bg_totals[2] += row[2]
+            bg_count += 1
+        bg = tuple(value / max(1, bg_count) for value in bg_totals)
+
+        consecutive = 0
+        detected_y: int | None = None
+        for y in range(height - 1, -1, -1):
+            row = average_row(y)
+            diff = sum(abs(row[index] - bg[index]) for index in range(3))
+            if diff >= 8.0:
+                consecutive += 1
+                if consecutive >= 4:
+                    detected_y = y + 3
+                    break
+            else:
+                consecutive = 0
+
+        if detected_y is None:
             return None
 
-        logger.info(
-            "[GPTImage2] AstrBot local text-to-image rendered "
-            f"action={action} type={type(rendered).__name__}"
-        )
-        return chain
+        crop_bottom = min(height, detected_y + 42)
+        if height - crop_bottom < 90:
+            return None
+
+        return image.crop((0, 0, width, crop_bottom)).copy()
 
     def _message_chain_from_rendered_text_image(
         self,
@@ -340,6 +394,91 @@ class GPTImage2Plugin(Star):
         if self._is_valid_image_file(path):
             return MessageChain(chain=[CompImage.fromFileSystem(path)])
         return None
+
+    @classmethod
+    def _rendered_image_diagnostic(cls, rendered: object) -> str:
+        """Build a compact, safe diagnostic summary for invalid render outputs."""
+        if isinstance(rendered, bytes):
+            head = rendered[:16]
+            return (
+                f"type=bytes size={len(rendered)} "
+                f"content_hint={cls._bytes_content_hint(rendered)} "
+                f"magic={head.hex() or '-'} "
+                f"preview={cls._safe_bytes_preview(rendered)}"
+            )
+
+        if not isinstance(rendered, str):
+            return f"type={type(rendered).__name__}"
+
+        value = rendered.strip()
+        if not value:
+            return "type=str empty=true"
+        if value.startswith("http://") or value.startswith("https://"):
+            return f"type=str url={cls._safe_text_preview(value, limit=120)}"
+        if value.startswith("base64://"):
+            payload = value.removeprefix("base64://")
+            return f"type=str base64_chars={len(payload)}"
+
+        path = Path(
+            value.removeprefix("file:///") if value.startswith("file:///") else value
+        )
+        if not path.exists():
+            return (
+                "type=str file_exists=false "
+                f"value={cls._safe_text_preview(value, limit=160)}"
+            )
+
+        try:
+            stat = path.stat()
+            with path.open("rb") as image_file:
+                sample = image_file.read(256)
+        except OSError as e:
+            return (
+                "type=str file_readable=false "
+                f"path={cls._safe_text_preview(str(path), limit=160)} "
+                f"error={type(e).__name__}: {e}"
+            )
+
+        return (
+            "type=str file_exists=true "
+            f"path={cls._safe_text_preview(str(path), limit=160)} "
+            f"size={stat.st_size} content_hint={cls._bytes_content_hint(sample)} "
+            f"magic={sample[:16].hex() or '-'} "
+            f"preview={cls._safe_bytes_preview(sample)}"
+        )
+
+    @staticmethod
+    def _bytes_content_hint(data: bytes) -> str:
+        stripped = data.lstrip()
+        if data.startswith(b"\xff\xd8"):
+            return "jpeg"
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            return "webp"
+        if stripped[:15].lower().startswith(b"<!doctype html") or stripped[
+            :5
+        ].lower().startswith(b"<html"):
+            return "html"
+        if stripped.startswith(b"{") or stripped.startswith(b"["):
+            return "json"
+        if not stripped:
+            return "empty"
+        return "unknown"
+
+    @staticmethod
+    def _safe_bytes_preview(data: bytes, *, limit: int = 160) -> str:
+        if not data:
+            return "-"
+        text = data[:limit].decode("utf-8", errors="replace")
+        return GPTImage2Plugin._safe_text_preview(text, limit=limit)
+
+    @staticmethod
+    def _safe_text_preview(text: str, *, limit: int = 160) -> str:
+        normalized = " ".join(text.replace("\x00", "�").split())
+        if len(normalized) > limit:
+            normalized = normalized[:limit] + "…"
+        return repr(normalized)
 
     @staticmethod
     def _is_valid_image_file(path: str) -> bool:

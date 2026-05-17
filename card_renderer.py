@@ -47,7 +47,7 @@ CARD_TEMPLATE = """<!doctype html>
 
     body {
       margin: 0;
-      padding: 40px;
+      padding: 32px;
       background: radial-gradient(circle at 18px 18px, rgba(56, 199, 189, 0.08) 1.5px, transparent 0) 0 0 / 18px 18px,
         linear-gradient(135deg, #edfafa 0%, #f8fcff 100%);
       color: var(--text);
@@ -59,7 +59,7 @@ CARD_TEMPLATE = """<!doctype html>
     }
 
     .card {
-      width: min(1180px, calc(100vw - 80px));
+      width: min(1180px, calc(100vw - 64px));
       margin: 0 auto;
       background: var(--card);
       border: 1px solid rgba(56, 199, 189, 0.18);
@@ -74,7 +74,7 @@ CARD_TEMPLATE = """<!doctype html>
     }
 
     .content {
-      padding: 42px 48px 46px;
+      padding: 36px 44px 34px;
     }
 
     h1, h2, h3, h4, h5, h6 {
@@ -183,7 +183,7 @@ CARD_TEMPLATE = """<!doctype html>
     }
 
     .footer {
-      padding: 14px 48px 24px;
+      padding: 8px 44px 18px;
       color: var(--muted);
       font-size: 18px;
       text-align: right;
