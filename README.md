@@ -19,6 +19,9 @@
 | `/image2 draw <提示词>` | 文生图 |
 | `/image2 edit <提示词>` | 编辑图片（需附带图片或引用包含图片的消息） |
 | `/image2 plan` | 进入 Plan 多轮图文会话，AI 辅助优化生图提示词 |
+| `/plan <描述>` | 在 Plan 会话中继续交流（群聊普通消息不会被拦截） |
+| `/plan confirm` | 在 Plan 会话中确认生成图片 |
+| `/plan quit` | 退出当前 Plan 会话 |
 | `/image2 plan confirm` | 在 Plan 中确认生成图片 |
 | `/image2 plan quit` | 退出当前 Plan 会话（`cancel` 也可用） |
 | `/image2 mode [images\|responses]` | 查看或切换 API 模式（仅管理员） |
@@ -27,10 +30,13 @@
 - `draw` 和 `edit` 命令在参数校验通过后会先回复一条
   "已收到，正在处理"的提示，随后再发送最终生成/编辑结果。
 - `plan` 进入 Plan 模式后，AI 会通过 Responses API 引导你完善图像描述。
-  对话中可以发送参考图；确认时若已有参考图，会自动走图像编辑/参考图生成流程。
+  群聊中只有带 `/plan` 前缀的消息会进入 Plan 交流，不带前缀的普通消息会正常发给群友。
+  对话中可以发送参考图；发送参考图时请附带 `/plan` 前缀。
+  确认时若已有参考图，会自动走图像编辑/参考图生成流程。
   Plan 会用中文与你交流，最终生图提示词可中英混合；如果图像中需要出现中文字符、标题或标语，会要求模型保留原文，不翻译成英文。
   在准备好时只展示中文摘要/核对项，不在中间交互中刷出完整生成提示词。
-  你可以发送 `/image2 plan confirm` 确认生成图片，或 `/image2 plan quit` 退出。
+  你可以发送 `/plan confirm` 或 `/image2 plan confirm` 确认生成图片，
+  发送 `/plan quit` 或 `/image2 plan quit` 退出。
   确认后会单独发送一张完整生成提示词图片，再发送正在生成提示和最终图片结果。
 - Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），
   可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
@@ -149,7 +155,8 @@ pip install -r requirements.txt
   日志中不会打印完整 prompt、参考图 base64 或 API Key。
 - Plan 等待用户输入时使用独立 watchdog 按 `plan_timeout` 主动超时；模型思考和生图处理期间会自动延长超时。
 - Plan 会话空闲超时后会主动向当前会话发送退出提示，并清理当前 Plan 会话。
-- Plan 中间交互不会展示完整生成提示词；完整提示词只会在 `/image2 plan confirm` 时单独转成图片发送。
+- Plan 中间交互不会展示完整生成提示词；完整提示词只会在 `/plan confirm`
+  或 `/image2 plan confirm` 时单独转成图片发送。
 - `render_text_as_image` 开启时，插件文本回复使用 image2 自包含 Markdown 卡片模板，
   避免依赖 jsdelivr 等外部 JS/CDN。卡片模板失败后直接回退为普通文本。
 - 插件内置 Pillow 仅用于卡片渲染后裁剪底部空白，不再作为文本回复的渲染兜底。
