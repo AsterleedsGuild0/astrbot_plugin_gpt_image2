@@ -85,6 +85,12 @@
     "type": "bool",
     "default": true
   },
+  "render_text_as_image": {
+    "description": "文本回复转图片",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后插件文本回复会优先使用 AstrBot 文转图发送，失败时自动回退纯文本"
+  },
   "plan_enabled": {
     "description": "启用 Plan 模式",
     "type": "bool",

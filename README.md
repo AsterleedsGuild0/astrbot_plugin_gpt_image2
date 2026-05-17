@@ -7,6 +7,7 @@
 - **文生图**：通过 `/image2 draw <提示词>` 生成图片
 - **图像编辑**：通过 `/image2 edit <提示词>` 编辑图片（支持当前消息或引用消息中的图片）
 - **Plan 模式**：通过 `/image2 plan` 进入多轮图文对话，AI 辅助优化生图提示词
+- **文本转图片**：插件文本回复默认优先用 AstrBot 文转图发送，减少群聊刷屏
 - **API 兼容**：支持 OpenAI 兼容 Images API 和 Responses API 两种模式
 - **灵活配置**：支持模型、尺寸、质量、输出格式等参数配置
 
@@ -27,11 +28,12 @@
 - `plan` 进入 Plan 模式后，AI 会通过 Responses API 引导你完善图像描述。
   对话中可以发送参考图；确认时若已有参考图，会自动走图像编辑/参考图生成流程。
   Plan 会用中文与你交流，最终生图提示词可中英混合；如果图像中需要出现中文字符、标题或标语，会要求模型保留原文，不翻译成英文。
-  在准备好时会展示中文摘要，并标注将用于生成的提示词。
+  在准备好时只展示中文摘要/核对项，不在中间交互中刷出完整生成提示词。
   你可以发送 `/image2 plan confirm` 确认生成图片，或 `/image2 plan quit` 退出。
-  确认后会先回复正在生成的提示，再发送最终图片结果。
+  确认后会单独发送一张完整生成提示词图片，再发送正在生成提示和最终图片结果。
 - Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），
   可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
+- 文本回复默认开启文转图（`render_text_as_image`），如 AstrBot 文转图失败会自动回退为普通文本。
 
 ## 配置
 
@@ -54,6 +56,7 @@
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
+| `render_text_as_image` | bool | `true` | 插件文本回复优先使用 AstrBot 文转图，失败回退文本 |
 | `plan_enabled` | bool | `true` | 启用 Plan 模式 |
 | `plan_model` | string | `gpt-5.4` | Plan 模式 Responses 模型 |
 | `plan_timeout` | int | `300` | Plan 用户空闲超时时间（秒） |
@@ -84,7 +87,7 @@ python scripts/package_plugin.py
 默认输出：
 
 ```text
-dist/astrbot_plugin_gpt_image2_233-v0.1.0.zip
+dist/astrbot_plugin_gpt_image2_233-v0.1.1.zip
 ```
 
 然后在 AstrBot WebUI 的插件页面中上传该 zip 文件安装。
@@ -113,6 +116,7 @@ pip install -r requirements.txt
 
 - `httpx>=0.27.0` — 异步 HTTP 客户端
 - `pyyaml>=6.0.2` — 开发依赖，仅用于本地打包读取 `metadata.yaml`
+- `ruff>=0.11.0` — 开发依赖，用于格式化与静态检查
 
 ## 注意事项
 
@@ -122,6 +126,8 @@ pip install -r requirements.txt
 - Plan 模式使用 `/responses`，日志中不会打印完整 prompt、参考图 base64 或 API Key。
 - Plan 等待用户输入时使用独立 watchdog 按 `plan_timeout` 主动超时；模型思考和生图处理期间会自动延长超时。
 - Plan 会话空闲超时后会主动向当前会话发送退出提示，并清理当前 Plan 会话。
+- Plan 中间交互不会展示完整生成提示词；完整提示词只会在 `/image2 plan confirm` 时单独转成图片发送。
+- `render_text_as_image` 开启时，插件文本回复优先调用 AstrBot 文转图；文转图失败会回退为普通文本。
 
 ## 许可证
 

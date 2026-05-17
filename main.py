@@ -58,7 +58,7 @@ class SenderSessionFilter(SessionFilter):
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.1.0",
+    "0.1.1",
 )
 class GPTImage2Plugin(Star):
     PLAN_WAITER_TIMEOUT_GRACE = 10
@@ -116,7 +116,7 @@ class GPTImage2Plugin(Star):
     ) -> None:
         """主动发送处理中提示，避免在 handler 中途 yield 打断处理流程。"""
         try:
-            await event.send(MessageChain().message(text))
+            await self._send_text(event, text, action=action)
             logger.debug(
                 "[GPTImage2] processing acknowledgement sent "
                 f"action={action} {self._event_context(event)}"
@@ -128,6 +128,70 @@ class GPTImage2Plugin(Star):
                 f"error={type(e).__name__}: {e}"
             )
 
+    def _render_text_as_image_enabled(self) -> bool:
+        """是否将插件文本回复渲染为图片，减少群聊刷屏。"""
+        return bool(self.config.get("render_text_as_image", True))
+
+    async def _build_text_chain(
+        self,
+        text: str,
+        *,
+        action: str,
+        prefer_image: bool | None = None,
+    ) -> MessageChain:
+        """构建文本回复消息链；默认使用 AstrBot 文转图，失败则回退纯文本。"""
+        use_image = self._render_text_as_image_enabled()
+        if prefer_image is not None:
+            use_image = prefer_image
+
+        if use_image:
+            try:
+                image_ref = await self.text_to_image(text, return_url=True)
+                if image_ref:
+                    image_ref = str(image_ref)
+                    if image_ref.startswith("http"):
+                        return MessageChain(chain=[CompImage.fromURL(image_ref)])
+                    return MessageChain(chain=[CompImage.fromFileSystem(image_ref)])
+            except Exception as e:
+                logger.warning(
+                    "[GPTImage2] text-to-image failed, fallback to plain text "
+                    f"action={action} error={type(e).__name__}: {e}"
+                )
+
+        return MessageChain().message(text)
+
+    async def _send_text(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        action: str,
+        prefer_image: bool | None = None,
+    ) -> None:
+        """发送文本类回复；默认文转图，失败回退文字。"""
+        chain = await self._build_text_chain(
+            text,
+            action=action,
+            prefer_image=prefer_image,
+        )
+        await event.send(chain)
+
+    async def _text_result(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        action: str,
+        prefer_image: bool | None = None,
+    ):
+        """构建可 yield 的文本回复结果；默认文转图，失败回退文字。"""
+        chain = await self._build_text_chain(
+            text,
+            action=action,
+            prefer_image=prefer_image,
+        )
+        return event.chain_result(chain.chain)
+
     async def _send_proactive_message(
         self,
         session_origin: str,
@@ -137,9 +201,10 @@ class GPTImage2Plugin(Star):
     ) -> bool:
         """主动向会话发送消息，用于超时等已脱离原始请求的场景。"""
         try:
+            chain = await self._build_text_chain(text, action=action)
             sent = await self.context.send_message(
                 session_origin,
-                MessageChain().message(text),
+                chain,
             )
             logger.debug(
                 "[GPTImage2] proactive message sent "
@@ -495,7 +560,7 @@ class GPTImage2Plugin(Star):
         try:
             client = self._get_client()
         except ValueError as e:
-            await event.send(MessageChain().message(str(e)))
+            await self._send_text(event, str(e), action=f"{action}-config-error")
             return []
 
         params = self._get_params()
@@ -560,7 +625,11 @@ class GPTImage2Plugin(Star):
                 results = await client.generate_responses_api(prompt, params)
         except RuntimeError as e:
             logger.warning(f"[GPTImage2] draw API failed action={action} error={e}")
-            await event.send(MessageChain().message(f"GPT Image2 调用失败：{e}"))
+            await self._send_text(
+                event,
+                f"GPT Image2 调用失败：{e}",
+                action=f"{action}-api-error",
+            )
             return []
         except Exception as e:
             logger.error(
@@ -568,7 +637,11 @@ class GPTImage2Plugin(Star):
                 f"action={action} error={type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}"
             )
-            await event.send(MessageChain().message(f"GPT Image2 调用失败：{e}"))
+            await self._send_text(
+                event,
+                f"GPT Image2 调用失败：{e}",
+                action=f"{action}-unexpected-error",
+            )
             return []
 
         logger.info(
@@ -578,8 +651,10 @@ class GPTImage2Plugin(Star):
 
         chain = self._build_image_chain(results, params)
         if not chain:
-            await event.send(
-                MessageChain().message("GPT Image2 未返回任何可显示的图片。")
+            await self._send_text(
+                event,
+                "GPT Image2 未返回任何可显示的图片。",
+                action=f"{action}-empty-result",
             )
         return chain
 
@@ -622,10 +697,14 @@ class GPTImage2Plugin(Star):
         lines.append(f"  输出格式        : {cfg.get('output_format', 'png')}")
         lines.append(f"  生成数量 n      : {cfg.get('n', 1)}")
         lines.append(
+            "  文本回复转图片  : "
+            f"{'是' if self._render_text_as_image_enabled() else '否'}"
+        )
+        lines.append(
             f"  保存输出        : {'是' if cfg.get('save_outputs', True) else '否'}"
         )
 
-        yield event.plain_result("\n".join(lines))
+        yield await self._text_result(event, "\n".join(lines), action="help")
 
     @image2.command("mode")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -638,24 +717,32 @@ class GPTImage2Plugin(Star):
             f"requested_mode={mode or '-'}"
         )
         if mode is None or not str(mode).strip():
-            yield event.plain_result(
+            yield await self._text_result(
+                event,
                 "当前 API 模式："
                 f"{current_mode}\n"
                 "可用模式：images / responses\n"
-                "用法：/image2 mode <images|responses>"
+                "用法：/image2 mode <images|responses>",
+                action="mode-help",
             )
             return
 
         next_mode = str(mode).strip().lower()
         if next_mode not in {"images", "responses"}:
-            yield event.plain_result(
+            yield await self._text_result(
+                event,
                 "API 模式无效。可用模式：images / responses\n"
-                "用法：/image2 mode <images|responses>"
+                "用法：/image2 mode <images|responses>",
+                action="mode-invalid",
             )
             return
 
         if next_mode == current_mode:
-            yield event.plain_result(f"API 模式已经是：{current_mode}")
+            yield await self._text_result(
+                event,
+                f"API 模式已经是：{current_mode}",
+                action="mode-unchanged",
+            )
             return
 
         self.config["api_mode"] = next_mode
@@ -665,8 +752,10 @@ class GPTImage2Plugin(Star):
             f"{self._event_context(event)} from={current_mode} to={next_mode} saved={saved}"
         )
         suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
-        yield event.plain_result(
-            f"API 模式已从 {current_mode} 切换为 {next_mode}，{suffix}"
+        yield await self._text_result(
+            event,
+            f"API 模式已从 {current_mode} 切换为 {next_mode}，{suffix}",
+            action="mode-switched",
         )
 
     # ── Plan 模式 ────────────────────────────────────────────
@@ -682,12 +771,16 @@ class GPTImage2Plugin(Star):
                 return
             if session_id in self._plan_sessions:
                 self._cleanup_plan(session_id)
-                yield event.plain_result(
-                    "Plan 会话已失效，请重新使用 /image2 plan 进入。"
+                yield await self._text_result(
+                    event,
+                    "Plan 会话已失效，请重新使用 /image2 plan 进入。",
+                    action="plan-confirm-stale",
                 )
             else:
-                yield event.plain_result(
-                    "当前没有进行中的 Plan 会话。请先使用 /image2 plan 进入。"
+                yield await self._text_result(
+                    event,
+                    "当前没有进行中的 Plan 会话。请先使用 /image2 plan 进入。",
+                    action="plan-confirm-missing",
                 )
             return
 
@@ -700,20 +793,28 @@ class GPTImage2Plugin(Star):
                 "[GPTImage2] plan quit external trigger "
                 f"{self._event_context(event)} action={action} had_session={had_session}"
             )
-            yield event.plain_result(
-                "已尝试退出 Plan 会话。如果没有响应中的 Plan 会话，则当前无需操作。"
+            yield await self._text_result(
+                event,
+                "已尝试退出 Plan 会话。如果没有响应中的 Plan 会话，则当前无需操作。",
+                action="plan-quit-external",
             )
             return
 
         if action:
-            yield event.plain_result(
+            yield await self._text_result(
+                event,
                 "Plan 子命令无效。用法：/image2 plan、/image2 plan confirm、"
-                "/image2 plan quit"
+                "/image2 plan quit",
+                action="plan-invalid-action",
             )
             return
 
         if not bool(self.config.get("plan_enabled", True)):
-            yield event.plain_result("Plan 模式当前未启用。")
+            yield await self._text_result(
+                event,
+                "Plan 模式当前未启用。",
+                action="plan-disabled",
+            )
             return
 
         plan_config = self._get_plan_config()
@@ -722,9 +823,11 @@ class GPTImage2Plugin(Star):
 
         # 防止同一会话重复进入
         if session_id in self._plan_sessions:
-            yield event.plain_result(
+            yield await self._text_result(
+                event,
                 "当前会话已有进行中的 Plan 会话。"
-                "请先使用 /image2 plan confirm 或 /image2 plan quit 结束当前会话。"
+                "请先使用 /image2 plan confirm 或 /image2 plan quit 结束当前会话。",
+                action="plan-duplicate",
             )
             return
 
@@ -732,7 +835,7 @@ class GPTImage2Plugin(Star):
         try:
             plan_client = self._get_plan_client(plan_config)
         except ValueError as e:
-            yield event.plain_result(str(e))
+            yield await self._text_result(event, str(e), action="plan-config-error")
             return
 
         # 创建会话，并记录随 plan 命令附带/引用的参考图。
@@ -752,15 +855,15 @@ class GPTImage2Plugin(Star):
             f"max_rounds={plan_config.max_rounds} model={plan_config.model}"
         )
 
-        await event.send(
-            MessageChain().message(
-                "🧠 已进入 Plan 模式。\n"
-                "请直接发送文字或参考图描述你想要的图像，我会用 Responses API 帮你优化提示词。\n"
-                f"当前已记录 {len(session.reference_data_urls)} 张参考图。\n"
-                f"空闲超过 {plan_config.timeout} 秒会自动退出 Plan 模式。\n"
-                "发送 /image2 plan confirm 用当前提示词生成图片。\n"
-                "发送 /image2 plan quit 退出。"
-            )
+        await self._send_text(
+            event,
+            "🧠 已进入 Plan 模式。\n"
+            "请直接发送文字或参考图描述你想要的图像，我会用 Responses API 帮你优化提示词。\n"
+            f"当前已记录 {len(session.reference_data_urls)} 张参考图。\n"
+            f"空闲超过 {plan_config.timeout} 秒会自动退出 Plan 模式。\n"
+            "发送 /image2 plan confirm 用当前提示词生成图片。\n"
+            "发送 /image2 plan quit 退出。",
+            action="plan-enter",
         )
 
         @session_waiter(
@@ -790,7 +893,11 @@ class GPTImage2Plugin(Star):
                 "/image2 plan cancel",
                 "image2 plan cancel",
             }:
-                await next_event.send(MessageChain().message("✅ 已退出 Plan 模式。"))
+                await self._send_text(
+                    next_event,
+                    "✅ 已退出 Plan 模式。",
+                    action="plan-quit",
+                )
                 self._cleanup_plan(session_id)
                 controller.stop()
                 return
@@ -824,6 +931,17 @@ class GPTImage2Plugin(Star):
                             "✅ 已确认 Plan 提示词，"
                             f"正在使用 {api_mode} 模式生成图片，请稍候…"
                         )
+                    prompt_text = (
+                        "🧾 将用于生成的完整提示词\n\n"
+                        f"{session.final_prompt}\n\n"
+                        "提示：中文文字内容会按原文保留，不强制翻译为英文。"
+                    )
+                    await self._send_text(
+                        next_event,
+                        prompt_text,
+                        action="plan-final-prompt",
+                        prefer_image=True,
+                    )
                     await self._send_processing_ack(
                         next_event,
                         confirm_ack,
@@ -840,12 +958,12 @@ class GPTImage2Plugin(Star):
                     if chain:
                         await next_event.send(MessageChain(chain=chain))
                 else:
-                    await next_event.send(
-                        MessageChain().message(
-                            "还没有准备好的提示词。"
-                            "请继续描述你的图像需求，"
-                            "或发送 /image2 plan quit 退出。"
-                        )
+                    await self._send_text(
+                        next_event,
+                        "还没有准备好的提示词。"
+                        "请继续描述你的图像需求，"
+                        "或发送 /image2 plan quit 退出。",
+                        action="plan-confirm-no-prompt",
                     )
                     controller.keep(
                         timeout=self._waiter_timeout(plan_config.timeout),
@@ -863,12 +981,12 @@ class GPTImage2Plugin(Star):
 
             # ── 其他 /image2 命令：拦截提示 ─────────────────
             if text.lower().startswith("/image2") or text.lower().startswith("image2"):
-                await next_event.send(
-                    MessageChain().message(
-                        "当前处于 Plan 会话中。"
-                        "请先使用 /image2 plan confirm 生成图片"
-                        "或 /image2 plan quit 退出。"
-                    )
+                await self._send_text(
+                    next_event,
+                    "当前处于 Plan 会话中。"
+                    "请先使用 /image2 plan confirm 生成图片"
+                    "或 /image2 plan quit 退出。",
+                    action="plan-command-blocked",
                 )
                 controller.keep(
                     timeout=self._waiter_timeout(plan_config.timeout),
@@ -884,10 +1002,10 @@ class GPTImage2Plugin(Star):
             # ── 普通文本/参考图：调用 Responses API 规划 ─────
             session = self._plan_sessions.get(session_id)
             if session is None:
-                await next_event.send(
-                    MessageChain().message(
-                        "Plan 会话已失效，请重新使用 /image2 plan 进入。"
-                    )
+                await self._send_text(
+                    next_event,
+                    "Plan 会话已失效，请重新使用 /image2 plan 进入。",
+                    action="plan-session-missing",
                 )
                 controller.stop()
                 return
@@ -906,8 +1024,10 @@ class GPTImage2Plugin(Star):
 
             # ── 空文本 ──────────────────────────────────────
             if not text and not new_reference_urls:
-                await next_event.send(
-                    MessageChain().message("请发送文字描述或参考图来说明你的图像需求。")
+                await self._send_text(
+                    next_event,
+                    "请发送文字描述或参考图来说明你的图像需求。",
+                    action="plan-empty-input",
                 )
                 controller.keep(
                     timeout=self._waiter_timeout(plan_config.timeout),
@@ -968,10 +1088,10 @@ class GPTImage2Plugin(Star):
                     f"{self._event_context(next_event)} round={session.round_count} "
                     f"error={e}"
                 )
-                await next_event.send(
-                    MessageChain().message(
-                        f"模型调用失败：{e}\n请重试或发送 /image2 plan quit 退出。"
-                    )
+                await self._send_text(
+                    next_event,
+                    f"模型调用失败：{e}\n请重试或发送 /image2 plan quit 退出。",
+                    action="plan-model-error",
                 )
                 controller.keep(
                     timeout=self._waiter_timeout(plan_config.timeout),
@@ -997,7 +1117,7 @@ class GPTImage2Plugin(Star):
                 summary = display or "我已根据你的描述和参考图整理好图像需求。"
                 display = (
                     f"✅ 我已整理好图像需求。\n\n{summary}\n\n"
-                    f"将用于生成的提示词：\n{final_prompt}\n\n"
+                    "完整生成提示词已保存，确认生成时会单独发送。\n"
                     "发送 /image2 plan confirm 生成图片，"
                     "或 /image2 plan quit 退出。"
                 )
@@ -1009,7 +1129,7 @@ class GPTImage2Plugin(Star):
                     "或发送 /image2 plan quit 退出。"
                 )
 
-            await next_event.send(MessageChain().message(display))
+            await self._send_text(next_event, display, action="plan-display")
             controller.keep(
                 timeout=self._waiter_timeout(plan_config.timeout),
                 reset_timeout=True,
@@ -1033,8 +1153,10 @@ class GPTImage2Plugin(Star):
                 action="plan-timeout",
             )
             if not sent:
-                await event.send(
-                    MessageChain().message("⌛ Plan 会话等待超时，已自动退出。")
+                await self._send_text(
+                    event,
+                    "⌛ Plan 会话等待超时，已自动退出。",
+                    action="plan-timeout-fallback",
                 )
         except Exception as e:
             logger.error(
@@ -1048,7 +1170,11 @@ class GPTImage2Plugin(Star):
                 action="plan-error",
             )
             if not sent:
-                await event.send(MessageChain().message(f"Plan 模式发生错误：{e}"))
+                await self._send_text(
+                    event,
+                    f"Plan 模式发生错误：{e}",
+                    action="plan-error-fallback",
+                )
         finally:
             self._cleanup_plan(session_id)
             event.stop_event()
@@ -1064,8 +1190,10 @@ class GPTImage2Plugin(Star):
             logger.info(
                 f"[GPTImage2] draw rejected empty prompt {self._event_context(event)}"
             )
-            yield event.plain_result(
-                "请提供图片描述提示词。用法：/image2 draw <提示词>"
+            yield await self._text_result(
+                event,
+                "请提供图片描述提示词。用法：/image2 draw <提示词>",
+                action="draw-empty-prompt",
             )
             return
 
@@ -1102,9 +1230,11 @@ class GPTImage2Plugin(Star):
             logger.info(
                 f"[GPTImage2] edit rejected empty prompt {self._event_context(event)}"
             )
-            yield event.plain_result(
+            yield await self._text_result(
+                event,
                 "请提供编辑提示词。用法：/image2 edit <提示词>"
-                "（请附带图片或引用包含图片的消息）"
+                "（请附带图片或引用包含图片的消息）",
+                action="edit-empty-prompt",
             )
             return
 
@@ -1124,16 +1254,18 @@ class GPTImage2Plugin(Star):
                 "[GPTImage2] edit rejected no input images "
                 f"{self._event_context(event)} message_components={len(messages)}"
             )
-            yield event.plain_result(
+            yield await self._text_result(
+                event,
                 "没有找到可编辑的图片。请附带图片，"
-                "或引用一条包含图片的消息后使用 /image2 edit <提示词>。"
+                "或引用一条包含图片的消息后使用 /image2 edit <提示词>。",
+                action="edit-no-images",
             )
             return
 
         try:
             client = self._get_client()
         except ValueError as e:
-            yield event.plain_result(str(e))
+            yield await self._text_result(event, str(e), action="edit-config-error")
             return
 
         params = self._get_params()
@@ -1180,7 +1312,11 @@ class GPTImage2Plugin(Star):
                 f"{self._event_context(event)} mode={api_mode} "
                 f"elapsed_ms={self._elapsed_ms(started)} error={e}"
             )
-            yield event.plain_result(f"GPT Image2 调用失败：{e}")
+            yield await self._text_result(
+                event,
+                f"GPT Image2 调用失败：{e}",
+                action="edit-api-error",
+            )
             return
         except Exception as e:
             logger.error(
@@ -1189,7 +1325,11 @@ class GPTImage2Plugin(Star):
                 f"elapsed_ms={self._elapsed_ms(started)} error={type(e).__name__}: {e}\n"
                 f"{traceback.format_exc()}"
             )
-            yield event.plain_result(f"GPT Image2 调用失败：{e}")
+            yield await self._text_result(
+                event,
+                f"GPT Image2 调用失败：{e}",
+                action="edit-unexpected-error",
+            )
             return
 
         logger.info(
@@ -1211,7 +1351,11 @@ class GPTImage2Plugin(Star):
                 "[GPTImage2] edit returned no displayable images "
                 f"{self._event_context(event)} results={len(results)}"
             )
-            yield event.plain_result("GPT Image2 未返回任何可显示的图片。")
+            yield await self._text_result(
+                event,
+                "GPT Image2 未返回任何可显示的图片。",
+                action="edit-empty-result",
+            )
 
     # ── 回复构建 ────────────────────────────────────────────────
 

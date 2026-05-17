@@ -74,31 +74,34 @@ PLAN_SYSTEM_PROMPT = (
     "in Chinese if the user's description is vague or incomplete.\n"
     "2. Keep all user-facing explanations, summaries, and next-step guidance in "
     "Simplified Chinese.\n"
-    "3. When you are ready to finalize, first write a concise Chinese summary "
+    "3. During intermediate planning, only expose Chinese clarification questions, "
+    "Chinese summaries, and Chinese checklist items to the user. Do not expose the "
+    "full final image generation prompt in the normal conversation text.\n"
+    "4. When you are ready to finalize, first write a concise Chinese summary "
     "for the user under the heading `中文摘要：`, explaining the key subject, "
     "reference-image usage, composition, style, and constraints.\n"
-    "4. After the Chinese summary, output the final image generation prompt inside "
-    "a clear "
+    "5. After the Chinese summary, still include the final image generation prompt "
+    "inside a clear "
     "FINAL_PROMPT section.\n"
-    "5. Use the following format:\n"
+    "6. Use the following format:\n"
     "中文摘要：\n"
     "- 用中文列出关键需求摘要。\n"
     "[FINAL_PROMPT]\n"
     "...your final image generation prompt here...\n"
     "[/FINAL_PROMPT]\n"
-    "6. You may also use the inline format: [FINAL_PROMPT: ...]\n"
-    "7. Keep your Chinese clarifying responses concise but helpful.\n"
-    "8. The content inside FINAL_PROMPT may use English, Chinese, or a mixed "
+    "7. You may also use the inline format: [FINAL_PROMPT: ...]\n"
+    "8. Keep your Chinese clarifying responses concise but helpful.\n"
+    "9. The content inside FINAL_PROMPT may use English, Chinese, or a mixed "
     "Chinese-English prompt, depending on what best preserves the user's intent. "
     "Do not force everything into English.\n"
-    "9. For general visual description, you may use concise image-generation terms "
+    "10. For general visual description, you may use concise image-generation terms "
     "in English, Chinese, or mixed language.\n"
-    "10. If any text, title, sign, UI copy, caption, label, logo text, or visible "
+    "11. If any text, title, sign, UI copy, caption, label, logo text, or visible "
     "characters should appear in the image, preserve that text exactly in its "
     "original language and characters. Do not translate, romanize, rewrite, "
     "summarize, or replace it. Quote the exact visible text, for example: "
     "必须保留文字：「正在观察猪」.\n"
-    "11. If reference images are provided, the final prompt should explicitly say "
+    "12. If reference images are provided, the final prompt should explicitly say "
     "how to use them, for example preserving identity, following style, or using "
     "them as visual references."
 )
@@ -128,13 +131,6 @@ def parse_final_prompt(text: str) -> str | None:
     if m:
         return m.group(1).strip()
     return None
-
-
-def strip_final_prompt_tags(text: str) -> str:
-    """去除 FINAL_PROMPT 标记，返回纯文本（用于展示给用户）。"""
-    text = _FINAL_PROMPT_BLOCK_RE.sub(r"\1", text)
-    text = _FINAL_PROMPT_INLINE_RE.sub(r"\1", text)
-    return text.strip()
 
 
 def remove_final_prompt_section(text: str) -> str:
