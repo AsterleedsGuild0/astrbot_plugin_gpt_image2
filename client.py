@@ -424,7 +424,7 @@ class GPTImageClient:
             "model": self.responses_model,
             "input": input_data,
             "tools": [tool],
-            "tool_choice": "required",
+            "tool_choice": {"type": "image_generation"},
         }
 
         start = perf_counter()

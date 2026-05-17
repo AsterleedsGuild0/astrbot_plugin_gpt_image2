@@ -49,7 +49,6 @@ from .plan import (
     remove_final_prompt_section,
     parse_final_prompt,
 )
-from .text_image import TextImageFontError, TextImageOptions, render_text_to_image
 
 
 class SenderSessionFilter(SessionFilter):
@@ -146,7 +145,7 @@ class GPTImage2Plugin(Star):
         action: str,
         prefer_image: bool | None = None,
     ) -> MessageChain:
-        """构建文本回复消息链；优先使用 image2 卡片，失败后用内置 Pillow 兜底。"""
+        """构建文本回复消息链；使用 image2 Markdown 卡片，失败则回退纯文本。"""
         use_image = self._render_text_as_image_enabled()
         if prefer_image is not None:
             use_image = prefer_image
@@ -156,30 +155,10 @@ class GPTImage2Plugin(Star):
             if card_chain is not None:
                 return card_chain
 
-            try:
-                image_path = render_text_to_image(
-                    text,
-                    self._get_text_image_dir(),
-                    options=self._get_text_image_options(),
-                )
-                logger.info(
-                    "[GPTImage2] built-in fallback text-to-image rendered "
-                    f"action={action} path={image_path}"
-                )
-                return MessageChain(chain=[CompImage.fromFileSystem(image_path)])
-            except TextImageFontError as e:
-                logger.warning(
-                    "[GPTImage2] built-in fallback text-to-image font missing, "
-                    "fallback to plain text "
-                    f"action={action} error={e}"
-                )
-                return MessageChain().message(f"⚠️ {e}\n\n{text}")
-            except Exception as e:
-                logger.warning(
-                    "[GPTImage2] built-in fallback text-to-image failed, "
-                    "fallback to plain text "
-                    f"action={action} error={type(e).__name__}: {e}"
-                )
+            logger.warning(
+                "[GPTImage2] image2 markdown card render failed, "
+                f"fallback to plain text action={action}"
+            )
 
         return MessageChain().message(text)
 
@@ -201,7 +180,7 @@ class GPTImage2Plugin(Star):
         except Exception as e:
             logger.warning(
                 "[GPTImage2] image2 markdown card render failed, "
-                "fallback to built-in renderer "
+                "fallback to plain text "
                 f"action={action} error={type(e).__name__}: {e}"
             )
             return None
@@ -211,7 +190,7 @@ class GPTImage2Plugin(Star):
         if chain is None:
             logger.warning(
                 "[GPTImage2] image2 markdown card returned invalid image, "
-                "fallback to built-in renderer "
+                "fallback to plain text "
                 f"action={action} {self._rendered_image_diagnostic(rendered)}"
             )
             return None
@@ -618,23 +597,6 @@ class GPTImage2Plugin(Star):
             )
         return self._text_image_dir
 
-    def _get_text_image_options(self) -> TextImageOptions:
-        """读取插件内置文转图参数。"""
-        try:
-            width = int(self.config.get("text_image_width", 1200))
-        except (TypeError, ValueError):
-            width = 1200
-        try:
-            font_size = int(self.config.get("text_image_font_size", 32))
-        except (TypeError, ValueError):
-            font_size = 32
-        font_path = self.config.get("text_image_font_path") or None
-        return TextImageOptions(
-            width=max(480, width),
-            font_size=max(16, font_size),
-            font_path=str(font_path) if font_path else None,
-        )
-
     def _extract_prompt(self, event: AstrMessageEvent, subcommand: str) -> str:
         """从原始消息中提取子命令后的完整提示词。"""
         message = event.message_str.strip()
@@ -902,6 +864,72 @@ class GPTImage2Plugin(Star):
             )
         return data_urls
 
+    @staticmethod
+    def _is_image_input_unsupported(error_msg: str) -> bool:
+        """判断错误是否表示模型不支持图片输入。"""
+        lower = error_msg.lower()
+        return (
+            "does not support image input" in lower
+            or "does not support image" in lower
+            or ("cannot read" in lower and "image" in lower)
+            or "image input is not supported" in lower
+            or ("model does not support" in lower and "image" in lower)
+        )
+
+    async def _call_draw_api(
+        self,
+        client: GPTImageClient,
+        prompt: str,
+        params: ImageParams,
+        api_mode: str,
+        reference_images: list,
+        reference_data_urls: list[str],
+        reference_count: int,
+        action: str,
+    ) -> list[ImageResult]:
+        """调用生图 API 并返回结果列表。
+
+        根据 api_mode 和参考图数量选择正确的 API 路径。
+        """
+        if reference_count and api_mode == "images":
+            image_paths: list[str] = []
+            if reference_images:
+                for idx, image in enumerate(reference_images, start=1):
+                    path = await image_to_file_path(image)
+                    image_paths.append(path)
+                    logger.debug(
+                        "[GPTImage2] reference image converted to file "
+                        f"action={action} index={idx} path={path} "
+                        f"bytes={self._file_size(path)}"
+                    )
+            else:
+                output_dir = self._get_output_dir()
+                for idx, data_url in enumerate(reference_data_urls, start=1):
+                    path = save_base64_to_file(data_url, output_dir, "png")
+                    image_paths.append(path)
+                    logger.debug(
+                        "[GPTImage2] reference data URL saved to file "
+                        f"action={action} index={idx} path={path} "
+                        f"bytes={self._file_size(path)}"
+                    )
+            return await client.edit_images_api(prompt, image_paths, params)
+
+        if reference_count:
+            data_urls = list(reference_data_urls)
+            if not data_urls:
+                for idx, image in enumerate(reference_images, start=1):
+                    data_url = await image_to_data_url(image)
+                    data_urls.append(data_url)
+                    logger.debug(
+                        "[GPTImage2] reference image converted to data URL "
+                        f"action={action} index={idx} chars={len(data_url)}"
+                    )
+            return await client.edit_responses_api(prompt, data_urls, params)
+
+        if api_mode == "images":
+            return await client.generate_images_api(prompt, params)
+        return await client.generate_responses_api(prompt, params)
+
     async def _generate_draw_chain(
         self,
         event: AstrMessageEvent,
@@ -956,45 +984,34 @@ class GPTImage2Plugin(Star):
 
         started = perf_counter()
         try:
-            if reference_count and api_mode == "images":
-                image_paths: list[str] = []
-                if reference_images:
-                    for idx, image in enumerate(reference_images, start=1):
-                        path = await image_to_file_path(image)
-                        image_paths.append(path)
-                        logger.debug(
-                            "[GPTImage2] reference image converted to file "
-                            f"action={action} index={idx} path={path} "
-                            f"bytes={self._file_size(path)}"
-                        )
-                else:
-                    output_dir = self._get_output_dir()
-                    for idx, data_url in enumerate(reference_data_urls, start=1):
-                        path = save_base64_to_file(data_url, output_dir, "png")
-                        image_paths.append(path)
-                        logger.debug(
-                            "[GPTImage2] reference data URL saved to file "
-                            f"action={action} index={idx} path={path} "
-                            f"bytes={self._file_size(path)}"
-                        )
-                results = await client.edit_images_api(prompt, image_paths, params)
-            elif reference_count:
-                data_urls = list(reference_data_urls)
-                if not data_urls:
-                    for idx, image in enumerate(reference_images, start=1):
-                        data_url = await image_to_data_url(image)
-                        data_urls.append(data_url)
-                        logger.debug(
-                            "[GPTImage2] reference image converted to data URL "
-                            f"action={action} index={idx} chars={len(data_url)}"
-                        )
-                results = await client.edit_responses_api(prompt, data_urls, params)
-            elif api_mode == "images":
-                results = await client.generate_images_api(prompt, params)
-            else:
-                results = await client.generate_responses_api(prompt, params)
+            results = await self._call_draw_api(
+                client=client,
+                prompt=prompt,
+                params=params,
+                api_mode=api_mode,
+                reference_images=reference_images,
+                reference_data_urls=reference_data_urls,
+                reference_count=reference_count,
+                action=action,
+            )
         except RuntimeError as e:
+            error_msg = str(e)
             logger.warning(f"[GPTImage2] draw API failed action={action} error={e}")
+            if reference_count and self._is_image_input_unsupported(error_msg):
+                await self._send_text(
+                    event,
+                    "## ⚠️ 上游拒绝读取参考图\n\n"
+                    f"错误：`{e}`\n\n"
+                    f"- 当前 API 模式：`{api_mode}`\n"
+                    f"- 参考图数量：`{reference_count}`\n"
+                    f"- 生图模型：`{self.config.get('model', 'gpt-image-2')}`\n"
+                    f"- Responses 模型：`{self.config.get('responses_model', 'gpt-5.5')}`\n\n"
+                    "这通常表示上游服务实际路由到的模型不支持图片输入，"
+                    "或服务商对当前 endpoint/model 的图像输入兼容性有问题。"
+                    "插件不会自动丢弃参考图重试，以免生成结果偏离 Plan。",
+                    action=f"{action}-image-input-error",
+                )
+                return []
             await self._send_text(
                 event,
                 f"## ⚠️ GPT Image2 调用失败\n\n`{e}`",

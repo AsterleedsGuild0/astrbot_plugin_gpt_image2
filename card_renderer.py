@@ -51,9 +51,10 @@ CARD_TEMPLATE = """<!doctype html>
       background: radial-gradient(circle at 18px 18px, rgba(56, 199, 189, 0.08) 1.5px, transparent 0) 0 0 / 18px 18px,
         linear-gradient(135deg, #edfafa 0%, #f8fcff 100%);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC",
-        "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif,
-        "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji";
+      font-family: "Noto Sans SC", "Noto Sans CJK SC", "Source Han Sans SC",
+        "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji",
+        "Noto Color Emoji";
       font-size: 28px;
       line-height: 1.62;
     }
