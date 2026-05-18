@@ -28,6 +28,30 @@
     "type": "string",
     "default": "gpt-5.5"
   },
+  "fallback_api_providers": {
+    "description": "备用生图 API 站点",
+    "type": "list",
+    "default": [],
+    "hint": "用于 draw/edit 一次性生图，以及 /plan confirm 最后的实际生图；Plan 对话整理阶段不使用该列表。WebUI 的列表项是字符串：点击 + 添加一条备用站点字符串。最简单写法只填 URL，例如 https://api-backup.example.com/v1，会继承主 api_key/api_mode/model/responses_model。若要指定独立 key、API 模式或模型，使用 key=value 写法：name=backup-1, base_url=https://api-backup.example.com/v1, api_key=sk-xxx, api_mode=responses, model=gpt-image-2, responses_model=gpt-5.5。官方兜底写法：role=authoritative_fallback, adaptive=false；该类站点固定在普通站点之后。调用顺序：普通站点按健康状态排序 → 权威兜底站点。",
+    "items": {
+      "description": "备用站点字符串",
+      "type": "string",
+      "default": "",
+      "hint": "推荐写法 1：只填 URL，例如 https://api-backup.example.com/v1（继承主 API Key、API 模式和模型）。推荐写法 2：key=value，例如 name=backup-1, base_url=https://api-backup.example.com/v1, api_key=sk-xxx, api_mode=responses, model=gpt-image-2, responses_model=gpt-5.5。官方兜底追加 role=authoritative_fallback, adaptive=false。"
+    }
+  },
+  "adaptive_provider_priority": {
+    "description": "自适应调整生图站点优先级",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后插件会根据 draw/edit 和 /plan confirm 的生图成功/失败情况自动调整本次运行时的站点尝试顺序；不会改写 WebUI 配置。健康状态保存在 AstrBot data/plugin_data 下，测试包重装不会清除。"
+  },
+  "provider_failure_cooldown": {
+    "description": "失败站点降级冷却时间（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "站点失败后会在该时间内降低优先级，但不会被永久禁用；如果所有站点都在冷却中，仍会继续按健康评分尝试。"
+  },
   "size": {
     "description": "图片尺寸",
     "type": "string",
@@ -67,7 +91,7 @@
   "timeout": {
     "description": "请求超时时间（秒）",
     "type": "int",
-    "default": 600
+    "default": 120
   },
   "response_format_b64_json": {
     "description": "请求返回 Base64 图片",

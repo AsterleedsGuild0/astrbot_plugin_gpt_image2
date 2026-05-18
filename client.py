@@ -56,7 +56,7 @@ class GPTImageClient:
         base_url: str,
         model: str,
         responses_model: str,
-        timeout: int = 600,
+        timeout: int = 120,
         response_format_b64_json: bool = True,
     ) -> None:
         self.api_key = api_key
@@ -87,8 +87,7 @@ class GPTImageClient:
         if status_code == 524:
             return (
                 "HTTP 524 服务商网关等待模型响应超时。"
-                "请稍后重试；如果你正在 Plan 模式中，可以再次发送 "
-                "`/plan confirm` 或 `/image2 plan confirm` 复用已整理好的提示词。"
+                "请稍后重试，或切换到更稳定的备用 API 站点。"
             )
         try:
             if isinstance(body, str) and body:
@@ -288,6 +287,16 @@ class GPTImageClient:
         """
         items = data if isinstance(data, list) else data.get("data", [])
         if not isinstance(items, list) or not items:
+            if isinstance(data, dict):
+                err = data.get("error")
+                if isinstance(err, dict) and err.get("message"):
+                    raise RuntimeError(f"API 返回错误：{err['message']}")
+                if isinstance(data.get("message"), str):
+                    raise RuntimeError(f"API 返回错误：{data['message']}")
+                keys = ", ".join(str(key) for key in data.keys()) or "无"
+                raise RuntimeError(
+                    f"API 返回结构异常：data 为空或非数组（顶层字段：{keys}）"
+                )
             raise RuntimeError("API 返回结构异常：data 为空或非数组")
 
         results: list[ImageResult] = []

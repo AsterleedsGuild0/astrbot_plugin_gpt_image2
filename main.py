@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass
+import hashlib
 import io
+import json
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, time
 import traceback
 import uuid
 
@@ -111,6 +114,22 @@ class PlanSessionFilter(SessionFilter):
         return None
 
 
+@dataclass(frozen=True)
+class ImageAPIProviderConfig:
+    """Draw/edit API provider config. Plan mode keeps its own config path."""
+
+    name: str
+    api_key: str
+    base_url: str
+    api_mode: str
+    model: str
+    responses_model: str
+    provider_id: str
+    configured_order: int
+    role: str = "normal"
+    adaptive: bool = True
+
+
 @register(
     "gpt_image2",
     "233",
@@ -126,6 +145,7 @@ class GPTImage2Plugin(Star):
         self.plugin_name = "astrbot_plugin_gpt_image2"
         self._output_dir: str | None = None
         self._text_image_dir: str | None = None
+        self._provider_stats_cache: dict | None = None
         self._plan_sessions: dict[str, PlanSession] = {}
 
     # ── 工具方法 ────────────────────────────────────────────────
@@ -528,6 +548,15 @@ class GPTImage2Plugin(Star):
         return repr(normalized)
 
     @staticmethod
+    def _safe_markdown_preview(text: str, *, limit: int = 160) -> str:
+        """Compact provider errors for Markdown cards without inline-code breakage."""
+        normalized = " ".join(str(text).replace("\x00", "�").split())
+        normalized = normalized.replace("`", "'")
+        if len(normalized) > limit:
+            normalized = normalized[:limit].rstrip() + "…"
+        return normalized or "-"
+
+    @staticmethod
     def _is_valid_image_file(path: str) -> bool:
         try:
             with Path(path).open("rb") as image_file:
@@ -604,18 +633,463 @@ class GPTImage2Plugin(Star):
 
     def _get_client(self) -> GPTImageClient:
         """从配置创建图片 API 客户端"""
-        api_key = self.config.get("api_key", "")
-        if not api_key:
-            raise ValueError("未配置 API Key。请在插件设置中填入 API Key。")
+        providers = self._get_image_api_provider_configs()
+        return self._build_image_api_client(providers[0])
 
+    def _build_image_api_client(
+        self,
+        provider: ImageAPIProviderConfig,
+    ) -> GPTImageClient:
         return GPTImageClient(
-            api_key=api_key,
-            base_url=self.config.get("base_url", "https://api.openai.com/v1"),
-            model=self.config.get("model", "gpt-image-2"),
-            responses_model=self.config.get("responses_model", "gpt-5.5"),
-            timeout=self.config.get("timeout", 600),
+            api_key=provider.api_key,
+            base_url=provider.base_url,
+            model=provider.model,
+            responses_model=provider.responses_model,
+            timeout=self.config.get("timeout", 120),
             response_format_b64_json=self.config.get("response_format_b64_json", True),
         )
+
+    def _get_image_api_provider_configs(self) -> list[ImageAPIProviderConfig]:
+        """Build ordered draw/edit provider list: primary config + fallback list."""
+        configs: list[ImageAPIProviderConfig] = []
+        base_url = str(self.config.get("base_url", "https://api.openai.com/v1") or "")
+        api_key = str(self.config.get("api_key", "") or "")
+        api_mode = self._normalize_api_mode(self.config.get("api_mode", "images"))
+        model = str(self.config.get("model", "gpt-image-2") or "gpt-image-2")
+        responses_model = str(
+            self.config.get("responses_model", "gpt-5.5") or "gpt-5.5"
+        )
+        if api_key.strip():
+            configs.append(
+                ImageAPIProviderConfig(
+                    name="primary",
+                    api_key=api_key.strip(),
+                    base_url=base_url.strip() or "https://api.openai.com/v1",
+                    api_mode=api_mode,
+                    model=model.strip() or "gpt-image-2",
+                    responses_model=responses_model.strip() or "gpt-5.5",
+                    provider_id="name:primary",
+                    configured_order=0,
+                    role="normal",
+                    adaptive=True,
+                )
+            )
+
+        for index, item in enumerate(self._get_fallback_api_provider_items(), start=1):
+            provider = self._parse_fallback_api_provider(
+                item,
+                index=index,
+                default_api_key=api_key,
+                default_base_url=base_url,
+                default_api_mode=api_mode,
+                default_model=model,
+                default_responses_model=responses_model,
+            )
+            if provider is not None:
+                configs.append(provider)
+
+        if not configs:
+            raise ValueError(
+                "未配置任何可用的生图 API Key。请配置 api_key，"
+                "或在 fallback_api_providers 中配置 api_key。"
+            )
+        return self._rank_image_api_provider_configs(configs)
+
+    def _get_fallback_api_provider_items(self) -> list:
+        value = self.config.get("fallback_api_providers", [])
+        if value is None or value == "":
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"[GPTImage2] fallback_api_providers JSON parse failed error={e}"
+                )
+                return []
+            return parsed if isinstance(parsed, list) else []
+        logger.warning(
+            "[GPTImage2] fallback_api_providers ignored invalid type "
+            f"type={type(value).__name__}"
+        )
+        return []
+
+    def _parse_fallback_api_provider(
+        self,
+        item: object,
+        *,
+        index: int,
+        default_api_key: str,
+        default_base_url: str,
+        default_api_mode: str,
+        default_model: str,
+        default_responses_model: str,
+    ) -> ImageAPIProviderConfig | None:
+        """Parse one fallback provider from WebUI list string or legacy dict."""
+        if isinstance(item, dict):
+            data = dict(item)
+        elif isinstance(item, str):
+            data = self._parse_fallback_api_provider_string(item)
+        else:
+            logger.warning(
+                "[GPTImage2] skip invalid fallback API provider "
+                f"index={index} type={type(item).__name__}"
+            )
+            return None
+
+        if not data:
+            return None
+
+        explicit_name = str(data.get("name") or "").strip()
+        provider_name = explicit_name or f"fallback-{index}"
+        provider_base_url = str(data.get("base_url") or default_base_url).strip()
+        provider_api_key = str(data.get("api_key") or default_api_key).strip()
+        provider_api_mode = self._normalize_api_mode(
+            data.get("api_mode") or default_api_mode
+        )
+        provider_role = self._normalize_provider_role(data.get("role") or "normal")
+        provider_adaptive = self._normalize_bool(
+            data.get("adaptive"), default=provider_role != "authoritative_fallback"
+        )
+        provider_model = str(data.get("model") or default_model).strip()
+        provider_responses_model = str(
+            data.get("responses_model") or default_responses_model
+        ).strip()
+
+        if not provider_base_url:
+            logger.warning(
+                "[GPTImage2] skip fallback API provider without base_url "
+                f"index={index} name={provider_name or '-'}"
+            )
+            return None
+        if not provider_api_key:
+            logger.warning(
+                "[GPTImage2] skip fallback API provider without api_key "
+                f"index={index} name={provider_name or '-'}"
+            )
+            return None
+
+        return ImageAPIProviderConfig(
+            name=provider_name or f"fallback-{index}",
+            api_key=provider_api_key,
+            base_url=provider_base_url or "https://api.openai.com/v1",
+            api_mode=provider_api_mode,
+            model=provider_model or "gpt-image-2",
+            responses_model=provider_responses_model or "gpt-5.5",
+            provider_id=self._build_provider_id(
+                explicit_name,
+                provider_base_url,
+                provider_api_mode,
+                provider_model,
+                provider_responses_model,
+            ),
+            configured_order=index,
+            role=provider_role,
+            adaptive=provider_adaptive,
+        )
+
+    @staticmethod
+    def _normalize_api_mode(value: object) -> str:
+        mode = str(value or "images").strip().lower()
+        return mode if mode in {"images", "responses"} else "images"
+
+    @staticmethod
+    def _normalize_provider_role(value: object) -> str:
+        role = str(value or "normal").strip().lower().replace("-", "_")
+        aliases = {
+            "official": "authoritative_fallback",
+            "official_fallback": "authoritative_fallback",
+            "authoritative": "authoritative_fallback",
+            "authority": "authoritative_fallback",
+            "authority_fallback": "authoritative_fallback",
+            "fallback_authoritative": "authoritative_fallback",
+        }
+        role = aliases.get(role, role)
+        return role if role in {"normal", "authoritative_fallback"} else "normal"
+
+    @staticmethod
+    def _normalize_bool(value: object, *, default: bool) -> bool:
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _build_provider_id(
+        name: str,
+        base_url: str,
+        api_mode: str,
+        model: str,
+        responses_model: str,
+    ) -> str:
+        if name.strip():
+            return f"name:{name.strip().lower()}"
+        source = "|".join(
+            [
+                base_url.strip().rstrip("/"),
+                api_mode.strip().lower(),
+                model.strip(),
+                responses_model.strip(),
+            ]
+        )
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+        return f"config:{digest}"
+
+    def _adaptive_provider_priority_enabled(self) -> bool:
+        value = self.config.get("adaptive_provider_priority", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
+
+    def _provider_failure_cooldown(self) -> int:
+        try:
+            return max(0, int(self.config.get("provider_failure_cooldown", 300)))
+        except (TypeError, ValueError):
+            return 300
+
+    def _provider_stats_path(self) -> Path:
+        plugin_name = getattr(self, "name", self.plugin_name)
+        return (
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / plugin_name
+            / "provider_stats.json"
+        )
+
+    def _load_provider_stats(self) -> dict:
+        if self._provider_stats_cache is not None:
+            return self._provider_stats_cache
+
+        path = self._provider_stats_path()
+        if not path.exists():
+            self._provider_stats_cache = {"version": 1, "providers": {}}
+            return self._provider_stats_cache
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(
+                "[GPTImage2] provider stats load failed "
+                f"path={path} error={type(e).__name__}: {e}"
+            )
+            data = {"version": 1, "providers": {}}
+
+        if not isinstance(data, dict):
+            data = {"version": 1, "providers": {}}
+        if not isinstance(data.get("providers"), dict):
+            data["providers"] = {}
+        data.setdefault("version", 1)
+        self._provider_stats_cache = data
+        return data
+
+    def _save_provider_stats(self) -> None:
+        if self._provider_stats_cache is None:
+            return
+        path = self._provider_stats_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._provider_stats_cache, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning(
+                "[GPTImage2] provider stats save failed "
+                f"path={path} error={type(e).__name__}: {e}"
+            )
+
+    @staticmethod
+    def _provider_stat_int(item: dict, key: str) -> int:
+        try:
+            return int(item.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _provider_stat_float(item: dict, key: str) -> float:
+        try:
+            return float(item.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _provider_health_score(self, item: dict, now: float) -> float:
+        success_count = self._provider_stat_int(item, "success_count")
+        failure_count = self._provider_stat_int(item, "failure_count")
+        consecutive_failures = self._provider_stat_int(item, "consecutive_failures")
+        last_success_at = self._provider_stat_float(item, "last_success_at")
+        last_failure_at = self._provider_stat_float(item, "last_failure_at")
+        cooldown_until = self._provider_stat_float(item, "cooldown_until")
+
+        score = min(success_count, 20) * 2.0
+        score -= min(failure_count, 20) * 1.5
+        score -= min(consecutive_failures, 10) * 8.0
+
+        if last_success_at > 0:
+            success_age = max(0.0, now - last_success_at)
+            score += max(0.0, 50.0 * (1.0 - success_age / 3600.0))
+        if last_failure_at > 0:
+            failure_age = max(0.0, now - last_failure_at)
+            score -= max(0.0, 20.0 * (1.0 - failure_age / 900.0))
+        if cooldown_until > now:
+            score -= 100.0
+        return score
+
+    def _rank_image_api_provider_configs(
+        self,
+        configs: list[ImageAPIProviderConfig],
+    ) -> list[ImageAPIProviderConfig]:
+        if len(configs) <= 1:
+            return configs
+
+        adaptive_enabled = self._adaptive_provider_priority_enabled()
+        stats = self._load_provider_stats().get("providers", {})
+        now = time()
+        ranked: list[tuple[int, bool, float, int, ImageAPIProviderConfig]] = []
+        debug_items: list[str] = []
+        for provider in configs:
+            item = stats.get(provider.provider_id, {})
+            item = item if isinstance(item, dict) else {}
+            cooldown_until = self._provider_stat_float(item, "cooldown_until")
+            adaptive_for_provider = adaptive_enabled and provider.adaptive
+            cooldown_active = adaptive_for_provider and cooldown_until > now
+            score = (
+                self._provider_health_score(item, now) if adaptive_for_provider else 0.0
+            )
+            role_rank = 1 if provider.role == "authoritative_fallback" else 0
+            ranked.append(
+                (
+                    role_rank,
+                    cooldown_active,
+                    -score,
+                    provider.configured_order,
+                    provider,
+                )
+            )
+            debug_items.append(
+                f"{provider.name}/{provider.api_mode}/{provider.role}:"
+                f"adaptive={provider.adaptive} score={score:.1f} "
+                f"cooldown={int(max(0, cooldown_until - now))}s"
+            )
+
+        ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        sorted_configs = [item[4] for item in ranked]
+        if [p.provider_id for p in sorted_configs] != [p.provider_id for p in configs]:
+            logger.info(
+                "[GPTImage2] adaptive provider priority reordered "
+                f"order={[p.name for p in sorted_configs]} stats={debug_items}"
+            )
+        return sorted_configs
+
+    def _record_image_provider_result(
+        self,
+        provider: ImageAPIProviderConfig,
+        *,
+        success: bool,
+        error_msg: str = "",
+    ) -> None:
+        if not self._adaptive_provider_priority_enabled():
+            return
+
+        stats = self._load_provider_stats()
+        providers = stats.setdefault("providers", {})
+        if not isinstance(providers, dict):
+            providers = {}
+            stats["providers"] = providers
+
+        item = providers.get(provider.provider_id)
+        if not isinstance(item, dict):
+            item = {}
+            providers[provider.provider_id] = item
+
+        now = time()
+        item.update(
+            {
+                "name": provider.name,
+                "base_url": provider.base_url,
+                "api_mode": provider.api_mode,
+                "model": provider.model,
+                "responses_model": provider.responses_model,
+                "configured_order": provider.configured_order,
+                "role": provider.role,
+                "adaptive": provider.adaptive,
+                "updated_at": now,
+            }
+        )
+
+        if success:
+            item["success_count"] = self._provider_stat_int(item, "success_count") + 1
+            item["consecutive_failures"] = 0
+            item["last_success_at"] = now
+            item["cooldown_until"] = 0
+            item.pop("last_error", None)
+        else:
+            item["failure_count"] = self._provider_stat_int(item, "failure_count") + 1
+            item["consecutive_failures"] = (
+                self._provider_stat_int(item, "consecutive_failures") + 1
+            )
+            item["last_failure_at"] = now
+            item["cooldown_until"] = now + self._provider_failure_cooldown()
+            item["last_error"] = self._safe_markdown_preview(error_msg, limit=240)
+
+        self._save_provider_stats()
+
+    @staticmethod
+    def _parse_fallback_api_provider_string(value: str) -> dict[str, str]:
+        text = value.strip()
+        if not text:
+            return {}
+
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    "[GPTImage2] fallback API provider JSON item parse failed "
+                    f"error={e}"
+                )
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+
+        if "=" not in text:
+            return {"base_url": text}
+
+        data: dict[str, str] = {}
+        for chunk in text.replace(";", ",").split(","):
+            if "=" not in chunk:
+                continue
+            key, raw = chunk.split("=", 1)
+            key = key.strip().lower().replace("-", "_")
+            raw = raw.strip()
+            if key in {"url", "base", "baseurl", "base_url"}:
+                key = "base_url"
+            elif key in {"key", "apikey", "api_key"}:
+                key = "api_key"
+            elif key in {"responses", "responses_model", "response_model"}:
+                key = "responses_model"
+            elif key in {"api", "api_mode", "apimode"}:
+                key = "api_mode"
+            elif key in {"role", "provider_role"}:
+                key = "role"
+            elif key in {"adaptive", "adapt", "adaptive_priority"}:
+                key = "adaptive"
+            elif key not in {
+                "name",
+                "base_url",
+                "api_key",
+                "api_mode",
+                "role",
+                "adaptive",
+                "model",
+                "responses_model",
+            }:
+                continue
+            data[key] = raw
+        return data
 
     def _get_params(self) -> ImageParams:
         """从配置创建参数模型"""
@@ -762,7 +1236,7 @@ class GPTImage2Plugin(Star):
             base_url=base_url,
             model=self.config.get("model", "gpt-image-2"),
             responses_model=self.config.get("responses_model", "gpt-5.5"),
-            timeout=self.config.get("timeout", 600),
+            timeout=self.config.get("timeout", 120),
             response_format_b64_json=self.config.get("response_format_b64_json", True),
         )
 
@@ -874,9 +1348,9 @@ class GPTImage2Plugin(Star):
     def _get_plan_processing_timeout(self, plan_config: PlanConfig) -> int:
         """Plan 处理阶段超时，覆盖模型思考和生图耗时。"""
         try:
-            api_timeout = int(self.config.get("timeout", 600))
+            api_timeout = int(self.config.get("timeout", 120))
         except (TypeError, ValueError):
-            api_timeout = 600
+            api_timeout = 120
         return max(plan_config.timeout, api_timeout + 60)
 
     def _get_max_input_images(self) -> int:
@@ -943,6 +1417,58 @@ class GPTImage2Plugin(Star):
             or "image input is not supported" in lower
             or ("model does not support" in lower and "image" in lower)
         )
+
+    @classmethod
+    def _should_try_next_image_provider(cls, error_msg: str) -> bool:
+        """Return whether a draw/edit failure is likely provider-specific."""
+        lower = error_msg.lower()
+        if cls._is_image_input_unsupported(error_msg):
+            return True
+        if (
+            "网络请求失败" in error_msg
+            or "connecterror" in lower
+            or "timeout" in lower
+            or "timed out" in lower
+            or "connection" in lower
+            or "api 返回错误" in error_msg
+            or "api 返回结构异常" in error_msg
+            or "html 错误页" in error_msg
+            or "invalid endpoint for image generation models" in lower
+        ):
+            return True
+        if not error_msg.startswith("HTTP "):
+            return False
+        parts = error_msg.split(maxsplit=2)
+        try:
+            status_code = int(parts[1])
+        except (IndexError, ValueError):
+            return False
+        return status_code in {
+            400,
+            401,
+            403,
+            408,
+            409,
+            429,
+            500,
+            502,
+            503,
+            504,
+            520,
+            522,
+            524,
+        }
+
+    @classmethod
+    def _provider_error_summary(cls, provider_errors: list[tuple[str, str]]) -> str:
+        if not provider_errors:
+            return ""
+        lines = ["\n\n已尝试的 API 站点："]
+        for name, error in provider_errors:
+            lines.append(
+                f"- **{name}**：{cls._safe_markdown_preview(error, limit=160)}"
+            )
+        return "\n".join(lines)
 
     async def _call_draw_api(
         self,
@@ -1024,25 +1550,30 @@ class GPTImage2Plugin(Star):
             消息组件列表（可空），供 caller yield chain_result 或 event.send
         """
         try:
-            client = self._get_client()
+            provider_configs = self._get_image_api_provider_configs()
         except ValueError as e:
             await self._send_text(event, str(e), action=f"{action}-config-error")
             return []
 
         params = self._get_params()
-        api_mode = self.config.get("api_mode", "images")
+        initial_api_mode = provider_configs[0].api_mode
         reference_images = reference_images or []
         reference_data_urls = reference_data_urls or []
         reference_count = max(len(reference_images), len(reference_data_urls))
 
         if send_ack:
-            if reference_count:
+            if action == "edit":
                 ack_text = (
-                    f"✅ 已识别 {reference_count} 张参考图，正在使用 {api_mode} "
+                    f"✅ 已收到图像编辑请求，已识别 {reference_count} 张参考图，"
+                    f"正在使用 {initial_api_mode} 模式处理，请稍候…"
+                )
+            elif reference_count:
+                ack_text = (
+                    f"✅ 已识别 {reference_count} 张参考图，正在使用 {initial_api_mode} "
                     "模式生成图片，请稍候…"
                 )
             else:
-                ack_text = f"✅ 正在使用 {api_mode} 模式生成图片，请稍候…"
+                ack_text = f"✅ 正在使用 {initial_api_mode} 模式生成图片，请稍候…"
 
             await self._send_processing_ack(
                 event,
@@ -1051,57 +1582,110 @@ class GPTImage2Plugin(Star):
             )
 
         started = perf_counter()
-        try:
-            results = await self._call_draw_api(
-                client=client,
-                prompt=prompt,
-                params=params,
-                api_mode=api_mode,
-                reference_images=reference_images,
-                reference_data_urls=reference_data_urls,
-                reference_count=reference_count,
-                action=action,
+        results: list[ImageResult] | None = None
+        selected_provider: ImageAPIProviderConfig | None = None
+        provider_errors: list[tuple[str, str]] = []
+
+        for index, provider in enumerate(provider_configs, start=1):
+            client = self._build_image_api_client(provider)
+            provider_api_mode = provider.api_mode
+            provider_action = (
+                f"{action}:{provider.name}" if len(provider_configs) > 1 else action
             )
-        except RuntimeError as e:
-            error_msg = str(e)
-            logger.warning(f"[GPTImage2] draw API failed action={action} error={e}")
-            if reference_count and self._is_image_input_unsupported(error_msg):
+            logger.info(
+                "[GPTImage2] image provider attempt "
+                f"action={action} provider={provider.name} index={index}/"
+                f"{len(provider_configs)} mode={provider_api_mode} "
+                f"role={provider.role} adaptive={provider.adaptive}"
+            )
+            try:
+                results = await self._call_draw_api(
+                    client=client,
+                    prompt=prompt,
+                    params=params,
+                    api_mode=provider_api_mode,
+                    reference_images=reference_images,
+                    reference_data_urls=reference_data_urls,
+                    reference_count=reference_count,
+                    action=provider_action,
+                )
+                self._record_image_provider_result(provider, success=True)
+                selected_provider = provider
+                break
+            except RuntimeError as e:
+                error_msg = str(e)
+                self._record_image_provider_result(
+                    provider,
+                    success=False,
+                    error_msg=error_msg,
+                )
+                provider_errors.append(
+                    (f"{provider.name}/{provider_api_mode}/{provider.role}", error_msg)
+                )
+                logger.warning(
+                    "[GPTImage2] image provider failed "
+                    f"action={action} provider={provider.name} index={index}/"
+                    f"{len(provider_configs)} role={provider.role} error={e}"
+                )
+                if index < len(
+                    provider_configs
+                ) and self._should_try_next_image_provider(error_msg):
+                    continue
+
+                provider_summary = self._provider_error_summary(provider_errors)
+                if reference_count and self._is_image_input_unsupported(error_msg):
+                    await self._send_text(
+                        event,
+                        "## ⚠️ 上游拒绝读取参考图\n\n"
+                        f"错误：{self._safe_markdown_preview(error_msg, limit=320)}\n\n"
+                        f"- 当前 API 模式：`{provider_api_mode}`\n"
+                        f"- 参考图数量：`{reference_count}`\n"
+                        f"- 生图模型：`{provider.model}`\n"
+                        f"- Responses 模型：`{provider.responses_model}`"
+                        f"{provider_summary}\n\n"
+                        "这通常表示上游服务实际路由到的模型不支持图片输入，"
+                        "或服务商对当前 endpoint/model 的图像输入兼容性有问题。"
+                        "插件不会自动丢弃参考图重试，以免生成结果偏离 Plan。",
+                        action=f"{action}-image-input-error",
+                    )
+                    return []
                 await self._send_text(
                     event,
-                    "## ⚠️ 上游拒绝读取参考图\n\n"
-                    f"错误：`{e}`\n\n"
-                    f"- 当前 API 模式：`{api_mode}`\n"
-                    f"- 参考图数量：`{reference_count}`\n"
-                    f"- 生图模型：`{self.config.get('model', 'gpt-image-2')}`\n"
-                    f"- Responses 模型：`{self.config.get('responses_model', 'gpt-5.5')}`\n\n"
-                    "这通常表示上游服务实际路由到的模型不支持图片输入，"
-                    "或服务商对当前 endpoint/model 的图像输入兼容性有问题。"
-                    "插件不会自动丢弃参考图重试，以免生成结果偏离 Plan。",
-                    action=f"{action}-image-input-error",
+                    "## ⚠️ GPT Image2 调用失败\n\n"
+                    f"最后错误：{self._safe_markdown_preview(error_msg, limit=320)}"
+                    f"{provider_summary}",
+                    action=f"{action}-api-error",
                 )
                 return []
+            except Exception as e:
+                logger.error(
+                    "[GPTImage2] draw unexpected error "
+                    f"action={action} provider={provider.name} "
+                    f"error={type(e).__name__}: {e}\n"
+                    f"{traceback.format_exc()}"
+                )
+                await self._send_text(
+                    event,
+                    f"## ⚠️ GPT Image2 调用失败\n\n`{e}`",
+                    action=f"{action}-unexpected-error",
+                )
+                return []
+
+        if results is None or selected_provider is None:
             await self._send_text(
                 event,
-                f"## ⚠️ GPT Image2 调用失败\n\n`{e}`",
-                action=f"{action}-api-error",
-            )
-            return []
-        except Exception as e:
-            logger.error(
-                "[GPTImage2] draw unexpected error "
-                f"action={action} error={type(e).__name__}: {e}\n"
-                f"{traceback.format_exc()}"
-            )
-            await self._send_text(
-                event,
-                f"## ⚠️ GPT Image2 调用失败\n\n`{e}`",
-                action=f"{action}-unexpected-error",
+                "## ⚠️ GPT Image2 调用失败\n\n所有 API 站点均未返回结果。"
+                f"{self._provider_error_summary(provider_errors)}",
+                action=f"{action}-provider-empty",
             )
             return []
 
         logger.info(
-            "[GPTImage2] draw API success "
-            f"action={action} results={len(results)} elapsed_ms={self._elapsed_ms(started)}"
+            "[GPTImage2] image API success "
+            f"action={action} provider={selected_provider.name} "
+            f"mode={selected_provider.api_mode} role={selected_provider.role} "
+            f"adaptive={selected_provider.adaptive} results={len(results)} "
+            f"elapsed_ms={self._elapsed_ms(started)}"
         )
 
         chain = self._build_image_chain(results, params)
@@ -1127,6 +1711,13 @@ class GPTImage2Plugin(Star):
         api_key_set = "✅ 已设置" if cfg.get("api_key") else "❌ 未设置"
         t2i_status = "✅ 开启" if self._render_text_as_image_enabled() else "关闭"
         save_status = "✅ 开启" if cfg.get("save_outputs", True) else "关闭"
+        adaptive_status = (
+            "✅ 开启" if self._adaptive_provider_priority_enabled() else "关闭"
+        )
+        try:
+            image_provider_count = len(self._get_image_api_provider_configs())
+        except ValueError:
+            image_provider_count = 0
 
         help_md = (
             "## 📋 GPT Image2 使用说明\n\n"
@@ -1149,6 +1740,8 @@ class GPTImage2Plugin(Star):
             f"| API 模式 | `{cfg.get('api_mode', 'images')}` |\n"
             f"| Images 模型 | `{cfg.get('model', 'gpt-image-2')}` |\n"
             f"| Responses 模型 | `{cfg.get('responses_model', 'gpt-5.5')}` |\n"
+            f"| 生图 API 站点 | {image_provider_count} 个 |\n"
+            f"| 自适应站点优先级 | {adaptive_status} |\n"
             f"| Plan 模型 | `{cfg.get('plan_model', 'gpt-5.4')}` |\n"
             f"| Plan 空闲超时 | {cfg.get('plan_timeout', 300)} 秒 |\n"
             f"| 图片尺寸 | `{cfg.get('size', 'auto')}` |\n"
@@ -1793,12 +2386,6 @@ class GPTImage2Plugin(Star):
             )
             return
 
-        try:
-            client = self._get_client()
-        except ValueError as e:
-            yield await self._text_result(event, str(e), action="edit-config-error")
-            return
-
         params = self._get_params()
         api_mode = self.config.get("api_mode", "images")
         logger.info(
@@ -1807,69 +2394,13 @@ class GPTImage2Plugin(Star):
             f"input_images={len(images)} {self._params_summary(params)} "
             f"save_outputs={self.config.get('save_outputs', True)}"
         )
-        await self._send_processing_ack(
+
+        chain = await self._generate_draw_chain(
             event,
-            f"✅ 已收到图像编辑请求，已识别 {len(images)} 张参考图，"
-            f"正在使用 {api_mode} 模式处理，请稍候…",
+            prompt,
             action="edit",
+            reference_images=images,
         )
-
-        try:
-            if api_mode == "images":
-                # Images API 编辑：使用本地文件路径
-                image_paths: list[str] = []
-                for idx, img in enumerate(images, start=1):
-                    path = await image_to_file_path(img)
-                    image_paths.append(path)
-                    logger.debug(
-                        "[GPTImage2] edit input image converted to file "
-                        f"index={idx} path={path} bytes={self._file_size(path)}"
-                    )
-                results = await client.edit_images_api(prompt, image_paths, params)
-            else:
-                # Responses API 编辑：使用 data URL
-                data_urls: list[str] = []
-                for idx, img in enumerate(images, start=1):
-                    data_url = await image_to_data_url(img)
-                    data_urls.append(data_url)
-                    logger.debug(
-                        "[GPTImage2] edit input image converted to data URL "
-                        f"index={idx} chars={len(data_url)}"
-                    )
-                results = await client.edit_responses_api(prompt, data_urls, params)
-        except RuntimeError as e:
-            logger.warning(
-                "[GPTImage2] edit API failed "
-                f"{self._event_context(event)} mode={api_mode} "
-                f"elapsed_ms={self._elapsed_ms(started)} error={e}"
-            )
-            yield await self._text_result(
-                event,
-                "## ⚠️ GPT Image2 调用失败\n\n`{}`".format(e),
-                action="edit-api-error",
-            )
-            return
-        except Exception as e:
-            logger.error(
-                "[GPTImage2] edit unexpected error "
-                f"{self._event_context(event)} mode={api_mode} "
-                f"elapsed_ms={self._elapsed_ms(started)} error={type(e).__name__}: {e}\n"
-                f"{traceback.format_exc()}"
-            )
-            yield await self._text_result(
-                event,
-                "## ⚠️ GPT Image2 调用失败\n\n`{}`".format(e),
-                action="edit-unexpected-error",
-            )
-            return
-
-        logger.info(
-            "[GPTImage2] edit API success "
-            f"{self._event_context(event)} mode={api_mode} results={len(results)} "
-            f"elapsed_ms={self._elapsed_ms(started)}"
-        )
-
-        chain = self._build_image_chain(results, params)
         if chain:
             logger.info(
                 "[GPTImage2] edit reply ready "
@@ -1880,12 +2411,7 @@ class GPTImage2Plugin(Star):
         else:
             logger.warning(
                 "[GPTImage2] edit returned no displayable images "
-                f"{self._event_context(event)} results={len(results)}"
-            )
-            yield await self._text_result(
-                event,
-                "## ⚠️ GPT Image2 未返回任何可显示的图片",
-                action="edit-empty-result",
+                f"{self._event_context(event)}"
             )
 
     # ── 回复构建 ────────────────────────────────────────────────
