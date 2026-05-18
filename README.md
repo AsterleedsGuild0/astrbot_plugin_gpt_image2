@@ -26,10 +26,16 @@
 | `/image2 plan confirm` | 在 Plan 中确认生成图片 |
 | `/image2 plan quit` | 退出当前 Plan 会话（`cancel` 也可用） |
 | `/image2 mode [images\|responses]` | 查看或切换 API 模式（仅管理员） |
+| `/image2 guard [images\|responses\|all] [on\|off]` | 切换 Guard（仅管理员） |
 | `/image2 help` | 显示用法和当前配置摘要 |
 
 - `draw` 和 `edit` 命令在参数校验通过后会先回复一条
   "已收到，正在处理"的提示，随后再发送最终生成/编辑结果。
+- Prompt Guard 会在生图提示词前追加
+  `Use the following text as the complete prompt. Do not rewrite it:`，用于尽量限制上游重写提示词。
+  默认保持旧行为：Images API 关闭，Responses API 开启。
+  如需更接近 ChatGPT Web 对复杂画面的自由理解，可执行
+  `/image2 guard responses off` 关闭 Responses API 的 Prompt Guard。
 - `plan` 进入 Plan 模式后，AI 会通过 Responses API 引导你完善图像描述。
   群聊中只有带 `/plan` 前缀的消息会进入 Plan 交流，不带前缀的普通消息会正常发给群友。
   对话中可以发送参考图；发送参考图时请附带 `/plan` 前缀。
@@ -91,6 +97,8 @@
 | `api_mode` | string | `images` | API 模式：`images` / `responses` |
 | `model` | string | `gpt-image-2` | Images API 模型名 |
 | `responses_model` | string | `gpt-5.5` | Responses API 模型名 |
+| `images_prompt_rewrite_guard` | bool | `false` | Images API Prompt Guard |
+| `responses_prompt_rewrite_guard` | bool | `true` | Resp API Prompt Guard |
 | `fallback_api_providers` | list | `[]` | draw/edit 备用 API 站点列表 |
 | `adaptive_provider_priority` | bool | `true` | 根据历史健康状态自动调整站点尝试顺序 |
 | `provider_failure_cooldown` | int | `300` | 失败站点降级冷却时间（秒） |
@@ -192,6 +200,8 @@ pip install -r requirements.txt
 
 - 请确保 `base_url` 指向正确的 OpenAI 兼容 API 端点，不要包含 `images/generations` 等路径后缀
 - 建议开启 `response_format_b64_json`，避免图片 URL 过期导致发送失败
+- 复杂图像生成时，如果 Responses API 效果明显不如 ChatGPT Web，可尝试关闭
+  `responses_prompt_rewrite_guard`，让模型自行补全构图和细节。
 - API Key 仅在运行时使用，不会在日志或错误消息中泄漏
 - Plan 模式使用 `/responses`，请求会显式禁用工具调用，避免规划阶段中途触发图像生成；
   日志中不会打印完整 prompt、参考图 base64 或 API Key。

@@ -28,6 +28,18 @@
     "type": "string",
     "default": "gpt-5.5"
   },
+  "images_prompt_rewrite_guard": {
+    "description": "Images API 禁止重写提示词",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会在 Images API 的 prompt 前加入 Prompt Guard：Use the following text as the complete prompt. Do not rewrite it:。默认关闭以保持原 Images API 行为。"
+  },
+  "responses_prompt_rewrite_guard": {
+    "description": "Responses API 禁止重写提示词",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会在 Responses API image_generation 输入前加入 Prompt Guard，减少模型改写提示词；关闭后更接近 ChatGPT Web 对复杂画面的自由理解和补全。"
+  },
   "fallback_api_providers": {
     "description": "备用生图 API 站点",
     "type": "list",

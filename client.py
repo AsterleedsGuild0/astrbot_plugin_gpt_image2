@@ -58,6 +58,8 @@ class GPTImageClient:
         responses_model: str,
         timeout: int = 120,
         response_format_b64_json: bool = True,
+        images_prompt_rewrite_guard: bool = False,
+        responses_prompt_rewrite_guard: bool = True,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -65,6 +67,8 @@ class GPTImageClient:
         self.responses_model = responses_model
         self.timeout = timeout
         self.response_format_b64_json = response_format_b64_json
+        self.images_prompt_rewrite_guard = images_prompt_rewrite_guard
+        self.responses_prompt_rewrite_guard = responses_prompt_rewrite_guard
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -81,6 +85,14 @@ class GPTImageClient:
         url_count = sum(1 for item in results if item.url)
         revised_count = sum(1 for item in results if item.revised_prompt)
         return f"results={len(results)} b64={b64_count} url={url_count} revised={revised_count}"
+
+    @staticmethod
+    def _apply_prompt_rewrite_guard(prompt: str, enabled: bool) -> str:
+        if not enabled:
+            return prompt
+        if prompt.lstrip().startswith(PROMPT_REWRITE_GUARD_PREFIX):
+            return prompt
+        return f"{PROMPT_REWRITE_GUARD_PREFIX}\n{prompt}"
 
     def _build_error_msg(self, status_code: int, body: Any) -> str:
         """构建不泄露 API Key 的错误消息"""
@@ -161,9 +173,13 @@ class GPTImageClient:
         POST {base_url}/images/generations
         """
         url = f"{self.base_url}/images/generations"
+        guarded_prompt = self._apply_prompt_rewrite_guard(
+            prompt,
+            self.images_prompt_rewrite_guard,
+        )
         body: dict[str, Any] = {
             "model": self.model,
-            "prompt": prompt,
+            "prompt": guarded_prompt,
             "size": params.size,
             "quality": params.quality,
             "output_format": params.output_format,
@@ -180,6 +196,7 @@ class GPTImageClient:
         logger.info(
             "[GPTImage2] Images API generate request start "
             f"url={url} model={self.model} prompt_len={len(prompt)} "
+            f"guard={self.images_prompt_rewrite_guard} "
             f"size={params.size} quality={params.quality} "
             f"format={params.output_format} n={params.n} timeout={self.timeout}s"
         )
@@ -232,10 +249,14 @@ class GPTImageClient:
         Content-Type: multipart/form-data
         """
         url = f"{self.base_url}/images/edits"
+        guarded_prompt = self._apply_prompt_rewrite_guard(
+            prompt,
+            self.images_prompt_rewrite_guard,
+        )
 
         multipart_data: dict[str, Any] = {
             "model": self.model,
-            "prompt": prompt,
+            "prompt": guarded_prompt,
             "size": params.size,
             "quality": params.quality,
             "output_format": params.output_format,
@@ -267,6 +288,7 @@ class GPTImageClient:
         logger.info(
             "[GPTImage2] Images API edit request start "
             f"url={url} model={self.model} prompt_len={len(prompt)} "
+            f"guard={self.images_prompt_rewrite_guard} "
             f"input_images={len(image_paths)} input_bytes={sum(file_sizes)} "
             f"size={params.size} quality={params.quality} "
             f"format={params.output_format} n={params.n} timeout={self.timeout}s"
@@ -436,7 +458,10 @@ class GPTImageClient:
     ) -> list[ImageResult]:
         """Responses API 通用调用"""
         url = f"{self.base_url}/responses"
-        guarded_prompt = f"{PROMPT_REWRITE_GUARD_PREFIX}\n{prompt}"
+        guarded_prompt = self._apply_prompt_rewrite_guard(
+            prompt,
+            self.responses_prompt_rewrite_guard,
+        )
 
         # 构建 input
         if not image_data_urls:
@@ -472,6 +497,7 @@ class GPTImageClient:
             "[GPTImage2] Responses API request start "
             f"url={url} model={self.responses_model} action={action} "
             f"prompt_len={len(prompt)} input_images={len(image_data_urls)} "
+            f"guard={self.responses_prompt_rewrite_guard} "
             f"size={params.size} quality={params.quality} "
             f"format={params.output_format} timeout={self.timeout}s"
         )

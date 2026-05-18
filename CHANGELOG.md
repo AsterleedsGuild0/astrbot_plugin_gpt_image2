@@ -19,6 +19,8 @@
 - 新增官方权威兜底层：`role=authoritative_fallback` 与 `adaptive=false`。
 - 新增备用站点切换进度提示，避免用户在多站点 fallback 期间无感等待。
 - 生图成功时在结果消息中显示实际命中的 API 站点、尝试序号和耗时。
+- 新增 Images API 与 Responses API 的 Prompt Guard 独立配置。
+- 新增 `/image2 guard` 管理员命令，用于查看和切换 Prompt Guard。
 - Plan 会话参考图按 data URL 去重，避免同一图片跨轮次或引用链重复计数。
 - Plan confirm 生图失败时发送纯文本可复制的 `/image2 edit` 或 `/image2 draw` 直接重试命令。
 - Plan confirm 生图成功后也发送纯文本可复制命令，方便在其他地方复用相同提示词。

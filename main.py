@@ -7,6 +7,7 @@
   /image2 plan confirm   在 Plan 中确认生成图片
   /image2 plan quit      退出 Plan 会话
   /image2 mode [模式]    查看/切换 API 模式（管理员）
+  /image2 guard          查看/切换 Prompt Guard（管理员）
   /image2 help           展示用法和配置摘要
 """
 
@@ -647,6 +648,10 @@ class GPTImage2Plugin(Star):
             responses_model=provider.responses_model,
             timeout=self.config.get("timeout", 120),
             response_format_b64_json=self.config.get("response_format_b64_json", True),
+            images_prompt_rewrite_guard=self._prompt_rewrite_guard_enabled("images"),
+            responses_prompt_rewrite_guard=self._prompt_rewrite_guard_enabled(
+                "responses"
+            ),
         )
 
     def _get_image_api_provider_configs(self) -> list[ImageAPIProviderConfig]:
@@ -818,6 +823,60 @@ class GPTImage2Plugin(Star):
         if isinstance(value, (int, float)):
             return bool(value)
         return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _prompt_rewrite_guard_config_key(api_mode: str) -> str:
+        return (
+            "responses_prompt_rewrite_guard"
+            if api_mode == "responses"
+            else "images_prompt_rewrite_guard"
+        )
+
+    @staticmethod
+    def _prompt_rewrite_guard_default(api_mode: str) -> bool:
+        return api_mode == "responses"
+
+    def _prompt_rewrite_guard_enabled(self, api_mode: str) -> bool:
+        key = self._prompt_rewrite_guard_config_key(api_mode)
+        return self._normalize_bool(
+            self.config.get(key),
+            default=self._prompt_rewrite_guard_default(api_mode),
+        )
+
+    @classmethod
+    def _prompt_rewrite_guard_status(cls, enabled: bool) -> str:
+        return "✅ 开启" if enabled else "关闭"
+
+    @staticmethod
+    def _parse_bool_switch(value: object) -> bool | None:
+        text = str(value or "").strip().lower()
+        if text in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+            "enable",
+            "enabled",
+            "开启",
+            "开",
+            "启用",
+        }:
+            return True
+        if text in {
+            "0",
+            "false",
+            "no",
+            "n",
+            "off",
+            "disable",
+            "disabled",
+            "关闭",
+            "关",
+            "禁用",
+        }:
+            return False
+        return None
 
     @staticmethod
     def _build_provider_id(
@@ -1244,6 +1303,10 @@ class GPTImage2Plugin(Star):
             responses_model=self.config.get("responses_model", "gpt-5.5"),
             timeout=self.config.get("timeout", 120),
             response_format_b64_json=self.config.get("response_format_b64_json", True),
+            images_prompt_rewrite_guard=self._prompt_rewrite_guard_enabled("images"),
+            responses_prompt_rewrite_guard=self._prompt_rewrite_guard_enabled(
+                "responses"
+            ),
         )
 
     def _cleanup_plan(self, session_id: str) -> None:
@@ -1876,6 +1939,12 @@ class GPTImage2Plugin(Star):
         adaptive_status = (
             "✅ 开启" if self._adaptive_provider_priority_enabled() else "关闭"
         )
+        images_guard_status = self._prompt_rewrite_guard_status(
+            self._prompt_rewrite_guard_enabled("images")
+        )
+        responses_guard_status = self._prompt_rewrite_guard_status(
+            self._prompt_rewrite_guard_enabled("responses")
+        )
         try:
             image_provider_count = len(self._get_image_api_provider_configs())
         except ValueError:
@@ -1893,6 +1962,8 @@ class GPTImage2Plugin(Star):
             "- `/image2 plan confirm` — 在 Plan 中确认生成（自动带参考图）\n"
             "- `/image2 plan quit` — 退出 Plan 会话（`cancel` 也可用）\n"
             "- `/image2 mode [模式]` — 查看/切换 API 模式（管理员）\n"
+            "- `/image2 guard [images|responses|all] [on|off]` — "
+            "查看/切换 Prompt Guard（管理员）\n"
             "- `/image2 help` — 显示本帮助\n\n"
             "### 当前配置\n\n"
             f"| 项目 | 值 |\n"
@@ -1902,6 +1973,8 @@ class GPTImage2Plugin(Star):
             f"| API 模式 | `{cfg.get('api_mode', 'images')}` |\n"
             f"| Images 模型 | `{cfg.get('model', 'gpt-image-2')}` |\n"
             f"| Responses 模型 | `{cfg.get('responses_model', 'gpt-5.5')}` |\n"
+            f"| Images Prompt Guard | {images_guard_status} |\n"
+            f"| Responses Prompt Guard | {responses_guard_status} |\n"
             f"| 生图 API 站点 | {image_provider_count} 个 |\n"
             f"| 自适应站点优先级 | {adaptive_status} |\n"
             f"| Plan 模型 | `{cfg.get('plan_model', 'gpt-5.4')}` |\n"
@@ -1969,6 +2042,99 @@ class GPTImage2Plugin(Star):
             f"从 **`{current_mode}`** → **`{next_mode}`**\n\n"
             f"{suffix}",
             action="mode-switched",
+        )
+
+    @image2.command("guard")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def guard(
+        self,
+        event: AstrMessageEvent,
+        target: str | None = None,
+        state: str | None = None,
+    ):
+        """查看或切换 Prompt Rewrite Guard（管理员）"""
+        target_aliases = {
+            "image": "images",
+            "images": "images",
+            "img": "images",
+            "response": "responses",
+            "responses": "responses",
+            "resp": "responses",
+            "all": "all",
+            "both": "all",
+            "全部": "all",
+        }
+        current_images = self._prompt_rewrite_guard_enabled("images")
+        current_responses = self._prompt_rewrite_guard_enabled("responses")
+        status_md = (
+            "## Prompt Guard\n\n"
+            f"- Images API：{self._prompt_rewrite_guard_status(current_images)}\n"
+            f"- Responses API：{self._prompt_rewrite_guard_status(current_responses)}\n\n"
+            "用法：`/image2 guard <images|responses|all> <on|off>`"
+        )
+
+        logger.info(
+            "[GPTImage2] guard command received "
+            f"{self._event_context(event)} target={target or '-'} state={state or '-'} "
+            f"images={current_images} responses={current_responses}"
+        )
+
+        if target is None or not str(target).strip():
+            yield await self._text_result(event, status_md, action="guard-help")
+            return
+
+        normalized_target = target_aliases.get(str(target).strip().lower())
+        if normalized_target is None:
+            yield await self._text_result(
+                event,
+                "## ⚠️ Prompt Guard 目标无效\n\n"
+                "可用目标：`images` / `responses` / `all`\n\n"
+                "用法：`/image2 guard <images|responses|all> <on|off>`",
+                action="guard-invalid-target",
+            )
+            return
+
+        if state is None or not str(state).strip():
+            yield await self._text_result(event, status_md, action="guard-target-help")
+            return
+
+        next_value = self._parse_bool_switch(state)
+        if next_value is None:
+            yield await self._text_result(
+                event,
+                "## ⚠️ Prompt Guard 状态无效\n\n"
+                "可用状态：`on` / `off` / `开启` / `关闭`\n\n"
+                "用法：`/image2 guard <images|responses|all> <on|off>`",
+                action="guard-invalid-state",
+            )
+            return
+
+        targets = (
+            ["images", "responses"]
+            if normalized_target == "all"
+            else [normalized_target]
+        )
+        rows: list[str] = []
+        for api_mode in targets:
+            key = self._prompt_rewrite_guard_config_key(api_mode)
+            old_value = self._prompt_rewrite_guard_enabled(api_mode)
+            self.config[key] = next_value
+            rows.append(
+                f"- {api_mode}：{self._prompt_rewrite_guard_status(old_value)} → "
+                f"{self._prompt_rewrite_guard_status(next_value)}"
+            )
+
+        saved = self._save_config()
+        logger.info(
+            "[GPTImage2] prompt guard switched "
+            f"{self._event_context(event)} target={normalized_target} "
+            f"value={next_value} saved={saved}"
+        )
+        suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
+        yield await self._text_result(
+            event,
+            "## ✅ Prompt Guard 已更新\n\n" + "\n".join(rows) + f"\n\n{suffix}",
+            action="guard-switched",
         )
 
     # ── Plan 模式 ────────────────────────────────────────────
