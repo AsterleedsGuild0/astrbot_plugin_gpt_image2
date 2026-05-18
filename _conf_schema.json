@@ -109,6 +109,12 @@
     "type": "bool",
     "default": true
   },
+  "send_copyable_prompt_after_success": {
+    "description": "Plan 成功后发送可复制命令",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 /plan confirm 成功生图会额外发送一条纯文本 /image2 draw 或 /image2 edit 命令，方便复制到其他地方复用；关闭可减少群聊刷屏。失败时的直接重试命令不受此项影响。"
+  },
   "render_text_as_image": {
     "description": "文本回复转图片",
     "type": "bool",

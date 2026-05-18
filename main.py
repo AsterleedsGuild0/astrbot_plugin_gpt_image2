@@ -846,6 +846,12 @@ class GPTImage2Plugin(Star):
             return value.strip().lower() not in {"0", "false", "no", "off"}
         return bool(value)
 
+    def _send_copyable_prompt_after_success_enabled(self) -> bool:
+        return self._normalize_bool(
+            self.config.get("send_copyable_prompt_after_success"),
+            default=True,
+        )
+
     def _provider_failure_cooldown(self) -> int:
         try:
             return max(0, int(self.config.get("provider_failure_cooldown", 300)))
@@ -1371,12 +1377,65 @@ class GPTImage2Plugin(Star):
             content.append({"type": "input_image", "image_url": data_url})
         return content
 
+    @staticmethod
+    def _single_line_command_prompt(prompt: str) -> str:
+        """Collapse a final prompt into one line so it can be copied as a command."""
+        return " ".join(str(prompt or "").replace("\x00", " ").split())
+
+    def _build_plan_copyable_command_text(
+        self,
+        session: PlanSession,
+        *,
+        succeeded: bool,
+    ) -> str:
+        """Build a plain-text command for reusing a Plan final prompt."""
+        self._dedupe_plan_reference_images(session)
+        prompt = self._single_line_command_prompt(session.final_prompt or "")
+        reference_count = len(session.reference_data_urls)
+        if reference_count:
+            command = f"/image2 edit {prompt}"
+            if succeeded:
+                usage_note = (
+                    f"这条命令需要配合 {reference_count} 张参考图使用。"
+                    "之后如需在其他地方复现效果，请附带相同参考图，"
+                    "或引用包含参考图的消息发送下面这条命令。"
+                )
+            else:
+                usage_note = (
+                    f"这条命令需要配合 {reference_count} 张参考图使用。"
+                    "请先发送 /plan quit 退出当前 Plan 会话，"
+                    "然后附带参考图或引用包含参考图的消息发送下面这条命令。"
+                )
+        else:
+            command = f"/image2 draw {prompt}"
+            if succeeded:
+                usage_note = (
+                    "当前 Plan 会话没有参考图。之后可直接发送下面这条命令复现效果。"
+                )
+            else:
+                usage_note = (
+                    "当前 Plan 会话没有参考图。请先发送 /plan quit 退出当前 Plan 会话，"
+                    "然后直接发送下面这条命令。"
+                )
+
+        title = (
+            "Plan 生图成功，可复制到其他地方复用的命令："
+            if succeeded
+            else "Plan 最终生图失败时可复制的直接重试命令："
+        )
+        return f"{title}\n\n{usage_note}\n\n{command}"
+
+    def _build_plan_direct_retry_command_text(self, session: PlanSession) -> str:
+        """Build a plain-text command for retrying outside Plan without re-planning."""
+        return self._build_plan_copyable_command_text(session, succeeded=False)
+
     async def _collect_plan_reference_images(
         self,
         event: AstrMessageEvent,
         session: PlanSession,
     ) -> list[str]:
         """从 Plan 消息中收集参考图，返回本轮新增 data URLs。"""
+        self._dedupe_plan_reference_images(session)
         remaining = self._get_max_input_images() - len(session.reference_data_urls)
         if remaining <= 0:
             return []
@@ -1386,6 +1445,7 @@ class GPTImage2Plugin(Star):
             return []
 
         data_urls: list[str] = []
+        existing_data_urls = set(session.reference_data_urls)
         for idx, image in enumerate(images, start=1):
             try:
                 data_url = await image_to_data_url(image)
@@ -1396,15 +1456,52 @@ class GPTImage2Plugin(Star):
                     f"error={type(e).__name__}: {e}"
                 )
                 continue
+            if data_url in existing_data_urls:
+                logger.info(
+                    "[GPTImage2] plan duplicate reference image skipped "
+                    f"{self._event_context(event)} index={idx} "
+                    f"total={len(session.reference_data_urls)}"
+                )
+                continue
             session.reference_images.append(image)
             session.reference_data_urls.append(data_url)
             data_urls.append(data_url)
+            existing_data_urls.add(data_url)
             logger.debug(
                 "[GPTImage2] plan reference image collected "
                 f"{self._event_context(event)} index={idx} chars={len(data_url)} "
                 f"total={len(session.reference_data_urls)}"
             )
         return data_urls
+
+    def _dedupe_plan_reference_images(self, session: PlanSession) -> None:
+        """去重 Plan 会话参考图，避免同一图片跨轮次或引用链重复计数。"""
+        if not session.reference_data_urls:
+            return
+
+        before_urls = len(session.reference_data_urls)
+        before_images = len(session.reference_images)
+        dedup_images: list = []
+        dedup_urls: list[str] = []
+        seen: set[str] = set()
+
+        for index, data_url in enumerate(session.reference_data_urls):
+            if not data_url or data_url in seen:
+                continue
+            seen.add(data_url)
+            dedup_urls.append(data_url)
+            if index < len(session.reference_images):
+                dedup_images.append(session.reference_images[index])
+
+        session.reference_data_urls = dedup_urls
+        session.reference_images = dedup_images
+
+        if len(dedup_urls) != before_urls or len(dedup_images) != before_images:
+            logger.info(
+                "[GPTImage2] plan reference images deduplicated "
+                f"before_images={before_images} before_urls={before_urls} "
+                f"after_images={len(dedup_images)} after_urls={len(dedup_urls)}"
+            )
 
     @staticmethod
     def _is_image_input_unsupported(error_msg: str) -> bool:
@@ -1469,6 +1566,49 @@ class GPTImage2Plugin(Star):
                 f"- **{name}**：{cls._safe_markdown_preview(error, limit=160)}"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _provider_user_label(provider: ImageAPIProviderConfig) -> str:
+        suffix = " / 权威兜底" if provider.role == "authoritative_fallback" else ""
+        return f"{provider.name} / {provider.api_mode}{suffix}"
+
+    async def _send_provider_switch_notice(
+        self,
+        event: AstrMessageEvent,
+        *,
+        action: str,
+        failed_provider: ImageAPIProviderConfig,
+        next_provider: ImageAPIProviderConfig,
+        error_msg: str,
+        next_index: int,
+        total: int,
+    ) -> None:
+        """Notify users before trying the next provider, so fallback is visible."""
+        await self._send_processing_ack(
+            event,
+            "## 🔁 正在切换备用 API 站点\n\n"
+            f"- 已失败：**{self._provider_user_label(failed_provider)}**\n"
+            f"- 失败原因：{self._safe_markdown_preview(error_msg, limit=220)}\n"
+            f"- 即将尝试：**{self._provider_user_label(next_provider)}**"
+            f"（第 {next_index}/{total} 个站点）",
+            action=f"{action}-provider-switch",
+        )
+
+    def _provider_success_notice(
+        self,
+        provider: ImageAPIProviderConfig,
+        *,
+        attempt_index: int,
+        total: int,
+        failed_count: int,
+        elapsed_ms: int,
+    ) -> Plain:
+        retry_text = f"，已跳过 {failed_count} 个失败站点" if failed_count else ""
+        return Plain(
+            "✅ 生图成功："
+            f"{self._provider_user_label(provider)}"
+            f"（第 {attempt_index}/{total} 个站点{retry_text}，耗时 {elapsed_ms}ms）\n"
+        )
 
     async def _call_draw_api(
         self,
@@ -1584,6 +1724,7 @@ class GPTImage2Plugin(Star):
         started = perf_counter()
         results: list[ImageResult] | None = None
         selected_provider: ImageAPIProviderConfig | None = None
+        selected_attempt_index = 0
         provider_errors: list[tuple[str, str]] = []
 
         for index, provider in enumerate(provider_configs, start=1):
@@ -1611,6 +1752,7 @@ class GPTImage2Plugin(Star):
                 )
                 self._record_image_provider_result(provider, success=True)
                 selected_provider = provider
+                selected_attempt_index = index
                 break
             except RuntimeError as e:
                 error_msg = str(e)
@@ -1630,6 +1772,15 @@ class GPTImage2Plugin(Star):
                 if index < len(
                     provider_configs
                 ) and self._should_try_next_image_provider(error_msg):
+                    await self._send_provider_switch_notice(
+                        event,
+                        action=action,
+                        failed_provider=provider,
+                        next_provider=provider_configs[index],
+                        error_msg=error_msg,
+                        next_index=index + 1,
+                        total=len(provider_configs),
+                    )
                     continue
 
                 provider_summary = self._provider_error_summary(provider_errors)
@@ -1689,6 +1840,17 @@ class GPTImage2Plugin(Star):
         )
 
         chain = self._build_image_chain(results, params)
+        if chain:
+            chain.insert(
+                0,
+                self._provider_success_notice(
+                    selected_provider,
+                    attempt_index=selected_attempt_index,
+                    total=len(provider_configs),
+                    failed_count=len(provider_errors),
+                    elapsed_ms=self._elapsed_ms(started),
+                ),
+            )
         if not chain:
             await self._send_text(
                 event,
@@ -1980,6 +2142,7 @@ class GPTImage2Plugin(Star):
             ):
                 session = self._plan_sessions.get(session_id)
                 if session and session.final_prompt:
+                    self._dedupe_plan_reference_images(session)
                     controller.keep(
                         timeout=processing_timeout,
                         reset_timeout=True,
@@ -1989,10 +2152,7 @@ class GPTImage2Plugin(Star):
                         next_event.unified_msg_origin,
                         processing_timeout,
                     )
-                    reference_count = max(
-                        len(session.reference_images),
-                        len(session.reference_data_urls),
-                    )
+                    reference_count = len(session.reference_data_urls)
                     api_mode = self.config.get("api_mode", "images")
                     if reference_count:
                         confirm_ack = (
@@ -2031,6 +2191,16 @@ class GPTImage2Plugin(Star):
                     )
                     if chain:
                         await next_event.send(MessageChain(chain=chain))
+                        if self._send_copyable_prompt_after_success_enabled():
+                            await self._send_text(
+                                next_event,
+                                self._build_plan_copyable_command_text(
+                                    session,
+                                    succeeded=True,
+                                ),
+                                action="plan-copyable-success-command",
+                                prefer_image=False,
+                            )
                         self._cleanup_plan(session_id)
                         controller.stop()
                         return
@@ -2042,6 +2212,12 @@ class GPTImage2Plugin(Star):
                         "- 你可以稍后再次发送 `/plan confirm` 重试生成\n"
                         "- 或发送 `/plan quit` 退出当前 Plan 会话",
                         action="plan-confirm-retry-available",
+                    )
+                    await self._send_text(
+                        next_event,
+                        self._build_plan_direct_retry_command_text(session),
+                        action="plan-direct-retry-command",
+                        prefer_image=False,
                     )
                     controller.keep(
                         timeout=self._waiter_timeout(plan_config.timeout),
