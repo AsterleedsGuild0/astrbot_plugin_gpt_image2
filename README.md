@@ -39,6 +39,8 @@
   你可以发送 `/plan confirm` 或 `/image2 plan confirm` 确认生成图片，
   发送 `/plan quit` 或 `/image2 plan quit` 退出。
   确认后会单独发送一张完整生成提示词图片，再发送正在生成提示和最终图片结果。
+  默认还会在成功后发送一条纯文本可复制命令；可通过
+  `send_copyable_prompt_after_success` 关闭。
 - Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），
   可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
 - draw/edit 支持 `fallback_api_providers` 备用站点列表。插件会先使用主
@@ -102,6 +104,7 @@
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
+| `send_copyable_prompt_after_success` | bool | `true` | Plan 成功后发送纯文本可复制命令 |
 | `render_text_as_image` | bool | `true` | image2 卡片模板优先，失败则回退纯文本 |
 | `text_image_width` | int | `1200` | 插件内置兜底文转图输出宽度（像素） |
 | `text_image_font_size` | int | `32` | 插件内置兜底文转图字体大小 |
