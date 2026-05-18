@@ -31,6 +31,7 @@
 
 - `draw` 和 `edit` 命令在参数校验通过后会先回复一条
   "已收到，正在处理"的提示，随后再发送最终生成/编辑结果。
+  如果上游返回较长的 `revised_prompt`，插件会将其收纳为合并转发，图片单独发送。
 - Prompt Guard 会在生图提示词前追加
   `Use the following text as the complete prompt. Do not rewrite it:`，用于尽量限制上游重写提示词。
   默认保持旧行为：Images API 关闭，Responses API 开启。
@@ -44,8 +45,9 @@
   在准备好时只展示中文摘要/核对项，不在中间交互中刷出完整生成提示词。
   你可以发送 `/plan confirm` 或 `/image2 plan confirm` 确认生成图片，
   发送 `/plan quit` 或 `/image2 plan quit` 退出。
-  确认后会单独发送一张完整生成提示词图片，再发送正在生成提示和最终图片结果。
-  默认还会在成功后发送一条纯文本可复制命令；可通过
+  确认后会用合并转发发送中文提示词和英文/混合提示词，
+  再发送正在生成提示和最终图片结果。
+  默认还会在成功后发送一条合并转发可复制命令；可通过
   `send_copyable_prompt_after_success` 关闭。
 - Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），
   可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
@@ -112,7 +114,7 @@
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
-| `send_copyable_prompt_after_success` | bool | `true` | Plan 成功后发送纯文本可复制命令 |
+| `send_copyable_prompt_after_success` | bool | `true` | Plan 成功后发送合并转发可复制命令 |
 | `render_text_as_image` | bool | `true` | image2 卡片模板优先，失败则回退纯文本 |
 | `text_image_width` | int | `1200` | 插件内置兜底文转图输出宽度（像素） |
 | `text_image_font_size` | int | `32` | 插件内置兜底文转图字体大小 |
@@ -208,7 +210,7 @@ pip install -r requirements.txt
 - Plan 等待用户输入时使用独立 watchdog 按 `plan_timeout` 主动超时；模型思考和生图处理期间会自动延长超时。
 - Plan 会话空闲超时后会主动向当前会话发送退出提示，并清理当前 Plan 会话。
 - Plan 中间交互不会展示完整生成提示词；完整提示词只会在 `/plan confirm`
-  或 `/image2 plan confirm` 时单独转成图片发送。
+  或 `/image2 plan confirm` 时通过合并转发发送，并同时包含中文提示词和英文/混合提示词。
 - `render_text_as_image` 开启时，插件文本回复使用 image2 自包含 Markdown 卡片模板，
   避免依赖 jsdelivr 等外部 JS/CDN。卡片模板失败后直接回退为普通文本。
 - 插件内置 Pillow 仅用于卡片渲染后裁剪底部空白，不再作为文本回复的渲染兜底。

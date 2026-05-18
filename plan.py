@@ -17,6 +17,7 @@ class PlanSession:
 
     owner_sender_id: str = ""
     final_prompt: Optional[str] = None
+    final_prompt_zh: Optional[str] = None
     round_count: int = 0
     history: list[dict] = field(default_factory=list)
     reference_images: list = field(default_factory=list)
@@ -86,16 +87,20 @@ PLAN_SYSTEM_PROMPT = (
     "5. When you are ready to finalize, first write a concise Chinese summary "
     "for the user under the heading `中文摘要：`, explaining the key subject, "
     "reference-image usage, composition, style, and constraints.\n"
-    "6. After the Chinese summary, still include the final image generation prompt "
-    "inside a clear "
-    "FINAL_PROMPT section.\n"
+    "6. After the Chinese summary, include two exact final prompts: a concise "
+    "Chinese prompt inside FINAL_PROMPT_ZH, and the detailed English or mixed "
+    "prompt inside FINAL_PROMPT. The Chinese prompt must be directly usable for "
+    "image generation and should preserve all concrete requirements.\n"
     "7. Use the following format:\n"
     "中文摘要：\n"
     "- 用中文列出关键需求摘要。\n"
+    "[FINAL_PROMPT_ZH]\n"
+    "...可直接用于生成图片的中文提示词...\n"
+    "[/FINAL_PROMPT_ZH]\n"
     "[FINAL_PROMPT]\n"
     "...your final image generation prompt here...\n"
     "[/FINAL_PROMPT]\n"
-    "8. You may also use the inline format: [FINAL_PROMPT: ...]\n"
+    "8. You may also use the inline formats: [FINAL_PROMPT_ZH: ...] and [FINAL_PROMPT: ...]\n"
     "9. Keep your Chinese clarifying responses concise but helpful.\n"
     "10. The content inside FINAL_PROMPT may use English, Chinese, or a mixed "
     "Chinese-English prompt, depending on what best preserves the user's intent. "
@@ -112,6 +117,13 @@ PLAN_SYSTEM_PROMPT = (
     "them as visual references."
 )
 
+_FINAL_PROMPT_ZH_BLOCK_RE = re.compile(
+    r"\[FINAL_PROMPT_ZH\]\s*(.*?)\s*\[/FINAL_PROMPT_ZH\]",
+    re.DOTALL,
+)
+_FINAL_PROMPT_ZH_INLINE_RE = re.compile(
+    r"\[FINAL_PROMPT_ZH:\s*(.*?)\s*\]",
+)
 _FINAL_PROMPT_BLOCK_RE = re.compile(
     r"\[FINAL_PROMPT\]\s*(.*?)\s*\[/FINAL_PROMPT\]",
     re.DOTALL,
@@ -139,8 +151,21 @@ def parse_final_prompt(text: str) -> str | None:
     return None
 
 
+def parse_final_prompt_zh(text: str) -> str | None:
+    """从模型回复中解析 FINAL_PROMPT_ZH 中文提示词内容。"""
+    m = _FINAL_PROMPT_ZH_BLOCK_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    m = _FINAL_PROMPT_ZH_INLINE_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def remove_final_prompt_section(text: str) -> str:
     """移除 FINAL_PROMPT 内容，只保留用户可读的中文说明。"""
+    text = _FINAL_PROMPT_ZH_BLOCK_RE.sub("", text)
+    text = _FINAL_PROMPT_ZH_INLINE_RE.sub("", text)
     text = _FINAL_PROMPT_BLOCK_RE.sub("", text)
     text = _FINAL_PROMPT_INLINE_RE.sub("", text)
     return text.strip()

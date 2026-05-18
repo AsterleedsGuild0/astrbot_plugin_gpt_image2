@@ -21,10 +21,12 @@
 - 生图成功时在结果消息中显示实际命中的 API 站点、尝试序号和耗时。
 - 新增 Images API 与 Responses API 的 Prompt Guard 独立配置。
 - 新增 `/image2 guard` 管理员命令，用于查看和切换 Prompt Guard。
+- draw/edit 成功时将模型返回的 `revised_prompt` 收纳为合并转发，图片单独发送。
 - Plan 会话参考图按 data URL 去重，避免同一图片跨轮次或引用链重复计数。
 - Plan confirm 生图失败时发送纯文本可复制的 `/image2 edit` 或 `/image2 draw` 直接重试命令。
-- Plan confirm 生图成功后也发送纯文本可复制命令，方便在其他地方复用相同提示词。
+- Plan confirm 生图成功后也通过合并转发发送可复制命令，方便在其他地方复用相同提示词。
 - 新增 `send_copyable_prompt_after_success` 配置，用于控制 Plan 成功后是否发送可复制命令。
+- Plan 最终提示词改为同时生成中文提示词和英文/混合提示词，并在 confirm 时通过合并转发发送。
 - VSCode Run and Debug 默认打包配置改为生成测试包，并保留 release 配置。
 
 ### v0.2.0 Changed
