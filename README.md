@@ -10,6 +10,7 @@
 - **文本转图片**：插件文本回复默认使用 image2 自包含 Markdown 卡片模板，
   不加载外部 JS/CDN；失败则回退纯文本
 - **API 兼容**：支持 OpenAI 兼容 Images API 和 Responses API 两种模式
+- **多站点容灾**：draw/edit 可配置备用生图 API 站点，主站点失败后按顺序重试
 - **灵活配置**：支持模型、尺寸、质量、输出格式等参数配置
 
 ## 命令
@@ -40,6 +41,39 @@
   确认后会单独发送一张完整生成提示词图片，再发送正在生成提示和最终图片结果。
 - Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），
   可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
+- draw/edit 支持 `fallback_api_providers` 备用站点列表。插件会先使用主
+  `api_key` / `base_url` / `api_mode` / `model` / `responses_model`，
+  遇到网络错误、429、5xx、524、HTML 错误页或 provider 兼容性错误时，
+  按配置顺序或自适应健康排序尝试备用站点。
+  该列表也会用于 `/plan confirm` 最后的实际生图，但不影响 Plan 对话整理阶段。
+  在 WebUI 中点击 `fallback_api_providers` 的 `+` 添加备用站点字符串。
+  如果备用站点和主站点共用 API Key、API 模式和模型，直接填 URL 即可：
+
+  ```text
+  https://api-backup.example.com/v1
+  ```
+
+  如果需要独立 API Key、API 模式或模型，同样添加一条字符串，使用 key=value 写法：
+
+  ```text
+  base_url=https://api-backup.example.com/v1, api_key=sk-xxx, api_mode=responses
+  ```
+
+  也可以继续追加 `name`、`model`、`responses_model` 字段。
+  如果要添加官方 API 作为最后保险，追加 `role=authoritative_fallback` 和
+  `adaptive=false`。实际填写时仍是一条字符串，下方为便于阅读换行展示：
+
+  ```text
+  name=Official, base_url=https://api.openai.com/v1, api_key=sk-xxx,
+  api_mode=responses, role=authoritative_fallback, adaptive=false
+  ```
+
+  权威兜底站点固定在普通站点之后；即使成功也不会被自动提到普通中转站前面。
+  开启 `adaptive_provider_priority` 后，插件会根据历史成功/失败自动调整
+  本次运行时的尝试顺序：最近成功的站点会前置，失败站点会在
+  `provider_failure_cooldown` 时间内降级。该策略不会改写 WebUI 配置；健康状态保存在
+  AstrBot `data/plugin_data/.../provider_stats.json`，测试包重装不会清除。
+
 - 文本回复默认开启文转图（`render_text_as_image`）：使用插件自带的
   image2 Markdown 卡片模板。模板在 Python 侧把 Markdown 转成 HTML，渲染时不加载外部
   JS/CDN；失败则回退普通文本。
@@ -55,13 +89,16 @@
 | `api_mode` | string | `images` | API 模式：`images` / `responses` |
 | `model` | string | `gpt-image-2` | Images API 模型名 |
 | `responses_model` | string | `gpt-5.5` | Responses API 模型名 |
+| `fallback_api_providers` | list | `[]` | draw/edit 备用 API 站点列表 |
+| `adaptive_provider_priority` | bool | `true` | 根据历史健康状态自动调整站点尝试顺序 |
+| `provider_failure_cooldown` | int | `300` | 失败站点降级冷却时间（秒） |
 | `size` | string | `auto` | 图片尺寸：auto / 1024x1024 / 1536x1024 / 1024x1536 |
 | `quality` | string | `auto` | 图片质量：auto / low / medium / high |
 | `output_format` | string | `png` | 输出格式：png / jpeg / webp |
 | `moderation` | string | `auto` | 内容审核强度：auto / low |
 | `output_compression` | int | `0` | 输出压缩质量，仅非 png 生效；0 表示不发送 |
 | `n` | int | `1` | 生成数量（Responses API 模式下并发请求） |
-| `timeout` | int | `600` | 请求超时时间（秒） |
+| `timeout` | int | `120` | 请求超时时间（秒） |
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
@@ -93,8 +130,10 @@ python scripts/package_plugin.py
 ```
 
 如果使用 VSCode，也可以在 Run and Debug 面板选择
-`Package AstrBot plugin` 手动触发打包。该配置使用项目 `.venv`，首次使用前请先运行
-`uv sync` 安装开发依赖。
+`Package AstrBot plugin (test)` 手动触发测试包打包。该配置会调用
+`python scripts/package_plugin.py --dev-version`，自动在 zip 内写入
+`v0.1.1-test.YYYYMMDD.HHMM` 形式的真实测试版本号，但不会修改工作区文件。
+如需正式包，可选择 `Package AstrBot plugin (release)`。
 
 默认输出：
 
