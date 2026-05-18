@@ -117,6 +117,38 @@ class GPTImageClient:
             return "HTTP 429 请求过于频繁或额度不足，请稍后重试。"
         return f"HTTP {status_code}"
 
+    def _build_network_error_msg(
+        self,
+        error: httpx.HTTPError,
+        *,
+        url: str,
+        elapsed_ms: int,
+    ) -> str:
+        """构建包含异常类型和请求上下文的网络错误，不泄露 API Key。"""
+        error_type = type(error).__name__
+        detail = str(error).strip()
+
+        if isinstance(error, httpx.TimeoutException):
+            reason = f"请求超时（timeout={self.timeout}s）"
+        elif isinstance(error, httpx.ConnectError):
+            reason = "连接失败"
+        elif isinstance(error, httpx.ProxyError):
+            reason = "代理连接失败"
+        elif isinstance(error, httpx.RemoteProtocolError):
+            reason = "上游连接协议异常"
+        elif isinstance(error, httpx.NetworkError):
+            reason = "网络传输异常"
+        else:
+            reason = "HTTP 客户端异常"
+
+        if detail:
+            reason = f"{reason}：{detail}"
+
+        return (
+            f"网络请求失败（{error_type}）：{reason}；"
+            f"url={url}；elapsed_ms={elapsed_ms}"
+        )
+
     # ── Images API ──────────────────────────────────────────────
 
     async def generate_images_api(
@@ -160,11 +192,11 @@ class GPTImageClient:
                 )
         except httpx.HTTPError as e:
             elapsed = self._elapsed_ms(start)
+            error_msg = self._build_network_error_msg(e, url=url, elapsed_ms=elapsed)
             logger.warning(
-                "[GPTImage2] Images API generate request failed "
-                f"elapsed_ms={elapsed} error={type(e).__name__}: {e}"
+                f"[GPTImage2] Images API generate request failed {error_msg}"
             )
-            raise RuntimeError(f"网络请求失败：{e}") from e
+            raise RuntimeError(error_msg) from e
 
         elapsed = self._elapsed_ms(start)
         logger.debug(
@@ -250,11 +282,9 @@ class GPTImageClient:
                 )
         except httpx.HTTPError as e:
             elapsed = self._elapsed_ms(start)
-            logger.warning(
-                "[GPTImage2] Images API edit request failed "
-                f"elapsed_ms={elapsed} error={type(e).__name__}: {e}"
-            )
-            raise RuntimeError(f"网络请求失败：{e}") from e
+            error_msg = self._build_network_error_msg(e, url=url, elapsed_ms=elapsed)
+            logger.warning(f"[GPTImage2] Images API edit request failed {error_msg}")
+            raise RuntimeError(error_msg) from e
 
         elapsed = self._elapsed_ms(start)
         logger.debug(
@@ -454,11 +484,11 @@ class GPTImageClient:
                 )
         except httpx.HTTPError as e:
             elapsed = self._elapsed_ms(start)
+            error_msg = self._build_network_error_msg(e, url=url, elapsed_ms=elapsed)
             logger.warning(
-                "[GPTImage2] Responses API request failed "
-                f"action={action} elapsed_ms={elapsed} error={type(e).__name__}: {e}"
+                f"[GPTImage2] Responses API request failed action={action} {error_msg}"
             )
-            raise RuntimeError(f"网络请求失败：{e}") from e
+            raise RuntimeError(error_msg) from e
 
         elapsed = self._elapsed_ms(start)
         logger.debug(
@@ -577,11 +607,9 @@ class GPTImageClient:
                 )
         except httpx.HTTPError as e:
             elapsed = self._elapsed_ms(start)
-            logger.warning(
-                "[GPTImage2] plan Responses request failed "
-                f"elapsed_ms={elapsed} error={type(e).__name__}: {e}"
-            )
-            raise RuntimeError(f"网络请求失败：{e}") from e
+            error_msg = self._build_network_error_msg(e, url=url, elapsed_ms=elapsed)
+            logger.warning(f"[GPTImage2] plan Responses request failed {error_msg}")
+            raise RuntimeError(error_msg) from e
 
         elapsed = self._elapsed_ms(start)
         logger.debug(
