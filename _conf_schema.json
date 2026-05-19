@@ -98,7 +98,7 @@
     "description": "生成数量",
     "type": "int",
     "default": 1,
-    "hint": "Responses API 模式下会并发多次请求"
+    "hint": "Images API 会优先尝试上游原生 n；如果上游不支持或只返回部分结果，插件会自动用多次单图请求补足。Responses API 会并发多次请求模拟 n。"
   },
   "timeout": {
     "description": "请求超时时间（秒）",

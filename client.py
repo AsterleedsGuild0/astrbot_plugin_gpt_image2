@@ -94,6 +94,74 @@ class GPTImageClient:
             return prompt
         return f"{PROMPT_REWRITE_GUARD_PREFIX}\n{prompt}"
 
+    @staticmethod
+    def _normalize_n(value: object) -> int:
+        try:
+            if isinstance(value, (int, float)):
+                return max(1, int(value))
+            if isinstance(value, str):
+                return max(1, int(value.strip() or "1"))
+        except (TypeError, ValueError):
+            pass
+        return 1
+
+    @staticmethod
+    def _params_with_n(params: ImageParams, n: int) -> ImageParams:
+        return ImageParams(
+            size=params.size,
+            quality=params.quality,
+            output_format=params.output_format,
+            moderation=params.moderation,
+            n=max(1, n),
+            output_compression=params.output_compression,
+        )
+
+    @staticmethod
+    def _should_fallback_images_native_n_error(error_msg: str) -> bool:
+        lower = str(error_msg or "").lower()
+        direct_phrases = {
+            "does not support n",
+            "n is not supported",
+            "n must be 1",
+            "n should be 1",
+            "unsupported parameter: n",
+            "unknown parameter: n",
+            "invalid parameter: n",
+            "unexpected parameter: n",
+            "one image can be generated at a time",
+            "only one image can be generated",
+            "one image generation at a time",
+            "multiple output images",
+            "multiple generations",
+            "more than 1 image",
+            "maximum of 1",
+            "max 1",
+        }
+        if any(phrase in lower for phrase in direct_phrases):
+            return True
+
+        mentions_n = any(
+            marker in lower for marker in ('"n"', "'n'", "`n`", " n ", "parameter n")
+        )
+        unsupported = any(
+            phrase in lower
+            for phrase in {
+                "unsupported",
+                "not supported",
+                "unknown",
+                "unrecognized",
+                "invalid",
+                "must be",
+                "should be",
+                "maximum",
+                "not allowed",
+                "cannot",
+                "不支持",
+            }
+        )
+        parameter_error = lower.startswith("http 400") or lower.startswith("http 422")
+        return parameter_error and mentions_n and unsupported
+
     def _build_error_msg(self, status_code: int, body: Any) -> str:
         """构建不泄露 API Key 的错误消息"""
         if status_code == 524:
@@ -168,7 +236,52 @@ class GPTImageClient:
         prompt: str,
         params: ImageParams,
     ) -> list[ImageResult]:
-        """Images API 文生图
+        """Images API 文生图。
+
+        优先尝试上游原生 n；若上游不支持 n 或只返回部分结果，
+        自动使用多次单图请求补足。
+        """
+        n = self._normalize_n(params.n)
+        params = self._params_with_n(params, n)
+        if n == 1:
+            return await self._generate_images_api_once(prompt, params)
+
+        try:
+            results = await self._generate_images_api_once(prompt, params)
+        except RuntimeError as e:
+            if not self._should_fallback_images_native_n_error(str(e)):
+                raise
+            logger.info(
+                "[GPTImage2] Images API native n unsupported, "
+                f"fallback to batch generate n={n} error={e}"
+            )
+            return await self._generate_images_api_batch(prompt, params, n=n)
+
+        if len(results) >= n:
+            return results
+
+        remaining = n - len(results)
+        logger.info(
+            "[GPTImage2] Images API native n returned fewer results, "
+            f"fallback to batch generate remaining={remaining} "
+            f"requested={n} returned={len(results)}"
+        )
+        try:
+            extras = await self._generate_images_api_batch(prompt, params, n=remaining)
+        except Exception as e:
+            logger.warning(
+                "[GPTImage2] Images API generate n supplement failed, "
+                f"return partial results requested={n} returned={len(results)} error={e}"
+            )
+            return results
+        return results + extras
+
+    async def _generate_images_api_once(
+        self,
+        prompt: str,
+        params: ImageParams,
+    ) -> list[ImageResult]:
+        """Images API 单次文生图调用。
 
         POST {base_url}/images/generations
         """
@@ -237,13 +350,104 @@ class GPTImageClient:
         )
         return results
 
+    async def _generate_images_api_batch(
+        self,
+        prompt: str,
+        params: ImageParams,
+        *,
+        n: int,
+    ) -> list[ImageResult]:
+        """Images API 按单图请求并发补足文生图数量。"""
+        n = self._normalize_n(n)
+        single_params = self._params_with_n(params, 1)
+        logger.info(f"[GPTImage2] Images API batch generate start n={n}")
+        start = perf_counter()
+        tasks = [
+            self._generate_images_api_once(prompt, single_params) for _ in range(n)
+        ]
+        settled = await asyncio.gather(*tasks, return_exceptions=True)
+        results: list[ImageResult] = []
+        first_error: Exception | None = None
+        for item in settled:
+            if isinstance(item, BaseException):
+                if first_error is None:
+                    first_error = (
+                        item if isinstance(item, Exception) else Exception(str(item))
+                    )
+                continue
+            results.extend(item)
+        if results:
+            logger.info(
+                "[GPTImage2] Images API batch generate success "
+                f"elapsed_ms={self._elapsed_ms(start)} {self._result_summary(results)}"
+            )
+            return results
+        if first_error:
+            logger.warning(
+                "[GPTImage2] Images API batch generate failed "
+                f"elapsed_ms={self._elapsed_ms(start)} error={first_error}"
+            )
+            raise first_error
+        raise RuntimeError("Images API 并发文生图请求均未返回图片")
+
     async def edit_images_api(
         self,
         prompt: str,
         image_paths: list[str],
         params: ImageParams,
     ) -> list[ImageResult]:
-        """Images API 图像编辑
+        """Images API 图像编辑。
+
+        优先尝试上游原生 n；若上游不支持 n 或只返回部分结果，
+        自动使用多次单图请求补足。
+        """
+        n = self._normalize_n(params.n)
+        params = self._params_with_n(params, n)
+        if n == 1:
+            return await self._edit_images_api_once(prompt, image_paths, params)
+
+        try:
+            results = await self._edit_images_api_once(prompt, image_paths, params)
+        except RuntimeError as e:
+            if not self._should_fallback_images_native_n_error(str(e)):
+                raise
+            logger.info(
+                "[GPTImage2] Images API native n unsupported, "
+                f"fallback to batch edit n={n} error={e}"
+            )
+            return await self._edit_images_api_batch(prompt, image_paths, params, n=n)
+
+        if len(results) >= n:
+            return results
+
+        remaining = n - len(results)
+        logger.info(
+            "[GPTImage2] Images API native n returned fewer edit results, "
+            f"fallback to batch edit remaining={remaining} "
+            f"requested={n} returned={len(results)}"
+        )
+        try:
+            extras = await self._edit_images_api_batch(
+                prompt,
+                image_paths,
+                params,
+                n=remaining,
+            )
+        except Exception as e:
+            logger.warning(
+                "[GPTImage2] Images API edit n supplement failed, "
+                f"return partial results requested={n} returned={len(results)} error={e}"
+            )
+            return results
+        return results + extras
+
+    async def _edit_images_api_once(
+        self,
+        prompt: str,
+        image_paths: list[str],
+        params: ImageParams,
+    ) -> list[ImageResult]:
+        """Images API 单次图像编辑调用。
 
         POST {base_url}/images/edits
         Content-Type: multipart/form-data
@@ -330,6 +534,51 @@ class GPTImageClient:
         )
         return results
 
+    async def _edit_images_api_batch(
+        self,
+        prompt: str,
+        image_paths: list[str],
+        params: ImageParams,
+        *,
+        n: int,
+    ) -> list[ImageResult]:
+        """Images API 按单图请求并发补足图像编辑数量。"""
+        n = self._normalize_n(n)
+        single_params = self._params_with_n(params, 1)
+        logger.info(
+            "[GPTImage2] Images API batch edit start "
+            f"n={n} input_images={len(image_paths)}"
+        )
+        start = perf_counter()
+        tasks = [
+            self._edit_images_api_once(prompt, image_paths, single_params)
+            for _ in range(n)
+        ]
+        settled = await asyncio.gather(*tasks, return_exceptions=True)
+        results: list[ImageResult] = []
+        first_error: Exception | None = None
+        for item in settled:
+            if isinstance(item, BaseException):
+                if first_error is None:
+                    first_error = (
+                        item if isinstance(item, Exception) else Exception(str(item))
+                    )
+                continue
+            results.extend(item)
+        if results:
+            logger.info(
+                "[GPTImage2] Images API batch edit success "
+                f"elapsed_ms={self._elapsed_ms(start)} {self._result_summary(results)}"
+            )
+            return results
+        if first_error:
+            logger.warning(
+                "[GPTImage2] Images API batch edit failed "
+                f"elapsed_ms={self._elapsed_ms(start)} error={first_error}"
+            )
+            raise first_error
+        raise RuntimeError("Images API 并发图像编辑请求均未返回图片")
+
     def _parse_images_api_response(self, data: dict | list) -> list[ImageResult]:
         """解析 Images API 返回
 
@@ -409,7 +658,7 @@ class GPTImageClient:
         action: str,
     ) -> list[ImageResult]:
         """Responses API 不传 n，按 n 并发多次请求。"""
-        n = max(1, int(params.n or 1))
+        n = self._normalize_n(params.n)
         if n == 1:
             return await self._call_responses_api(
                 prompt, image_data_urls, params, action

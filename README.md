@@ -109,7 +109,7 @@
 | `output_format` | string | `png` | 输出格式：png / jpeg / webp |
 | `moderation` | string | `auto` | 内容审核强度：auto / low |
 | `output_compression` | int | `0` | 输出压缩质量，仅非 png 生效；0 表示不发送 |
-| `n` | int | `1` | 生成数量（Responses API 模式下并发请求） |
+| `n` | int | `1` | 生成数量；Images 原生 n，Responses 并发 |
 | `timeout` | int | `120` | 请求超时时间（秒） |
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
@@ -202,6 +202,9 @@ pip install -r requirements.txt
 
 - 请确保 `base_url` 指向正确的 OpenAI 兼容 API 端点，不要包含 `images/generations` 等路径后缀
 - 建议开启 `response_format_b64_json`，避免图片 URL 过期导致发送失败
+- `n` 在 Images API 模式下会先尝试上游原生参数；如果上游不支持
+  或只返回部分结果，插件会自动用多次单图请求补足。
+  Responses API 模式会直接并发多次请求模拟 `n`。
 - 复杂图像生成时，如果 Responses API 效果明显不如 ChatGPT Web，可尝试关闭
   `responses_prompt_rewrite_guard`，让模型自行补全构图和细节。
 - API Key 仅在运行时使用，不会在日志或错误消息中泄漏
