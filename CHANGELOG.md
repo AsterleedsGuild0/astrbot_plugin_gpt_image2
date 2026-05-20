@@ -6,6 +6,38 @@
 
 ---
 
+## v0.3.0 - 2026-05-20
+
+### v0.3.0 Added
+
+- 新增全局 `api_mode` 模式过滤：draw/edit 仅尝试支持当前全局模式的站点。
+- 新增 `primary_provider_name` 配置，用于显示主站点名称。
+- 新增独立权威兜底配置节：`authoritative_fallback_enabled`、`authoritative_fallback_name`、
+  `authoritative_fallback_api_key`、`authoritative_fallback_base_url`、
+  `authoritative_fallback_images_model`、`authoritative_fallback_responses_model`。
+- 新增 `/image2 providers` 管理员命令，显示站点顺序、能力、健康状态。
+- 新增 `capabilities` 字段支持（`images`/`responses`/`all`/`both`），用于声明
+  fallback 备用站点的能力范围。旧 `api_mode` 字段仍可自动推断 `capabilities`。
+
+### v0.3.0 Changed
+
+- Provider 配置模型移除独立 `api_mode`，能力由 `model` / `responses_model` 是否为
+  非空字符串决定。新增 `supports_mode()` / `model_for_mode()` 能力查询方法。
+- 排序改为三段固定：primary → 动态排序 normal → authoritative_fallback。
+  仅 normal 角色参与自适应健康排序和冷却降级。
+- `_parse_fallback_api_provider` 支持 `capabilities` 解析和旧 `api_mode` 自动推断。
+- provider_stats.json 写入新增 `images_model` / `responses_model` 字段。
+- 未命名 fallback 站点的 provider_id 不再包含旧 `api_mode`，升级后这类站点的健康统计会重新开始累计。
+- `/image2 help` 新增 `/image2 providers` 命令提示。
+- 升级版本至 0.3.0。
+
+### v0.3.0 Deprecated
+
+- fallback 列表中的 `role=authoritative_fallback` 仍兼容但优先使用独立配置节；
+  启用独立配置节后列表中该类项将被忽略并记录 warning。
+
+---
+
 ## v0.2.0 - 2026-05-19
 
 ### v0.2.0 Added
