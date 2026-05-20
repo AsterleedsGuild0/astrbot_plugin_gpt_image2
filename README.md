@@ -25,7 +25,7 @@
 | `/plan quit` | 退出当前 Plan 会话 |
 | `/image2 plan confirm` | 在 Plan 中确认生成图片 |
 | `/image2 plan quit` | 退出当前 Plan 会话（`cancel` 也可用） |
-| `/image2 mode [images\|responses]` | 查看或切换 API 模式（仅管理员） |
+| `/image2 mode [images\|responses]` | 查看或切换全局 API 模式（仅管理员） |
 | `/image2 guard [images\|responses\|all] [on\|off]` | 切换 Guard（仅管理员） |
 | `/image2 providers` | 查看生图站点状态（仅管理员） |
 | `/image2 help` | 显示用法和当前配置摘要 |
@@ -38,22 +38,20 @@
   默认保持旧行为：Images API 关闭，Responses API 开启。
   如需更接近 ChatGPT Web 对复杂画面的自由理解，可执行
   `/image2 guard responses off` 关闭 Responses API 的 Prompt Guard。
-- `plan` 进入 Plan 模式后，AI 会通过 Responses API 引导你完善图像描述。
-  群聊中只有带 `/plan` 前缀的消息会进入 Plan 交流，不带前缀的普通消息会正常发给群友。
-  对话中可以发送参考图；发送参考图时请附带 `/plan` 前缀。
-  确认时若已有参考图，会自动走图像编辑/参考图生成流程。
-  Plan 会用中文与你交流，最终生图提示词可中英混合；如果图像中需要出现中文字符、标题或标语，会要求模型保留原文，不翻译成英文。
-  在准备好时只展示中文摘要/核对项，不在中间交互中刷出完整生成提示词。
-  你可以发送 `/plan confirm` 或 `/image2 plan confirm` 确认生成图片，
-  发送 `/plan quit` 或 `/image2 plan quit` 退出。
-  确认后会用合并转发发送中文提示词和英文/混合提示词，
-  再发送正在生成提示和最终图片结果。
-  默认还会在成功后发送一条合并转发可复制命令；可通过
-  `send_copyable_prompt_after_success` 关闭。
+- `/image2 plan` 进入 Plan 模式后，AI 会通过 Responses API 引导你完善图像描述。
+  - 群聊中只有带 `/plan` 前缀的消息会进入 Plan 交流，不带前缀的普通消息会正常发给群友。
+  - 对话中可以发送参考图；发送参考图时请附带 `/plan` 前缀。
+  - 确认时若已有参考图，会自动走图像编辑/参考图生成流程。
+  - Plan 会用中文与你交流，最终生图提示词可中英混合；如果图像中需要出现中文字符、标题或标语，会要求模型保留原文，不翻译、不转写、不改写、不替换。
+  - 在准备好时只展示中文摘要/核对项，不在中间交互中刷出完整生成提示词。
+  - 你可以发送 `/plan confirm` 或 `/image2 plan confirm` 确认生成图片，
+    发送 `/plan quit` 或 `/image2 plan quit` 退出（`cancel` 也可用）。
+  - 确认后会用合并转发发送中文提示词和英文/混合提示词，再发送正在生成提示和最终图片结果。
+  - 默认还会在成功后发送一条合并转发可复制命令；可通过 `send_copyable_prompt_after_success` 关闭。
 - Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），
   可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
-- draw/edit 支持 `fallback_api_providers` 备用站点列表。插件会先使用主
-  `api_key` / `base_url` / `model` / `responses_model`，
+- draw/edit 支持 `fallback_api_providers` 备用站点列表。插件会优先尝试主站点
+  （`api_key` / `base_url` / `model` / `responses_model`），
   遇到网络错误、429、5xx、524、HTML 错误页或 provider 兼容性错误时，
   按三段顺序（primary → 自适应排序 normal → authoritative_fallback）尝试备用站点。
   该列表也会用于 `/plan confirm` 最后的实际生图，但不影响 Plan 对话整理阶段。
@@ -91,6 +89,7 @@
 
 - **全局模式过滤**：draw/edit 仅尝试支持当前全局模式（`/image2 mode`）的站点。
   不支持的站点在本次尝试中被跳过，不会参与跨模式重试。
+  需要查看每个站点在当前模式下是否可用时，请使用 `/image2 providers`。
 
   开启 `adaptive_provider_priority` 后，插件会根据历史成功/失败自动调整
   本次运行时普通备用站点的尝试顺序：最近成功的站点会前置，失败站点会在
