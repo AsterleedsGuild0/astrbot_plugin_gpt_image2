@@ -2351,10 +2351,21 @@ class GPTImage2Plugin(Star):
         responses_guard_status = self._prompt_rewrite_guard_status(
             self._prompt_rewrite_guard_enabled("responses")
         )
+        current_mode = self._normalize_api_mode(cfg.get("api_mode", "images"))
+        primary_provider_name = str(cfg.get("primary_provider_name", "") or "primary")
+        authoritative_enabled = self._normalize_bool(
+            cfg.get("authoritative_fallback_enabled"), default=False
+        )
+        authoritative_status = "✅ 开启" if authoritative_enabled else "❌ 关闭"
         try:
-            image_provider_count = len(self._get_image_api_provider_configs())
+            provider_configs = self._get_image_api_provider_configs()
+            image_provider_count = len(provider_configs)
+            viable_provider_count = sum(
+                1 for p in provider_configs if p.supports_mode(current_mode)
+            )
         except ValueError:
             image_provider_count = 0
+            viable_provider_count = 0
 
         help_md = (
             "## 📋 GPT Image2 使用说明\n\n"
@@ -2362,27 +2373,29 @@ class GPTImage2Plugin(Star):
             "- `/image2 draw <提示词>` — 文生图\n"
             "- `/image2 edit <提示词>` — 编辑图片（附带图片或引用图片消息）\n"
             "- `/image2 plan` — 进入 Plan 多轮图文会话，辅助优化生图提示词\n"
-            "- `/plan <描述>` — 在 Plan 会话中继续交流（群聊普通消息不会被拦截）\n"
-            "- `/plan confirm` — 在 Plan 会话中确认生成\n"
-            "- `/plan quit` — 退出当前 Plan 会话\n"
-            "- `/image2 plan confirm` — 在 Plan 中确认生成（自动带参考图）\n"
-            "- `/image2 plan quit` — 退出 Plan 会话（`cancel` 也可用）\n"
-            "- `/image2 mode [模式]` — 查看/切换 API 模式（管理员）\n"
+            "  - `/plan <描述>` — 在 Plan 会话中继续交流（群聊普通消息不会被拦截）\n"
+            "  - `/plan confirm` — 在 Plan 会话中确认生成\n"
+            "  - `/plan quit` — 退出当前 Plan 会话\n"
+            "  - `/image2 plan confirm` — 在 Plan 中确认生成（自动带参考图）\n"
+            "  - `/image2 plan quit` — 退出 Plan 会话（`cancel` 也可用）\n"
+            "- `/image2 mode [模式]` — 查看/切换全局 API 模式（管理员）\n"
             "- `/image2 guard [images|responses|all] [on|off]` — "
             "查看/切换 Prompt Guard（管理员）\n"
-            "- `/image2 providers` — 查看生图站点状态（管理员）\n"
+            "- `/image2 providers` — 查看生图站点状态与当前模式可用性（管理员）\n"
             "- `/image2 help` — 显示本帮助\n\n"
             "### 当前配置\n\n"
             f"| 项目 | 值 |\n"
             f"|------|------|\n"
             f"| API Key | {api_key_set} |\n"
             f"| Base URL | `{cfg.get('base_url', '未设置')}` |\n"
-            f"| API 模式 | `{cfg.get('api_mode', 'images')}` |\n"
+            f"| 全局 API 模式 | `{current_mode}` |\n"
+            f"| 主站点名称 | `{primary_provider_name}` |\n"
             f"| Images 模型 | `{cfg.get('model', 'gpt-image-2')}` |\n"
             f"| Responses 模型 | `{cfg.get('responses_model', 'gpt-5.5')}` |\n"
             f"| Images Prompt Guard | {images_guard_status} |\n"
             f"| Responses Prompt Guard | {responses_guard_status} |\n"
-            f"| 生图 API 站点 | {image_provider_count} 个 |\n"
+            f"| 权威兜底 | {authoritative_status} |\n"
+            f"| 生图 API 站点 | {image_provider_count} 个（当前模式可用 {viable_provider_count} 个） |\n"
             f"| 自适应站点优先级 | {adaptive_status} |\n"
             f"| Plan 模型 | `{cfg.get('plan_model', 'gpt-5.4')}` |\n"
             f"| Plan 空闲超时 | {cfg.get('plan_timeout', 300)} 秒 |\n"
@@ -2391,7 +2404,12 @@ class GPTImage2Plugin(Star):
             f"| 输出格式 | `{cfg.get('output_format', 'png')}` |\n"
             f"| 生成数量 n | {cfg.get('n', 1)} |\n"
             f"| 文本回复转图片 | {t2i_status} |\n"
-            f"| 保存输出 | {save_status} |"
+            f"| 保存输出 | {save_status} |\n\n"
+            "### 说明\n\n"
+            f"- `/image2 mode` 是全局模式，会影响 draw/edit 的站点过滤。\n"
+            f"- draw/edit 只会尝试支持当前模式的站点；不支持的站点会被跳过。\n"
+            f"- 站点明细请使用 `/image2 providers` 查看。\n"
+            f"- `/image2 plan` 进入后，下面缩进的是 Plan 子命令。"
         )
 
         yield await self._text_result(event, help_md, action="help")
@@ -2400,7 +2418,7 @@ class GPTImage2Plugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def mode(self, event: AstrMessageEvent, mode: str | None = None):
         """查看或切换 API 模式（管理员）"""
-        current_mode = self.config.get("api_mode", "images")
+        current_mode = self._normalize_api_mode(self.config.get("api_mode", "images"))
         logger.info(
             "[GPTImage2] mode command received "
             f"{self._event_context(event)} current_mode={current_mode} "
@@ -2436,6 +2454,16 @@ class GPTImage2Plugin(Star):
             )
             return
 
+        try:
+            provider_configs = self._get_image_api_provider_configs()
+            provider_count = len(provider_configs)
+            viable_provider_count = sum(
+                1 for p in provider_configs if p.supports_mode(next_mode)
+            )
+        except ValueError:
+            provider_count = 0
+            viable_provider_count = 0
+
         self.config["api_mode"] = next_mode
         saved = self._save_config()
         logger.info(
@@ -2443,10 +2471,25 @@ class GPTImage2Plugin(Star):
             f"{self._event_context(event)} from={current_mode} to={next_mode} saved={saved}"
         )
         suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
+        if provider_count == 0:
+            availability_note = (
+                "\n\n⚠️ 当前还没有配置任何可用站点。请先配置主站点或备用站点。"
+            )
+        elif viable_provider_count == 0:
+            availability_note = (
+                f"\n\n⚠️ 当前没有任何站点支持 `{next_mode}` 模式。"
+                "请先使用 `/image2 providers` 检查配置。"
+            )
+        else:
+            availability_note = (
+                f"\n\n当前模式可用站点：**{viable_provider_count}/{provider_count}**。"
+                "更多详情请使用 `/image2 providers`。"
+            )
         yield await self._text_result(
             event,
             f"## ✅ API 模式已切换\n\n"
             f"从 **`{current_mode}`** → **`{next_mode}`**\n\n"
+            f"{availability_note}\n"
             f"{suffix}",
             action="mode-switched",
         )
