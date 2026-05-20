@@ -27,6 +27,7 @@
 | `/image2 plan quit` | 退出当前 Plan 会话（`cancel` 也可用） |
 | `/image2 mode [images\|responses]` | 查看或切换 API 模式（仅管理员） |
 | `/image2 guard [images\|responses\|all] [on\|off]` | 切换 Guard（仅管理员） |
+| `/image2 providers` | 查看生图站点状态（仅管理员） |
 | `/image2 help` | 显示用法和当前配置摘要 |
 
 - `draw` 和 `edit` 命令在参数校验通过后会先回复一条
@@ -52,35 +53,47 @@
 - Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），
   可与图像生成 API 共用一套配置或分离，但对应服务必须支持 `/responses`。
 - draw/edit 支持 `fallback_api_providers` 备用站点列表。插件会先使用主
-  `api_key` / `base_url` / `api_mode` / `model` / `responses_model`，
+  `api_key` / `base_url` / `model` / `responses_model`，
   遇到网络错误、429、5xx、524、HTML 错误页或 provider 兼容性错误时，
-  按配置顺序或自适应健康排序尝试备用站点。
+  按三段顺序（primary → 自适应排序 normal → authoritative_fallback）尝试备用站点。
   该列表也会用于 `/plan confirm` 最后的实际生图，但不影响 Plan 对话整理阶段。
   在 WebUI 中点击 `fallback_api_providers` 的 `+` 添加备用站点字符串。
-  如果备用站点和主站点共用 API Key、API 模式和模型，直接填 URL 即可：
+  如果备用站点和主站点共用 API Key 和模型，直接填 URL 即可：
 
   ```text
   https://api-backup.example.com/v1
   ```
 
-  如果需要独立 API Key、API 模式或模型，同样添加一条字符串，使用 key=value 写法：
+  如果需要独立 API Key、能力或模型，使用 key=value 写法：
 
   ```text
-  base_url=https://api-backup.example.com/v1, api_key=sk-xxx, api_mode=responses
+  base_url=https://api-backup.example.com/v1, api_key=sk-xxx,
+  capabilities=images, model=gpt-image-2
   ```
 
-  也可以继续追加 `name`、`model`、`responses_model` 字段。
-  如果要添加官方 API 作为最后保险，追加 `role=authoritative_fallback` 和
-  `adaptive=false`。实际填写时仍是一条字符串，下方为便于阅读换行展示：
+  `capabilities` 字段声明该站点的能力范围，可选值：
+  - `all` 或省略 — 支持 Images 和 Responses 两种模式（向后兼容）
+  - `images` — 仅支持 Images 模式
+  - `responses` — 仅支持 Responses 模式
+  - `both` — `all` 的别名
 
-  ```text
-  name=Official, base_url=https://api.openai.com/v1, api_key=sk-xxx,
-  api_mode=responses, role=authoritative_fallback, adaptive=false
-  ```
+  旧版 `api_mode=responses` 写法仍被接受，会自动推断为 `capabilities=responses`。
+  你也可以继续追加 `name`、`model`、`responses_model` 字段。
 
+- **权威兜底站点**：推荐使用独立配置节 `authoritative_fallback_enabled` 及配套的
+  `authoritative_fallback_name`、`authoritative_fallback_api_key`、
+  `authoritative_fallback_base_url`、
+  `authoritative_fallback_images_model`、
+  `authoritative_fallback_responses_model` 配置项。
+  旧版 `fallback_api_providers` 列表中的 `role=authoritative_fallback` 写法仍兼容，
+  但启用独立配置节后，列表中的该类项将被忽略并记录 warning。
   权威兜底站点固定在普通站点之后；即使成功也不会被自动提到普通中转站前面。
+
+- **全局模式过滤**：draw/edit 仅尝试支持当前全局模式（`/image2 mode`）的站点。
+  不支持的站点在本次尝试中被跳过，不会参与跨模式重试。
+
   开启 `adaptive_provider_priority` 后，插件会根据历史成功/失败自动调整
-  本次运行时的尝试顺序：最近成功的站点会前置，失败站点会在
+  本次运行时普通备用站点的尝试顺序：最近成功的站点会前置，失败站点会在
   `provider_failure_cooldown` 时间内降级。该策略不会改写 WebUI 配置；健康状态保存在
   AstrBot `data/plugin_data/.../provider_stats.json`，测试包重装不会清除。
 
@@ -96,12 +109,19 @@
 | --- | --- | --- | --- |
 | `api_key` | string | - | API Key（必填） |
 | `base_url` | string | `https://api.openai.com/v1` | API Base URL |
-| `api_mode` | string | `images` | API 模式：`images` / `responses` |
-| `model` | string | `gpt-image-2` | Images API 模型名 |
-| `responses_model` | string | `gpt-5.5` | Responses API 模型名 |
+| `api_mode` | string | `images` | 全局 API 模式：`images` / `responses` |
+| `primary_provider_name` | string | `primary` | 主站点显示名称 |
+| `model` | string | `gpt-image-2` | 主站 Images API 模型名 |
+| `responses_model` | string | `gpt-5.5` | 主站 Responses API 模型名 |
 | `images_prompt_rewrite_guard` | bool | `false` | Images API Prompt Guard |
 | `responses_prompt_rewrite_guard` | bool | `true` | Resp API Prompt Guard |
 | `fallback_api_providers` | list | `[]` | draw/edit 备用 API 站点列表 |
+| `authoritative_fallback_enabled` | bool | `false` | 启用权威兜底站点 |
+| `authoritative_fallback_name` | string | `authoritative-fallback` | 权威兜底站点名称 |
+| `authoritative_fallback_api_key` | string | `` | 权威兜底 API Key |
+| `authoritative_fallback_base_url` | string | `` | 权威兜底 Base URL |
+| `authoritative_fallback_images_model` | string | `` | 权威兜底 Images 模型（空=不支持） |
+| `authoritative_fallback_responses_model` | string | `` | 权威兜底 Resp 模型（空=不支持） |
 | `adaptive_provider_priority` | bool | `true` | 根据历史健康状态自动调整站点尝试顺序 |
 | `provider_failure_cooldown` | int | `300` | 失败站点降级冷却时间（秒） |
 | `size` | string | `auto` | 图片尺寸：auto / 1024x1024 / 1536x1024 / 1024x1536 |

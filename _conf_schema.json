@@ -12,21 +12,27 @@
     "hint": "例如 https://api.example.com/v1，不要以 images/generations 结尾"
   },
   "api_mode": {
-    "description": "API 模式",
+    "description": "全局 API 模式",
     "type": "string",
     "default": "images",
     "options": ["images", "responses"],
     "labels": ["Images API", "Responses API"]
   },
   "model": {
-    "description": "Images API 模型",
+    "description": "主站 Images API 模型",
     "type": "string",
     "default": "gpt-image-2"
   },
   "responses_model": {
-    "description": "Responses API 模型",
+    "description": "主站 Responses API 模型",
     "type": "string",
     "default": "gpt-5.5"
+  },
+  "primary_provider_name": {
+    "description": "主站点显示名称",
+    "type": "string",
+    "default": "primary",
+    "hint": "日志、切换通知与 /image2 providers 中的主站点名称"
   },
   "images_prompt_rewrite_guard": {
     "description": "Images API 禁止重写提示词",
@@ -44,13 +50,45 @@
     "description": "备用生图 API 站点",
     "type": "list",
     "default": [],
-    "hint": "用于 draw/edit 一次性生图，以及 /plan confirm 最后的实际生图；Plan 对话整理阶段不使用该列表。WebUI 的列表项是字符串：点击 + 添加一条备用站点字符串。最简单写法只填 URL，例如 https://api-backup.example.com/v1，会继承主 api_key/api_mode/model/responses_model。若要指定独立 key、API 模式或模型，使用 key=value 写法：name=backup-1, base_url=https://api-backup.example.com/v1, api_key=sk-xxx, api_mode=responses, model=gpt-image-2, responses_model=gpt-5.5。官方兜底写法：role=authoritative_fallback, adaptive=false；该类站点固定在普通站点之后。调用顺序：普通站点按健康状态排序 → 权威兜底站点。",
+    "hint": "用于 draw/edit 一次性生图，以及 /plan confirm 最后的实际生图；Plan 对话整理阶段不使用该列表。WebUI 的列表项是字符串：点击 + 添加一条备用站点字符串。最简单写法只填 URL，例如 https://api-backup.example.com/v1，会继承主 api_key/model/responses_model。若要指定独立 Key、能力或模型，使用 key=value 写法：name=backup-1, base_url=https://api-backup.example.com/v1, api_key=sk-xxx, capabilities=images, model=gpt-image-2, responses_model=gpt-5.5。capabilities 可选 images/responses/all/both，默认 all。旧版 api_mode 仍可自动推断 capabilities。权威兜底请使用独立配置项 authoritative_fallback_*，不再推荐写在列表中（旧版 role=authoritative_fallback 仍兼容）。",
     "items": {
       "description": "备用站点字符串",
       "type": "string",
       "default": "",
-      "hint": "推荐写法 1：只填 URL，例如 https://api-backup.example.com/v1（继承主 API Key、API 模式和模型）。推荐写法 2：key=value，例如 name=backup-1, base_url=https://api-backup.example.com/v1, api_key=sk-xxx, api_mode=responses, model=gpt-image-2, responses_model=gpt-5.5。官方兜底追加 role=authoritative_fallback, adaptive=false。"
+      "hint": "推荐写法 1：只填 URL，例如 https://api-backup.example.com/v1（继承主 API Key 和模型）。推荐写法 2：key=value，例如 name=backup-1, base_url=https://api-backup.example.com/v1, api_key=sk-xxx, capabilities=images, model=gpt-image-2。旧式写法：api_mode=responses（会被自动推断为 capabilities=responses）。权威兜底建议使用独立的 authoritative_fallback_* 配置节。"
     }
+  },
+  "authoritative_fallback_enabled": {
+    "description": "启用权威兜底站点",
+    "type": "bool",
+    "default": false
+  },
+  "authoritative_fallback_name": {
+    "description": "权威兜底站点名称",
+    "type": "string",
+    "default": "authoritative-fallback"
+  },
+  "authoritative_fallback_api_key": {
+    "description": "权威兜底 API Key（留空复用主 api_key）",
+    "type": "string",
+    "default": ""
+  },
+  "authoritative_fallback_base_url": {
+    "description": "权威兜底 Base URL（留空复用主 base_url）",
+    "type": "string",
+    "default": ""
+  },
+  "authoritative_fallback_images_model": {
+    "description": "权威兜底 Images API 模型（留空=不支持 Images 模式）",
+    "type": "string",
+    "default": "",
+    "hint": "例如 gpt-image-2；该站点仅在 images 全局模式下参与尝试"
+  },
+  "authoritative_fallback_responses_model": {
+    "description": "权威兜底 Responses API 模型（留空=不支持 Responses 模式）",
+    "type": "string",
+    "default": "",
+    "hint": "例如 gpt-5.5；该站点仅在 responses 全局模式下参与尝试"
   },
   "adaptive_provider_priority": {
     "description": "自适应调整生图站点优先级",

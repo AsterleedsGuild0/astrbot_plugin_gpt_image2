@@ -123,13 +123,33 @@ class ImageAPIProviderConfig:
     name: str
     api_key: str
     base_url: str
-    api_mode: str
-    model: str
-    responses_model: str
+    model: str  # Images API 模型；空字符串 = 不支持 Images
+    responses_model: str  # Responses API 模型；空字符串 = 不支持 Responses
     provider_id: str
     configured_order: int
-    role: str = "normal"
+    role: str = "normal"  # "primary" | "normal" | "authoritative_fallback"
     adaptive: bool = True
+
+    @property
+    def images_supported(self) -> bool:
+        return bool(self.model)
+
+    @property
+    def responses_supported(self) -> bool:
+        return bool(self.responses_model)
+
+    def supports_mode(self, mode: str) -> bool:
+        if mode == "images":
+            return self.images_supported
+        if mode == "responses":
+            return self.responses_supported
+        return False
+
+    def model_for_mode(self, mode: str) -> str:
+        """返回该模式下应使用的模型名，调用方保证 mode 已通过 supports_mode 检查。"""
+        if mode == "images":
+            return self.model
+        return self.responses_model
 
 
 @register(
@@ -656,43 +676,115 @@ class GPTImage2Plugin(Star):
         )
 
     def _get_image_api_provider_configs(self) -> list[ImageAPIProviderConfig]:
-        """Build ordered draw/edit provider list: primary config + fallback list."""
+        """Build ordered draw/edit provider list: primary + normal backups + authoritative."""
         configs: list[ImageAPIProviderConfig] = []
         base_url = str(self.config.get("base_url", "https://api.openai.com/v1") or "")
         api_key = str(self.config.get("api_key", "") or "")
-        api_mode = self._normalize_api_mode(self.config.get("api_mode", "images"))
         model = str(self.config.get("model", "gpt-image-2") or "gpt-image-2")
         responses_model = str(
             self.config.get("responses_model", "gpt-5.5") or "gpt-5.5"
         )
+        primary_name = (
+            str(self.config.get("primary_provider_name", "") or "").strip() or "primary"
+        )
+
         if api_key.strip():
             configs.append(
                 ImageAPIProviderConfig(
-                    name="primary",
+                    name=primary_name,
                     api_key=api_key.strip(),
                     base_url=base_url.strip() or "https://api.openai.com/v1",
-                    api_mode=api_mode,
                     model=model.strip() or "gpt-image-2",
                     responses_model=responses_model.strip() or "gpt-5.5",
                     provider_id="name:primary",
                     configured_order=0,
-                    role="normal",
-                    adaptive=True,
+                    role="primary",
+                    adaptive=False,
                 )
             )
 
+        # Build authoritative fallback from dedicated config section
+        auth_enabled = self._normalize_bool(
+            self.config.get("authoritative_fallback_enabled"), default=False
+        )
+        auth_provider: ImageAPIProviderConfig | None = None
+        if auth_enabled:
+            auth_name = (
+                str(self.config.get("authoritative_fallback_name", "") or "").strip()
+                or "authoritative-fallback"
+            )
+            auth_base_url = (
+                str(
+                    self.config.get("authoritative_fallback_base_url", "") or ""
+                ).strip()
+                or base_url.strip()
+            )
+            auth_api_key = (
+                str(self.config.get("authoritative_fallback_api_key", "") or "").strip()
+                or api_key.strip()
+            )
+            auth_model = str(
+                self.config.get("authoritative_fallback_images_model", "") or ""
+            ).strip()
+            auth_responses_model = str(
+                self.config.get("authoritative_fallback_responses_model", "") or ""
+            ).strip()
+
+            if auth_api_key and auth_base_url:
+                if not auth_model and not auth_responses_model:
+                    logger.warning(
+                        "[GPTImage2] authoritative_fallback enabled but both "
+                        "images model and responses model are empty; skipped"
+                    )
+                else:
+                    auth_provider = ImageAPIProviderConfig(
+                        name=auth_name,
+                        api_key=auth_api_key,
+                        base_url=auth_base_url,
+                        model=auth_model,
+                        responses_model=auth_responses_model,
+                        provider_id=self._build_provider_id(
+                            auth_name,
+                            auth_base_url,
+                            auth_model,
+                            auth_responses_model,
+                        ),
+                        configured_order=9999,
+                        role="authoritative_fallback",
+                        adaptive=False,
+                    )
+            else:
+                logger.warning(
+                    "[GPTImage2] authoritative_fallback_enabled but missing "
+                    "api_key or base_url, skipped"
+                )
+
+        # Parse fallback_api_providers
         for index, item in enumerate(self._get_fallback_api_provider_items(), start=1):
             provider = self._parse_fallback_api_provider(
                 item,
                 index=index,
                 default_api_key=api_key,
                 default_base_url=base_url,
-                default_api_mode=api_mode,
                 default_model=model,
                 default_responses_model=responses_model,
             )
             if provider is not None:
+                # Check for legacy authoritative_fallback in the list
+                if provider.role == "authoritative_fallback":
+                    if auth_provider is not None:
+                        logger.warning(
+                            "[GPTImage2] ignoring authoritative_fallback from "
+                            f"fallback_api_providers name={provider.name} "
+                            "because dedicated authoritative_fallback config is enabled"
+                        )
+                        continue
+                    auth_provider = provider
+                    continue
                 configs.append(provider)
+
+        if auth_provider is not None:
+            configs.append(auth_provider)
 
         if not configs:
             raise ValueError(
@@ -722,6 +814,34 @@ class GPTImage2Plugin(Star):
         )
         return []
 
+    def _resolve_fallback_capabilities(self, data: dict) -> str:
+        """Resolve capabilities from explicit field or legacy api_mode.
+
+        Returns "images", "responses", or "all".
+        """
+        raw = str(data.get("capabilities") or "").strip().lower()
+        if raw in {"images", "responses"}:
+            return raw
+        if raw in {"all", "both"}:
+            return "all"
+        if not raw:
+            api_mode = str(data.get("api_mode") or "").strip().lower()
+            if api_mode == "images":
+                logger.info(
+                    "[GPTImage2] auto-inferred capabilities=images from legacy "
+                    f"api_mode for provider {data.get('name', '-')}; "
+                    "consider using capabilities=images"
+                )
+                return "images"
+            if api_mode == "responses":
+                logger.info(
+                    "[GPTImage2] auto-inferred capabilities=responses from legacy "
+                    f"api_mode for provider {data.get('name', '-')}; "
+                    "consider using capabilities=responses"
+                )
+                return "responses"
+        return "all"
+
     def _parse_fallback_api_provider(
         self,
         item: object,
@@ -729,7 +849,6 @@ class GPTImage2Plugin(Star):
         index: int,
         default_api_key: str,
         default_base_url: str,
-        default_api_mode: str,
         default_model: str,
         default_responses_model: str,
     ) -> ImageAPIProviderConfig | None:
@@ -752,17 +871,26 @@ class GPTImage2Plugin(Star):
         provider_name = explicit_name or f"fallback-{index}"
         provider_base_url = str(data.get("base_url") or default_base_url).strip()
         provider_api_key = str(data.get("api_key") or default_api_key).strip()
-        provider_api_mode = self._normalize_api_mode(
-            data.get("api_mode") or default_api_mode
-        )
         provider_role = self._normalize_provider_role(data.get("role") or "normal")
         provider_adaptive = self._normalize_bool(
             data.get("adaptive"), default=provider_role != "authoritative_fallback"
         )
-        provider_model = str(data.get("model") or default_model).strip()
-        provider_responses_model = str(
-            data.get("responses_model") or default_responses_model
-        ).strip()
+
+        # Capabilities resolution
+        capabilities = self._resolve_fallback_capabilities(data)
+        if capabilities == "images":
+            provider_model = str(data.get("model") or default_model).strip()
+            provider_responses_model = ""
+        elif capabilities == "responses":
+            provider_model = ""
+            provider_responses_model = str(
+                data.get("responses_model") or default_responses_model
+            ).strip()
+        else:  # "all"
+            provider_model = str(data.get("model") or default_model).strip()
+            provider_responses_model = str(
+                data.get("responses_model") or default_responses_model
+            ).strip()
 
         if not provider_base_url:
             logger.warning(
@@ -776,18 +904,22 @@ class GPTImage2Plugin(Star):
                 f"index={index} name={provider_name or '-'}"
             )
             return None
+        if not provider_model and not provider_responses_model:
+            logger.warning(
+                "[GPTImage2] skip fallback API provider with no supported "
+                f"capabilities index={index} name={provider_name or '-'}"
+            )
+            return None
 
         return ImageAPIProviderConfig(
             name=provider_name or f"fallback-{index}",
             api_key=provider_api_key,
             base_url=provider_base_url or "https://api.openai.com/v1",
-            api_mode=provider_api_mode,
-            model=provider_model or "gpt-image-2",
-            responses_model=provider_responses_model or "gpt-5.5",
+            model=provider_model,
+            responses_model=provider_responses_model,
             provider_id=self._build_provider_id(
                 explicit_name,
                 provider_base_url,
-                provider_api_mode,
                 provider_model,
                 provider_responses_model,
             ),
@@ -883,7 +1015,6 @@ class GPTImage2Plugin(Star):
     def _build_provider_id(
         name: str,
         base_url: str,
-        api_mode: str,
         model: str,
         responses_model: str,
     ) -> str:
@@ -892,7 +1023,6 @@ class GPTImage2Plugin(Star):
         source = "|".join(
             [
                 base_url.strip().rstrip("/"),
-                api_mode.strip().lower(),
                 model.strip(),
                 responses_model.strip(),
             ]
@@ -1005,19 +1135,20 @@ class GPTImage2Plugin(Star):
             score -= 100.0
         return score
 
-    def _rank_image_api_provider_configs(
+    def _adaptive_sort_normal_providers(
         self,
-        configs: list[ImageAPIProviderConfig],
+        normal: list[ImageAPIProviderConfig],
     ) -> list[ImageAPIProviderConfig]:
-        if len(configs) <= 1:
-            return configs
+        """Sort normal backups by health score (adaptive) then configured_order."""
+        if len(normal) <= 1:
+            return normal
 
         adaptive_enabled = self._adaptive_provider_priority_enabled()
         stats = self._load_provider_stats().get("providers", {})
         now = time()
-        ranked: list[tuple[int, bool, float, int, ImageAPIProviderConfig]] = []
-        debug_items: list[str] = []
-        for provider in configs:
+
+        ranked: list[tuple[bool, float, int, ImageAPIProviderConfig]] = []
+        for provider in normal:
             item = stats.get(provider.provider_id, {})
             item = item if isinstance(item, dict) else {}
             cooldown_until = self._provider_stat_float(item, "cooldown_until")
@@ -1026,30 +1157,40 @@ class GPTImage2Plugin(Star):
             score = (
                 self._provider_health_score(item, now) if adaptive_for_provider else 0.0
             )
-            role_rank = 1 if provider.role == "authoritative_fallback" else 0
             ranked.append(
                 (
-                    role_rank,
                     cooldown_active,
                     -score,
                     provider.configured_order,
                     provider,
                 )
             )
-            debug_items.append(
-                f"{provider.name}/{provider.api_mode}/{provider.role}:"
-                f"adaptive={provider.adaptive} score={score:.1f} "
-                f"cooldown={int(max(0, cooldown_until - now))}s"
-            )
 
-        ranked.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
-        sorted_configs = [item[4] for item in ranked]
-        if [p.provider_id for p in sorted_configs] != [p.provider_id for p in configs]:
+        ranked.sort(key=lambda x: (x[0], x[1], x[2]))
+        return [item[3] for item in ranked]
+
+    def _rank_image_api_provider_configs(
+        self,
+        configs: list[ImageAPIProviderConfig],
+    ) -> list[ImageAPIProviderConfig]:
+        """Three-segment sort: primary first, normal sorted, authoritative last."""
+        if len(configs) <= 1:
+            return configs
+
+        primary = [c for c in configs if c.role == "primary"]
+        authoritative = [c for c in configs if c.role == "authoritative_fallback"]
+        normal = [c for c in configs if c.role == "normal"]
+
+        # Only normal backups participate in adaptive sorting
+        normal = self._adaptive_sort_normal_providers(normal)
+
+        result = primary + normal + authoritative
+        if [p.provider_id for p in result] != [p.provider_id for p in configs]:
             logger.info(
-                "[GPTImage2] adaptive provider priority reordered "
-                f"order={[p.name for p in sorted_configs]} stats={debug_items}"
+                "[GPTImage2] provider priority reordered "
+                f"order={[p.name for p in result]}"
             )
-        return sorted_configs
+        return result
 
     def _record_image_provider_result(
         self,
@@ -1077,9 +1218,10 @@ class GPTImage2Plugin(Star):
             {
                 "name": provider.name,
                 "base_url": provider.base_url,
-                "api_mode": provider.api_mode,
+                "api_mode": self.config.get("api_mode", "images"),  # legacy
                 "model": provider.model,
                 "responses_model": provider.responses_model,
+                "images_model": provider.model,
                 "configured_order": provider.configured_order,
                 "role": provider.role,
                 "adaptive": provider.adaptive,
@@ -1143,6 +1285,8 @@ class GPTImage2Plugin(Star):
                 key = "role"
             elif key in {"adaptive", "adapt", "adaptive_priority"}:
                 key = "adaptive"
+            elif key in {"cap", "capabilities", "capability"}:
+                key = "capabilities"
             elif key not in {
                 "name",
                 "base_url",
@@ -1152,6 +1296,7 @@ class GPTImage2Plugin(Star):
                 "adaptive",
                 "model",
                 "responses_model",
+                "capabilities",
             }:
                 continue
             data[key] = raw
@@ -1870,9 +2015,13 @@ class GPTImage2Plugin(Star):
         return "\n".join(lines)
 
     @staticmethod
-    def _provider_user_label(provider: ImageAPIProviderConfig) -> str:
+    def _provider_user_label(
+        provider: ImageAPIProviderConfig,
+        global_mode: str = "",
+    ) -> str:
         suffix = " / 权威兜底" if provider.role == "authoritative_fallback" else ""
-        return f"{provider.name} / {provider.api_mode}{suffix}"
+        mode_label = f" / {global_mode}" if global_mode else ""
+        return f"{provider.name}{mode_label}{suffix}"
 
     async def _send_provider_switch_notice(
         self,
@@ -1884,14 +2033,15 @@ class GPTImage2Plugin(Star):
         error_msg: str,
         next_index: int,
         total: int,
+        global_mode: str = "",
     ) -> None:
         """Notify users before trying the next provider, so fallback is visible."""
         await self._send_processing_ack(
             event,
             "## 🔁 正在切换备用 API 站点\n\n"
-            f"- 已失败：**{self._provider_user_label(failed_provider)}**\n"
+            f"- 已失败：**{self._provider_user_label(failed_provider, global_mode)}**\n"
             f"- 失败原因：{self._safe_markdown_preview(error_msg, limit=220)}\n"
-            f"- 即将尝试：**{self._provider_user_label(next_provider)}**"
+            f"- 即将尝试：**{self._provider_user_label(next_provider, global_mode)}**"
             f"（第 {next_index}/{total} 个站点）",
             action=f"{action}-provider-switch",
         )
@@ -1904,11 +2054,12 @@ class GPTImage2Plugin(Star):
         total: int,
         failed_count: int,
         elapsed_ms: int,
+        global_mode: str = "",
     ) -> Plain:
         retry_text = f"，已跳过 {failed_count} 个失败站点" if failed_count else ""
         return Plain(
             "✅ 生图成功："
-            f"{self._provider_user_label(provider)}"
+            f"{self._provider_user_label(provider, global_mode)}"
             f"（第 {attempt_index}/{total} 个站点{retry_text}，耗时 {elapsed_ms}ms）\n"
         )
 
@@ -1997,8 +2148,22 @@ class GPTImage2Plugin(Star):
             await self._send_text(event, str(e), action=f"{action}-config-error")
             return []
 
+        global_mode = self._normalize_api_mode(self.config.get("api_mode", "images"))
+
+        # Filter providers by global mode support
+        viable = [p for p in provider_configs if p.supports_mode(global_mode)]
+        if not viable:
+            other_mode = "responses" if global_mode == "images" else "images"
+            await self._send_text(
+                event,
+                f"## ⚠️ 当前 `{global_mode}` 模式下无可用生图站点\n\n"
+                f"请使用 `/image2 mode {other_mode}` 切换到另一模式，"
+                "或配置至少一个支持当前模式的站点。",
+                action=f"{action}-no-viable-provider",
+            )
+            return []
+
         params = self._get_params()
-        initial_api_mode = provider_configs[0].api_mode
         reference_images = reference_images or []
         reference_data_urls = reference_data_urls or []
         reference_count = max(len(reference_images), len(reference_data_urls))
@@ -2007,15 +2172,15 @@ class GPTImage2Plugin(Star):
             if action == "edit":
                 ack_text = (
                     f"✅ 已收到图像编辑请求，已识别 {reference_count} 张参考图，"
-                    f"正在使用 {initial_api_mode} 模式处理，请稍候…"
+                    f"正在使用 {global_mode} 模式处理，请稍候…"
                 )
             elif reference_count:
                 ack_text = (
-                    f"✅ 已识别 {reference_count} 张参考图，正在使用 {initial_api_mode} "
+                    f"✅ 已识别 {reference_count} 张参考图，正在使用 {global_mode} "
                     "模式生成图片，请稍候…"
                 )
             else:
-                ack_text = f"✅ 正在使用 {initial_api_mode} 模式生成图片，请稍候…"
+                ack_text = f"✅ 正在使用 {global_mode} 模式生成图片，请稍候…"
 
             await self._send_processing_ack(
                 event,
@@ -2029,16 +2194,13 @@ class GPTImage2Plugin(Star):
         selected_attempt_index = 0
         provider_errors: list[tuple[str, str]] = []
 
-        for index, provider in enumerate(provider_configs, start=1):
+        for index, provider in enumerate(viable, start=1):
             client = self._build_image_api_client(provider)
-            provider_api_mode = provider.api_mode
-            provider_action = (
-                f"{action}:{provider.name}" if len(provider_configs) > 1 else action
-            )
+            provider_action = f"{action}:{provider.name}" if len(viable) > 1 else action
             logger.info(
                 "[GPTImage2] image provider attempt "
                 f"action={action} provider={provider.name} index={index}/"
-                f"{len(provider_configs)} mode={provider_api_mode} "
+                f"{len(viable)} mode={global_mode} "
                 f"role={provider.role} adaptive={provider.adaptive}"
             )
             try:
@@ -2046,7 +2208,7 @@ class GPTImage2Plugin(Star):
                     client=client,
                     prompt=prompt,
                     params=params,
-                    api_mode=provider_api_mode,
+                    api_mode=global_mode,
                     reference_images=reference_images,
                     reference_data_urls=reference_data_urls,
                     reference_count=reference_count,
@@ -2064,24 +2226,25 @@ class GPTImage2Plugin(Star):
                     error_msg=error_msg,
                 )
                 provider_errors.append(
-                    (f"{provider.name}/{provider_api_mode}/{provider.role}", error_msg)
+                    (f"{provider.name}/{global_mode}/{provider.role}", error_msg)
                 )
                 logger.warning(
                     "[GPTImage2] image provider failed "
                     f"action={action} provider={provider.name} index={index}/"
-                    f"{len(provider_configs)} role={provider.role} error={e}"
+                    f"{len(viable)} role={provider.role} error={e}"
                 )
-                if index < len(
-                    provider_configs
-                ) and self._should_try_next_image_provider(error_msg):
+                if index < len(viable) and self._should_try_next_image_provider(
+                    error_msg
+                ):
                     await self._send_provider_switch_notice(
                         event,
                         action=action,
                         failed_provider=provider,
-                        next_provider=provider_configs[index],
+                        next_provider=viable[index],
                         error_msg=error_msg,
                         next_index=index + 1,
-                        total=len(provider_configs),
+                        total=len(viable),
+                        global_mode=global_mode,
                     )
                     continue
 
@@ -2091,7 +2254,7 @@ class GPTImage2Plugin(Star):
                         event,
                         "## ⚠️ 上游拒绝读取参考图\n\n"
                         f"错误：{self._safe_markdown_preview(error_msg, limit=320)}\n\n"
-                        f"- 当前 API 模式：`{provider_api_mode}`\n"
+                        f"- 当前 API 模式：`{global_mode}`\n"
                         f"- 参考图数量：`{reference_count}`\n"
                         f"- 生图模型：`{provider.model}`\n"
                         f"- Responses 模型：`{provider.responses_model}`"
@@ -2136,7 +2299,7 @@ class GPTImage2Plugin(Star):
         logger.info(
             "[GPTImage2] image API success "
             f"action={action} provider={selected_provider.name} "
-            f"mode={selected_provider.api_mode} role={selected_provider.role} "
+            f"mode={global_mode} role={selected_provider.role} "
             f"adaptive={selected_provider.adaptive} results={len(results)} "
             f"elapsed_ms={self._elapsed_ms(started)}"
         )
@@ -2151,9 +2314,10 @@ class GPTImage2Plugin(Star):
                 self._provider_success_notice(
                     selected_provider,
                     attempt_index=selected_attempt_index,
-                    total=len(provider_configs),
+                    total=len(viable),
                     failed_count=len(provider_errors),
                     elapsed_ms=self._elapsed_ms(started),
+                    global_mode=global_mode,
                 ),
             )
         if not chain:
@@ -2206,6 +2370,7 @@ class GPTImage2Plugin(Star):
             "- `/image2 mode [模式]` — 查看/切换 API 模式（管理员）\n"
             "- `/image2 guard [images|responses|all] [on|off]` — "
             "查看/切换 Prompt Guard（管理员）\n"
+            "- `/image2 providers` — 查看生图站点状态（管理员）\n"
             "- `/image2 help` — 显示本帮助\n\n"
             "### 当前配置\n\n"
             f"| 项目 | 值 |\n"
@@ -2378,6 +2543,119 @@ class GPTImage2Plugin(Star):
             "## ✅ Prompt Guard 已更新\n\n" + "\n".join(rows) + f"\n\n{suffix}",
             action="guard-switched",
         )
+
+    @image2.command("providers")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def providers(self, event: AstrMessageEvent):
+        """显示当前生图站点状态（管理员）"""
+        global_mode = self._normalize_api_mode(self.config.get("api_mode", "images"))
+
+        try:
+            configs = self._get_image_api_provider_configs()
+        except ValueError as e:
+            yield await self._text_result(
+                event,
+                f"## ⚠️ 无法获取站点配置\n\n{str(e)}",
+                action="providers-config-error",
+            )
+            return
+
+        stats = self._load_provider_stats().get("providers", {})
+        now = time()
+
+        primary = [c for c in configs if c.role == "primary"]
+        normal = [c for c in configs if c.role == "normal"]
+        authoritative = [c for c in configs if c.role == "authoritative_fallback"]
+
+        def _mode_status(p: ImageAPIProviderConfig) -> str:
+            img = "✅" if p.images_supported else "❌"
+            resp = "✅" if p.responses_supported else "❌"
+            return f"`images {img} / responses {resp}`"
+
+        def _viable_marker(p: ImageAPIProviderConfig) -> str:
+            return "✅" if p.supports_mode(global_mode) else "❌"
+
+        def _health_str(p: ImageAPIProviderConfig) -> str:
+            item = stats.get(p.provider_id, {})
+            if not isinstance(item, dict):
+                item = {}
+            success = item.get("success_count", 0)
+            failure = item.get("failure_count", 0)
+            cooldown_until = item.get("cooldown_until", 0)
+            remaining = max(0, int(cooldown_until - now)) if cooldown_until > now else 0
+            parts = [f"成功 {success} 次 / 失败 {failure} 次"]
+            if remaining > 0:
+                parts.append(f"冷却 {remaining}s ⚠️")
+            return "，".join(parts)
+
+        def _model_str(p: ImageAPIProviderConfig) -> str:
+            parts = []
+            if p.model:
+                parts.append(f"images=`{p.model}`")
+            if p.responses_model:
+                parts.append(f"responses=`{p.responses_model}`")
+            return "，".join(parts)
+
+        lines: list[str] = [
+            "## 📡 生图站点状态\n\n",
+            f"全局模式：`{global_mode}`\n\n",
+            "---\n\n",
+        ]
+
+        if primary:
+            lines.append("### ⭐ 主站点（始终优先）\n\n")
+            for p in primary:
+                lines.append(
+                    f"**{p.name}** {_viable_marker(p)} {_mode_status(p)}\n\n"
+                    f"- 模型：{_model_str(p)}\n"
+                    f"- URL：`{p.base_url}`\n"
+                    f"- 健康：{_health_str(p)}\n\n"
+                )
+        else:
+            lines.append("### ⭐ 主站点\n\n（未配置）\n\n")
+
+        if normal:
+            lines.append("### 🔄 普通备用站点（按当前优先级排列）\n\n")
+            for idx, p in enumerate(normal, start=1):
+                cooldown_str = ""
+                item = stats.get(p.provider_id, {})
+                if isinstance(item, dict):
+                    cooldown_until = item.get("cooldown_until", 0)
+                    remaining = (
+                        max(0, int(cooldown_until - now)) if cooldown_until > now else 0
+                    )
+                    if remaining > 0:
+                        cooldown_str = f" ⚠️冷却 {remaining}s"
+                lines.append(
+                    f"{idx}. **{p.name}** {_viable_marker(p)} "
+                    f"{_mode_status(p)}{cooldown_str}\n\n"
+                    f"   模型：{_model_str(p)}\n"
+                    f"   URL：`{p.base_url}`\n"
+                    f"   健康：{_health_str(p)}\n\n"
+                )
+        else:
+            lines.append("### 🔄 普通备用站点\n\n（无）\n\n")
+
+        if authoritative:
+            lines.append("### 🛡️ 权威兜底站点（始终最后）\n\n")
+            for p in authoritative:
+                lines.append(
+                    f"**{p.name}** {_viable_marker(p)} {_mode_status(p)}\n\n"
+                    f"- 模型：{_model_str(p)}\n"
+                    f"- URL：`{p.base_url}`\n"
+                    f"- 健康：{_health_str(p)}\n\n"
+                )
+        else:
+            lines.append("### 🛡️ 权威兜底站点\n\n（未配置）\n\n")
+
+        viable_count = sum(1 for p in configs if p.supports_mode(global_mode))
+        lines.append(
+            f"---\n\n共 {len(configs)} 个站点，"
+            f"当前 `{global_mode}` 模式可用：{viable_count} 个\n\n"
+            "`✅` = 当前模式可用  `❌` = 当前模式不可用"
+        )
+
+        yield await self._text_result(event, "".join(lines), action="providers")
 
     # ── Plan 模式 ────────────────────────────────────────────
 
