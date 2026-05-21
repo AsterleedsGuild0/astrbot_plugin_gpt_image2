@@ -30,7 +30,13 @@ import uuid
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Image as CompImage, Node, Nodes, Plain
+from astrbot.api.message_components import (
+    Image as CompImage,
+    Node,
+    Nodes,
+    Plain,
+    Reply,
+)
 from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.session_waiter import (
@@ -229,14 +235,21 @@ class GPTImage2Plugin(Star):
         *,
         action: str,
         prefer_image: bool | None = None,
+        task_anchor: bool = False,
     ) -> None:
-        """主动发送处理中提示，避免在 handler 中途 yield 打断处理流程。"""
+        """主动发送处理中提示，避免在 handler 中途 yield 打断处理流程。
+
+        When *task_anchor* is ``True`` a visible ``[任务 #TAG]`` prefix and
+        a ``Reply`` component are added to tie the message to the original
+        user command.
+        """
         try:
             await self._send_text(
                 event,
                 text,
                 action=action,
                 prefer_image=prefer_image,
+                task_anchor=task_anchor,
             )
             logger.debug(
                 "[GPTImage2] processing acknowledgement sent "
@@ -584,6 +597,45 @@ class GPTImage2Plugin(Star):
         return normalized or "-"
 
     @staticmethod
+    def _task_tag(event: AstrMessageEvent) -> str:
+        """Generate a short, opaque task tag for draw/edit flow anchoring.
+
+        The tag is a 6-char hex hash derived from the event's message origin
+        and source-message metadata.  It is stable for a given message and
+        does *not* leak the raw message ID or any user secret.
+        """
+        msg_obj = getattr(event, "message_obj", None)
+        message_id = getattr(msg_obj, "message_id", "") or ""
+        timestamp = getattr(msg_obj, "timestamp", "") or ""
+        fallback_text = getattr(event, "message_str", "") or ""
+        raw = f"{event.unified_msg_origin}:{message_id}:{timestamp}:{fallback_text}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:6].upper()
+
+    @staticmethod
+    def _build_reply(event: AstrMessageEvent) -> Reply | None:
+        """Build a ``Reply`` component anchored to *event*'s source message.
+
+        Returns ``None`` when the message object lacks the metadata needed
+        to construct a meaningful reply — the caller should degrade gracefully
+        by omitting the reply anchor.
+        """
+        try:
+            msg_obj = event.message_obj
+            message_id = getattr(msg_obj, "message_id", "")
+            if not message_id:
+                return None
+            return Reply(
+                id=message_id,
+                sender_id=event.get_sender_id(),
+                sender_nickname=event.get_sender_name(),
+                chain=msg_obj.message,
+                message_str=getattr(msg_obj, "message_str", "") or "",
+                time=getattr(msg_obj, "timestamp", 0) or 0,
+            )
+        except Exception:
+            return None
+
+    @staticmethod
     def _is_valid_image_file(path: str) -> bool:
         try:
             with Path(path).open("rb") as image_file:
@@ -606,13 +658,26 @@ class GPTImage2Plugin(Star):
         *,
         action: str,
         prefer_image: bool | None = None,
+        task_anchor: bool = False,
     ) -> None:
-        """发送文本类回复；默认文转图，失败回退文字。"""
+        """发送文本类回复；默认文转图，失败回退文字。
+
+        When *task_anchor* is ``True`` a visible ``[任务 #TAG]`` prefix is
+        injected into *text* and a ``Reply`` component is prepended so the
+        platform can render a native reply bubble.
+        """
+        if task_anchor:
+            tag = self._task_tag(event)
+            text = f"[任务 #{tag}]\n\n{text}"
         chain = await self._build_text_chain(
             text,
             action=action,
             prefer_image=prefer_image,
         )
+        if task_anchor:
+            reply = self._build_reply(event)
+            if reply is not None:
+                chain.chain.insert(0, reply)
         await event.send(chain)
 
     async def _text_result(
@@ -622,14 +687,28 @@ class GPTImage2Plugin(Star):
         *,
         action: str,
         prefer_image: bool | None = None,
+        task_anchor: bool = False,
     ):
-        """构建可 yield 的文本回复结果；默认文转图，失败回退文字。"""
+        """构建可 yield 的文本回复结果；默认文转图，失败回退文字。
+
+        When *task_anchor* is ``True`` a visible ``[任务 #TAG]`` prefix is
+        injected and a ``Reply`` component is prepended.
+        """
+        if task_anchor:
+            tag = self._task_tag(event)
+            text = f"[任务 #{tag}]\n\n{text}"
         chain = await self._build_text_chain(
             text,
             action=action,
             prefer_image=prefer_image,
         )
-        return event.chain_result(chain.chain)
+        result_chain = chain.chain
+        if task_anchor:
+            reply = self._build_reply(event)
+            if reply is not None:
+                result_chain = list(result_chain)
+                result_chain.insert(0, reply)
+        return event.chain_result(result_chain)
 
     async def _send_proactive_message(
         self,
@@ -2335,6 +2414,7 @@ class GPTImage2Plugin(Star):
             f"- 即将尝试：**{self._provider_user_label(next_provider, global_mode)}**"
             f"（第 {next_index}/{total} 个站点）",
             action=f"{action}-provider-switch",
+            task_anchor=True,
         )
 
     def _provider_success_notice(
@@ -2346,10 +2426,12 @@ class GPTImage2Plugin(Star):
         failed_count: int,
         elapsed_ms: int,
         global_mode: str = "",
+        task_tag: str = "",
     ) -> Plain:
         retry_text = f"，已跳过 {failed_count} 个失败站点" if failed_count else ""
+        tag_prefix = f"[任务 #{task_tag}]\n\n" if task_tag else ""
         return Plain(
-            "✅ 生图成功："
+            tag_prefix + "✅ 生图成功："
             f"{self._provider_user_label(provider, global_mode)}"
             f"（第 {attempt_index}/{total} 个站点{retry_text}，耗时 {elapsed_ms}ms）\n"
         )
@@ -2477,6 +2559,7 @@ class GPTImage2Plugin(Star):
                 event,
                 ack_text,
                 action=action,
+                task_anchor=True,
             )
 
         started = perf_counter()
@@ -2566,6 +2649,7 @@ class GPTImage2Plugin(Star):
                         "或服务商对当前 endpoint/model 的图像输入兼容性有问题。"
                         "插件不会自动丢弃参考图重试，以免生成结果偏离 Plan。",
                         action=f"{action}-image-input-error",
+                        task_anchor=True,
                     )
                     return []
                 await self._send_text(
@@ -2574,6 +2658,7 @@ class GPTImage2Plugin(Star):
                     f"最后错误：{self._safe_markdown_preview(error_msg, limit=320)}"
                     f"{provider_summary}",
                     action=f"{action}-api-error",
+                    task_anchor=True,
                 )
                 return []
             except Exception as e:
@@ -2587,6 +2672,7 @@ class GPTImage2Plugin(Star):
                     event,
                     f"## ⚠️ GPT Image2 调用失败\n\n`{e}`",
                     action=f"{action}-unexpected-error",
+                    task_anchor=True,
                 )
                 return []
 
@@ -2596,6 +2682,7 @@ class GPTImage2Plugin(Star):
                 "## ⚠️ GPT Image2 调用失败\n\n所有 API 站点均未返回结果。"
                 f"{self._provider_error_summary(provider_errors)}",
                 action=f"{action}-provider-empty",
+                task_anchor=True,
             )
             return []
 
@@ -2610,6 +2697,7 @@ class GPTImage2Plugin(Star):
         if action in {"draw", "edit"}:
             await self._send_revised_prompt_forward(event, results, action=action)
 
+        tag = self._task_tag(event)
         chain = self._build_image_chain(results, params)
         if chain:
             chain.insert(
@@ -2621,13 +2709,18 @@ class GPTImage2Plugin(Star):
                     failed_count=len(provider_errors),
                     elapsed_ms=self._elapsed_ms(started),
                     global_mode=global_mode,
+                    task_tag=tag,
                 ),
             )
+            reply = self._build_reply(event)
+            if reply is not None:
+                chain.insert(0, reply)
         if not chain:
             await self._send_text(
                 event,
                 "## ⚠️ GPT Image2 未返回任何可显示的图片",
                 action=f"{action}-empty-result",
+                task_anchor=True,
             )
         return chain
 
