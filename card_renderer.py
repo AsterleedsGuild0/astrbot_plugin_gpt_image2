@@ -110,6 +110,10 @@ CARD_TEMPLATE = """<!doctype html>
     }
 
     li { margin: 7px 0; }
+
+    ul ul, ol ol, ul ol, ol ul {
+      margin: 7px 0;
+    }
     li::marker { color: var(--accent); }
 
     code {
@@ -279,30 +283,10 @@ def markdown_to_html(text: str) -> str:
             html_parts.append(f"<blockquote><p>{quote_body}</p></blockquote>")
             continue
 
-        list_match = re.match(r"^([-*+])\s+(.+)$", stripped)
-        if list_match:
+        if _is_list_line(stripped):
             flush_paragraph()
-            items: list[str] = []
-            while i < len(lines):
-                item_match = re.match(r"^([-*+])\s+(.+)$", lines[i].strip())
-                if not item_match:
-                    break
-                items.append(f"<li>{_render_inline(item_match.group(2))}</li>")
-                i += 1
-            html_parts.append(f"<ul>{''.join(items)}</ul>")
-            continue
-
-        ordered_match = re.match(r"^\d+[.)]\s+(.+)$", stripped)
-        if ordered_match:
-            flush_paragraph()
-            items = []
-            while i < len(lines):
-                item_match = re.match(r"^\d+[.)]\s+(.+)$", lines[i].strip())
-                if not item_match:
-                    break
-                items.append(f"<li>{_render_inline(item_match.group(1))}</li>")
-                i += 1
-            html_parts.append(f"<ol>{''.join(items)}</ol>")
+            list_html, i = _collect_and_render_list(lines, i)
+            html_parts.append(list_html)
             continue
 
         paragraph.append(stripped)
@@ -372,3 +356,101 @@ def _split_table_row(row: str) -> list[str]:
     if stripped.endswith("|"):
         stripped = stripped[:-1]
     return [cell.strip() for cell in stripped.split("|")]
+
+
+# ---------------------------------------------------------------------------
+# Nested-list helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_list_line(stripped: str) -> bool:
+    """Return True if *stripped* looks like a Markdown list item."""
+    return bool(
+        re.match(r"^([-*+])\s+", stripped) or re.match(r"^\d+[.)]\s+", stripped)
+    )
+
+
+def _collect_and_render_list(lines: list[str], start: int) -> tuple[str, int]:
+    """Collect consecutive list lines (ordered & unordered) from *start* and
+    render them as nested HTML.
+
+    Returns ``(html_string, next_line_index)``.
+    """
+    raw_items: list[tuple[int, str, str]] = []  # (indent, type, content)
+    i = start
+    first_indent = len(lines[start]) - len(lines[start].lstrip())
+
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+
+        if not stripped:
+            i += 1
+            continue
+
+        ul_match = re.match(r"^([-*+])\s+(.+)$", stripped)
+        if ul_match:
+            indent = len(raw) - len(raw.lstrip())
+            if indent < first_indent and i > start:
+                break
+            raw_items.append((indent, "ul", ul_match.group(2)))
+            i += 1
+            continue
+
+        ol_match = re.match(r"^\d+[.)]\s+(.+)$", stripped)
+        if ol_match:
+            indent = len(raw) - len(raw.lstrip())
+            if indent < first_indent and i > start:
+                break
+            raw_items.append((indent, "ol", ol_match.group(1)))
+            i += 1
+            continue
+
+        break
+
+    return _render_nested_list(raw_items), i
+
+
+def _render_nested_list(items: list[tuple[int, str, str]]) -> str:
+    """Recursively render flat ``(indent, type, content)`` tuples into nested
+    HTML ``<ul>`` / ``<ol>`` lists.
+
+    Items at the same indentation and of the same marker type are grouped into
+    a single list.  A deeper indentation opens a new list nested inside the
+    preceding ``<li>``.
+    """
+    if not items:
+        return ""
+
+    result: list[str] = []
+    n = len(items)
+    i = 0
+
+    while i < n:
+        base_indent = items[i][0]
+        base_type = items[i][1]
+
+        # group consecutive same-level & same-type items
+        lis: list[str] = []
+        while i < n and items[i][0] == base_indent and items[i][1] == base_type:
+            _, _, content = items[i]
+            i += 1
+
+            # children (deeper indent) belong to this item
+            child_start = i
+            while i < n and items[i][0] > base_indent:
+                i += 1
+
+            child_html = (
+                _render_nested_list(items[child_start:i]) if i > child_start else ""
+            )
+
+            inner = _render_inline(content)
+            lis.append(
+                f"<li>{inner}{child_html}</li>" if child_html else f"<li>{inner}</li>"
+            )
+
+        tag = "ul" if base_type == "ul" else "ol"
+        result.append(f"<{tag}>{''.join(lis)}</{tag}>")
+
+    return "".join(result)
