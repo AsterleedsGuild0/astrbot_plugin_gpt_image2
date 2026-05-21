@@ -22,6 +22,7 @@ PACKAGE_FILES = [
     "main.py",
     "card_renderer.py",
     "client.py",
+    "config_redact.py",
     "image_utils.py",
     "plan.py",
     "text_image.py",
