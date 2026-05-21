@@ -161,7 +161,7 @@ class ImageAPIProviderConfig:
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.4.0",
+    "0.4.1",
 )
 class GPTImage2Plugin(Star):
     PLAN_WAITER_TIMEOUT_GRACE = 10
@@ -3227,7 +3227,7 @@ class GPTImage2Plugin(Star):
                 # 5. version.txt
                 zf.writestr(
                     "version.txt",
-                    f"Plugin: {plugin_name}\nVersion: 0.4.0\nGenerated: {timestamp}\n",
+                    f"Plugin: {plugin_name}\nVersion: 0.4.1\nGenerated: {timestamp}\n",
                 )
 
             # Try sending as a File component

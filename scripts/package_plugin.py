@@ -178,7 +178,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help=(
             "Override the version written into the zip package, e.g. "
-            "v0.4.0-test.20260517.1548. Workspace files are not modified."
+            "v0.4.1-test.20260517.1548. Workspace files are not modified."
         ),
     )
     return parser.parse_args(argv)

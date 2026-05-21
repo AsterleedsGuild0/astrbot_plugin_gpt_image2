@@ -6,6 +6,27 @@
 
 ---
 
+## v0.4.1 - 2026-05-21
+
+### v0.4.1 Fixed
+
+- 修复 `/image2 diag` 诊断包脱敏不完整：`config_redacted.json` 现在递归脱敏嵌套
+  API Key、Token、Secret、Password，包括 `fallback_api_providers` 字符串中的
+  `api_key=` / `key=` 参数、JSON 编码配置、URL 凭据和查询参数、裸 `sk-`/`fk-` 密钥。
+- 修复 `/image2 diag` 在 `provider_failures.jsonl` 不存在或读取失败时未写入空文件的问题；
+  诊断包现在始终包含该文件。
+- 修复诊断包中权威兜底、Plan 独立 API Key 等配置项可能未被完整脱敏的问题。
+
+### v0.4.1 Added
+
+- 新增独立 `config_redact.py` 脱敏工具模块，便于无 AstrBot 运行时测试。
+- 非 2xx API 响应现在通过结构化诊断写入 `provider_failures.jsonl`，包含状态码、
+  content-type、请求 ID、响应预览和耗时。
+- 响应预览新增 Bearer Token、`api_key` / `token` / `secret` / `password`、
+  `sk-` / `fk-` 风格密钥和 URL-safe base64 脱敏。
+
+---
+
 ## v0.4.0 - 2026-05-21
 
 ### v0.4.0 Added
