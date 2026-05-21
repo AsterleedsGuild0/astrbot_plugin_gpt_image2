@@ -106,6 +106,64 @@ class GPTImageClient:
         return 1
 
     @staticmethod
+    def _sanitized_response_preview(text: str, limit: int = 500) -> str:
+        """Sanitize and truncate response body for diagnostics logging.
+
+        Strips likely base64 data URLs and truncates to limit chars,
+        avoiding logging sensitive data like API keys or image data.
+        """
+        if not text:
+            return "-"
+        # Avoid logging huge responses
+        preview = text[: limit + 100]
+        # Rough removal of base64 blobs in JSON
+        import re as _re
+
+        preview = _re.sub(
+            r'"(?:b64_json|image|data|image_url)"\s*:\s*"[A-Za-z0-9+/=]{100,}"',
+            '"<redacted-base64>"',
+            preview,
+        )
+        if len(preview) > limit:
+            preview = preview[:limit] + "…"
+        return repr(preview)
+
+    @staticmethod
+    def _request_id_headers(resp: httpx.Response) -> str:
+        """Extract common request ID headers from response for diagnostics."""
+        candidates = (
+            "x-request-id",
+            "request-id",
+            "cf-ray",
+            "openai-request-id",
+            "x-request-id",
+        )
+        ids = []
+        for header in candidates:
+            value = resp.headers.get(header)
+            if value:
+                ids.append(f"{header}={value}")
+        return " ".join(ids) if ids else "-"
+
+    def _log_http_failure(
+        self,
+        resp: httpx.Response,
+        elapsed_ms: int,
+        context: str,
+    ) -> None:
+        """Log detailed non-success HTTP response diagnostics."""
+        preview = self._sanitized_response_preview(resp.text)
+        request_ids = self._request_id_headers(resp)
+        logger.warning(
+            f"[GPTImage2] {context} HTTP failure "
+            f"status={resp.status_code} elapsed_ms={elapsed_ms} "
+            f"response_bytes={len(resp.content)} "
+            f"content_type={resp.headers.get('content-type', '-')} "
+            f"request_ids=[{request_ids}] "
+            f"response_preview={preview}"
+        )
+
+    @staticmethod
     def _params_with_n(params: ImageParams, n: int) -> ImageParams:
         return ImageParams(
             size=params.size,
@@ -336,10 +394,7 @@ class GPTImageClient:
         )
 
         if not resp.is_success:
-            logger.warning(
-                "[GPTImage2] Images API generate returned error "
-                f"status={resp.status_code} elapsed_ms={elapsed}"
-            )
+            self._log_http_failure(resp, elapsed, "Images API generate")
             raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
 
         data = resp.json()
@@ -520,10 +575,7 @@ class GPTImageClient:
         )
 
         if not resp.is_success:
-            logger.warning(
-                "[GPTImage2] Images API edit returned error "
-                f"status={resp.status_code} elapsed_ms={elapsed}"
-            )
+            self._log_http_failure(resp, elapsed, "Images API edit")
             raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
 
         data = resp.json()
@@ -773,10 +825,7 @@ class GPTImageClient:
         )
 
         if not resp.is_success:
-            logger.warning(
-                "[GPTImage2] Responses API returned error "
-                f"action={action} status={resp.status_code} elapsed_ms={elapsed}"
-            )
+            self._log_http_failure(resp, elapsed, f"Responses API {action}")
             raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
 
         data = resp.json()
@@ -894,10 +943,7 @@ class GPTImageClient:
         )
 
         if not resp.is_success:
-            logger.warning(
-                "[GPTImage2] plan Responses returned error "
-                f"status={resp.status_code} elapsed_ms={elapsed}"
-            )
+            self._log_http_failure(resp, elapsed, "plan Responses")
             raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
 
         data = resp.json()
