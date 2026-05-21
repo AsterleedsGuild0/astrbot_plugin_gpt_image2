@@ -42,7 +42,8 @@ from astrbot.core.utils.session_waiter import (
 from PIL import Image as PILImage
 
 from .card_renderer import build_markdown_card
-from .client import GPTImageClient, ImageParams, ImageResult
+from .client import GPTImageClient, ImageParams, ImageResult, ImageAPIError
+from .config_redact import redact_config_value
 from .image_utils import (
     ensure_output_dir,
     extract_images_from_event,
@@ -1079,15 +1080,20 @@ class GPTImage2Plugin(Star):
         attempt_index: int,
         attempt_total: int,
         elapsed_ms: int | None = None,
+        error: BaseException | None = None,
     ) -> None:
         """Append a sanitized failure record to provider_failures.jsonl.
+
+        When ``error`` is an :class:`ImageAPIError` with ``diagnostics``,
+        HTTP response metadata (``status_code``, ``response_content_type``,
+        ``request_ids``, ``response_preview``, ``elapsed_ms``) are written
+        to the record.
 
         Never stores: user prompt, image data, API key, or request bodies.
         """
         from urllib.parse import urlparse
 
         reason_key = self._classify_failure_reason(error_msg)
-        status_code = self._classify_http_status_code(error_msg)
 
         # Sanitize base_url: host + path only, no query, no API key
         try:
@@ -1109,13 +1115,30 @@ class GPTImage2Plugin(Star):
             "attempt_index": attempt_index,
             "attempt_total": attempt_total,
             "reason_key": reason_key,
-            "status_code": status_code,
-            "error_class": "RuntimeError",
             "message_preview": self._safe_text_preview(error_msg, limit=240),
             "retryable": self._should_try_next_image_provider(error_msg),
         }
-        if elapsed_ms is not None:
-            record["elapsed_ms"] = elapsed_ms
+
+        # Extract structured diagnostics from ImageAPIError if available
+        if (
+            error is not None
+            and isinstance(error, ImageAPIError)
+            and error.diagnostics is not None
+        ):
+            diag = error.diagnostics
+            record["error_class"] = "ImageAPIError"
+            record["status_code"] = diag.status_code
+            record["response_content_type"] = diag.response_content_type
+            record["request_ids"] = diag.request_ids
+            record["response_preview"] = diag.response_preview
+            record["elapsed_ms"] = diag.elapsed_ms
+        else:
+            record["error_class"] = "RuntimeError"
+            parsed_code = self._classify_http_status_code(error_msg)
+            if parsed_code is not None:
+                record["status_code"] = parsed_code
+            if elapsed_ms is not None:
+                record["elapsed_ms"] = elapsed_ms
 
         path = self._provider_failures_jsonl_path()
         try:
@@ -2500,6 +2523,7 @@ class GPTImage2Plugin(Star):
                     attempt_index=index,
                     attempt_total=len(viable),
                     elapsed_ms=attempt_elapsed,
+                    error=e,
                 )
                 provider_errors.append(
                     (f"{provider.name}/{global_mode}/{provider.role}", error_msg)
@@ -3183,20 +3207,19 @@ class GPTImage2Plugin(Star):
                     json.dumps(redacted_stats, ensure_ascii=False, indent=2),
                 )
 
-                # 3. recent failures JSONL (last 100)
+                # 3. recent failures JSONL (last 100) — always included
                 failures_path = self._provider_failures_jsonl_path()
+                failures_content = ""
                 if failures_path.exists():
                     try:
                         all_lines = failures_path.read_text(
                             encoding="utf-8"
                         ).splitlines()
                         recent = all_lines[-100:]
-                        zf.writestr(
-                            "provider_failures.jsonl",
-                            "\n".join(recent) + "\n" if recent else "",
-                        )
+                        failures_content = "\n".join(recent) + "\n" if recent else ""
                     except Exception:
-                        zf.writestr("provider_failures.jsonl", "")
+                        pass
+                zf.writestr("provider_failures.jsonl", failures_content)
 
                 # 4. config_redacted.json
                 self._write_diag_redacted_config(zf)
@@ -3348,35 +3371,15 @@ class GPTImage2Plugin(Star):
         return result
 
     def _write_diag_redacted_config(self, zf: object) -> None:
-        """Write a redacted copy of plugin config into the diagnostic zip."""
-        redacted_keys = {
-            "api_key",
-            "plan_api_key",
-            "authoritative_fallback_api_key",
-        }
-        redacted = {}
-        for key, value in self.config.items():
-            if key in redacted_keys:
-                redacted[key] = "***REDACTED***"
-            else:
-                # Also scrub any nested dicts/lists that might contain keys
-                if isinstance(value, dict):
-                    redacted[key] = {
-                        k: "***REDACTED***" if k in redacted_keys else v
-                        for k, v in value.items()
-                    }
-                elif isinstance(value, list):
-                    redacted[key] = [
-                        {
-                            k: "***REDACTED***" if k in redacted_keys else v
-                            for k, v in item.items()
-                        }
-                        if isinstance(item, dict)
-                        else item
-                        for item in value
-                    ]
-                else:
-                    redacted[key] = value
+        """Write a redacted copy of plugin config into the diagnostic zip.
+
+        Uses :func:`redact_config_value` for recursive, pattern-based redaction
+        that handles nested dicts/lists, fallback provider strings, JSON-encoded
+        values, and URL credentials.
+        """
+        redacted = redact_config_value(self.config)
+        if not isinstance(redacted, dict):
+            redacted = {"_error": "redact_config_value returned non-dict"}
         zf.writestr(
             "config_redacted.json",
             json.dumps(redacted, ensure_ascii=False, indent=2),

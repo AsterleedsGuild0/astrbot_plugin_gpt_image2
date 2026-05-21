@@ -42,6 +42,35 @@ class ImageResult:
     revised_prompt: str | None = None
 
 
+@dataclass
+class HTTPDiagnostics:
+    """HTTP response metadata for provider failure records.
+
+    Never stores: user prompt, image data, API keys, or request bodies.
+    """
+
+    status_code: int
+    response_content_type: str
+    request_ids: str
+    response_preview: str
+    elapsed_ms: int
+
+
+class ImageAPIError(RuntimeError):
+    """Structured error carrying HTTP response diagnostics.
+
+    Subclasses ``RuntimeError`` so existing ``except RuntimeError`` blocks
+    continue to catch it.  Use the ``diagnostics`` attribute to access HTTP
+    response metadata when available.
+    """
+
+    def __init__(
+        self, message: str, *, diagnostics: HTTPDiagnostics | None = None
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
 PROMPT_REWRITE_GUARD_PREFIX = (
     "Use the following text as the complete prompt. Do not rewrite it:"
 )
@@ -120,8 +149,24 @@ class GPTImageClient:
         import re as _re
 
         preview = _re.sub(
-            r'"(?:b64_json|image|data|image_url)"\s*:\s*"[A-Za-z0-9+/=]{100,}"',
+            r'"(?:b64_json|image|data|image_url)"\s*:\s*"[A-Za-z0-9+/_=-]{100,}"',
             '"<redacted-base64>"',
+            preview,
+        )
+        preview = _re.sub(
+            r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}",
+            r"\1***REDACTED***",
+            preview,
+        )
+        preview = _re.sub(
+            r"(?i)((?:api[_-]?key|token|secret|password)\s*[:=]\s*)"
+            r"[\"']?[^\"'\s,;}]{6,}[\"']?",
+            r"\1***REDACTED***",
+            preview,
+        )
+        preview = _re.sub(
+            r"\b(?:sk|fk)-[A-Za-z0-9_-]{12,}\b",
+            "***REDACTED***",
             preview,
         )
         if len(preview) > limit:
@@ -395,7 +440,17 @@ class GPTImageClient:
 
         if not resp.is_success:
             self._log_http_failure(resp, elapsed, "Images API generate")
-            raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
+            diagnostics = HTTPDiagnostics(
+                status_code=resp.status_code,
+                response_content_type=resp.headers.get("content-type", "-"),
+                request_ids=self._request_id_headers(resp),
+                response_preview=self._sanitized_response_preview(resp.text),
+                elapsed_ms=elapsed,
+            )
+            raise ImageAPIError(
+                self._build_error_msg(resp.status_code, resp.text),
+                diagnostics=diagnostics,
+            )
 
         data = resp.json()
         results = self._parse_images_api_response(data)
@@ -576,7 +631,17 @@ class GPTImageClient:
 
         if not resp.is_success:
             self._log_http_failure(resp, elapsed, "Images API edit")
-            raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
+            diagnostics = HTTPDiagnostics(
+                status_code=resp.status_code,
+                response_content_type=resp.headers.get("content-type", "-"),
+                request_ids=self._request_id_headers(resp),
+                response_preview=self._sanitized_response_preview(resp.text),
+                elapsed_ms=elapsed,
+            )
+            raise ImageAPIError(
+                self._build_error_msg(resp.status_code, resp.text),
+                diagnostics=diagnostics,
+            )
 
         data = resp.json()
         results = self._parse_images_api_response(data)
@@ -826,7 +891,17 @@ class GPTImageClient:
 
         if not resp.is_success:
             self._log_http_failure(resp, elapsed, f"Responses API {action}")
-            raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
+            diagnostics = HTTPDiagnostics(
+                status_code=resp.status_code,
+                response_content_type=resp.headers.get("content-type", "-"),
+                request_ids=self._request_id_headers(resp),
+                response_preview=self._sanitized_response_preview(resp.text),
+                elapsed_ms=elapsed,
+            )
+            raise ImageAPIError(
+                self._build_error_msg(resp.status_code, resp.text),
+                diagnostics=diagnostics,
+            )
 
         data = resp.json()
         results = self._parse_responses_api_response(data)
@@ -944,7 +1019,17 @@ class GPTImageClient:
 
         if not resp.is_success:
             self._log_http_failure(resp, elapsed, "plan Responses")
-            raise RuntimeError(self._build_error_msg(resp.status_code, resp.text))
+            diagnostics = HTTPDiagnostics(
+                status_code=resp.status_code,
+                response_content_type=resp.headers.get("content-type", "-"),
+                request_ids=self._request_id_headers(resp),
+                response_preview=self._sanitized_response_preview(resp.text),
+                elapsed_ms=elapsed,
+            )
+            raise ImageAPIError(
+                self._build_error_msg(resp.status_code, resp.text),
+                diagnostics=diagnostics,
+            )
 
         data = resp.json()
         content = self._parse_plan_responses_text(data)
