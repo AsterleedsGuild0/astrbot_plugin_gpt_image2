@@ -28,6 +28,9 @@
 | `/image2 mode [images\|responses]` | 查看或切换全局 API 模式（仅管理员） |
 | `/image2 guard [images\|responses\|all] [on\|off]` | 切换 Guard（仅管理员） |
 | `/image2 providers` | 查看生图站点状态（仅管理员） |
+| `/image2 stats` | 查看 Provider 统计、失败原因、成功率（仅管理员） |
+| `/image2 stats recent [N]` | 查看最近 N 条失败记录，默认 10，上限 50（仅管理员） |
+| `/image2 diag` | 生成诊断包（管理员） |
 | `/image2 help` | 显示用法和当前配置摘要 |
 
 - `draw` 和 `edit` 命令在参数校验通过后会先回复一条
@@ -94,7 +97,9 @@
   开启 `adaptive_provider_priority` 后，插件会根据历史成功/失败自动调整
   本次运行时普通备用站点的尝试顺序：最近成功的站点会前置，失败站点会在
   `provider_failure_cooldown` 时间内降级。该策略不会改写 WebUI 配置；健康状态保存在
-  AstrBot `data/plugin_data/.../provider_stats.json`，测试包重装不会清除。
+   AstrBot `data/plugin_data/.../provider_stats.json`，测试包重装不会清除。
+   失败详情追加在相同目录的 `provider_failures.jsonl` 中，可配合
+   `/image2 stats recent` 查看。诊断包生成在 `plugin_data/.../diagnostics/` 下。
 
 - 文本回复默认开启文转图（`render_text_as_image`）：使用插件自带的
   image2 Markdown 卡片模板。模板在 Python 侧把 Markdown 转成 HTML，渲染时不加载外部
