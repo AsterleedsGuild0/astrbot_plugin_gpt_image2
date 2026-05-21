@@ -6,6 +6,36 @@
 
 ---
 
+## v0.4.0 - 2026-05-21
+
+### v0.4.0 Added
+
+- 新增 `/image2 stats` 管理员命令，显示 Provider 聚合统计、失败原因分布、
+  失败状态码分布、各站点详情。
+- 新增 `/image2 stats recent [N]` 命令查看最近 N 条失败记录。
+- 新增 `/image2 diag` 管理员命令，生成包含 summary.md、provider_stats.json、
+  provider_failures.jsonl、config_redacted.json、version.txt 的诊断压缩包。
+- 新增 `provider_failures.jsonl` 失败详情文件，追加每次生图失败的脱敏记录
+  （时间戳、Provider、原因分类、状态码、重试性等），不存储提示词、图片或
+  API Key。
+- 新增 v2 provider_stats 字段：per-provider `failure_reasons` 和
+  `failure_status_codes` 计数；顶层 `summary` 聚合。
+- 新增 `_classify_failure_reason` 分类器：network_timeout/connect/proxy/protocol、
+  http_400-524、html_error_page、api_schema_error、provider_compatibility、unknown。
+- HTTP 失败日志增强：在 Images generate、Images edit、Responses 和 Plan Responses
+  的错误分支中记录 status、elapsed_ms、response_bytes、content_type、请求 ID 头
+  （x-request-id/cf-ray/openai-request-id）和脱敏响应预览。
+- Provider 失败尝试记录 elapsed_ms。
+- `/image2 help` 新增 `/image2 stats` 和 `/image2 diag` 命令提示。
+
+### v0.4.0 Changed
+
+- 升级版本至 0.4.0。
+- provider_stats.json 兼容旧 v1 文件，新增 v2 字段后自动升级。
+- provider_failures.jsonl 自动裁剪至最近 5000 行以避免无限增长。
+
+---
+
 ## v0.3.0 - 2026-05-20
 
 ### v0.3.0 Added
