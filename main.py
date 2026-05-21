@@ -1131,6 +1131,8 @@ class GPTImage2Plugin(Star):
             record["response_content_type"] = diag.response_content_type
             record["request_ids"] = diag.request_ids
             record["response_preview"] = diag.response_preview
+            record["response_preview_truncated"] = diag.response_preview_truncated
+            record["response_bytes"] = diag.response_bytes
             record["elapsed_ms"] = diag.elapsed_ms
         else:
             record["error_class"] = "RuntimeError"
@@ -3049,10 +3051,36 @@ class GPTImage2Plugin(Star):
                 reason = rec.get("reason_key", "unknown")
                 action_rec = rec.get("action", "-")
                 status = rec.get("status_code", "-")
-                lines.append(
+                ctype = rec.get("response_content_type", "")
+                rid = rec.get("request_ids", "")
+                preview = rec.get("response_preview", "")
+                preview_truncated = rec.get("response_preview_truncated", False)
+                resp_bytes = rec.get("response_bytes", "")
+
+                rec_lines = [
                     f"- **{ts_str}** | {provider_name} | "
                     f"{action_rec} | `{reason}` | HTTP {status}"
-                )
+                ]
+                # Show content-type and request IDs when available
+                meta_parts = []
+                if ctype:
+                    meta_parts.append(f"ctype={ctype}")
+                if rid and rid != "-":
+                    meta_parts.append(f"rid={rid}")
+                if resp_bytes != "":
+                    meta_parts.append(f"bytes={resp_bytes}")
+                if preview_truncated:
+                    meta_parts.append("preview_truncated")
+                if meta_parts:
+                    rec_lines.append(f"  - {', '.join(meta_parts)}")
+                # Show response preview when available — clipped to 240 chars
+                # for readability in Markdown
+                if preview and preview != "repr('')":
+                    preview_short = (
+                        preview[:240] + "…" if len(preview) > 240 else preview
+                    )
+                    rec_lines.append(f"  - preview: `{preview_short}`")
+                lines.append("\n".join(rec_lines))
             lines.append("\n\n完整记录见 `provider_failures.jsonl`。")
             yield await self._text_result(
                 event,

@@ -53,6 +53,8 @@ class HTTPDiagnostics:
     response_content_type: str
     request_ids: str
     response_preview: str
+    response_preview_truncated: bool
+    response_bytes: int
     elapsed_ms: int
 
 
@@ -135,17 +137,21 @@ class GPTImageClient:
         return 1
 
     @staticmethod
-    def _sanitized_response_preview(text: str, limit: int = 500) -> str:
-        """Sanitize and truncate response body for diagnostics logging.
+    def _sanitized_response_preview(text: str, limit: int = 2000) -> tuple[str, bool]:
+        """Sanitize and truncate response body for diagnostics.
 
-        Strips likely base64 data URLs and truncates to limit chars,
-        avoiding logging sensitive data like API keys or image data.
+        Returns ``(preview, truncated)`` where *truncated* is ``True`` when
+        the sanitized preview was clipped to *limit*.
+
+        Strips base64 blobs, bearer tokens, API key patterns, and
+        ``sk-``/``fk-``-style keys.  The result is wrapped in ``repr()``
+        for single-line safety in logs and JSON.
         """
         if not text:
-            return "-"
-        # Avoid logging huge responses
+            return "repr('')", False
+        # Take a buffer beyond limit so regex redaction near the boundary
+        # has enough context and the final truncation is accurate.
         preview = text[: limit + 100]
-        # Rough removal of base64 blobs in JSON
         import re as _re
 
         preview = _re.sub(
@@ -169,9 +175,10 @@ class GPTImageClient:
             "***REDACTED***",
             preview,
         )
-        if len(preview) > limit:
+        truncated = len(preview) > limit
+        if truncated:
             preview = preview[:limit] + "…"
-        return repr(preview)
+        return repr(preview), truncated
 
     @staticmethod
     def _request_id_headers(resp: httpx.Response) -> str:
@@ -197,7 +204,7 @@ class GPTImageClient:
         context: str,
     ) -> None:
         """Log detailed non-success HTTP response diagnostics."""
-        preview = self._sanitized_response_preview(resp.text)
+        preview, truncated = self._sanitized_response_preview(resp.text, limit=500)
         request_ids = self._request_id_headers(resp)
         logger.warning(
             f"[GPTImage2] {context} HTTP failure "
@@ -206,6 +213,7 @@ class GPTImageClient:
             f"content_type={resp.headers.get('content-type', '-')} "
             f"request_ids=[{request_ids}] "
             f"response_preview={preview}"
+            f"{' (truncated)' if truncated else ''}"
         )
 
     @staticmethod
@@ -440,11 +448,14 @@ class GPTImageClient:
 
         if not resp.is_success:
             self._log_http_failure(resp, elapsed, "Images API generate")
+            preview, truncated = self._sanitized_response_preview(resp.text)
             diagnostics = HTTPDiagnostics(
                 status_code=resp.status_code,
                 response_content_type=resp.headers.get("content-type", "-"),
                 request_ids=self._request_id_headers(resp),
-                response_preview=self._sanitized_response_preview(resp.text),
+                response_preview=preview,
+                response_preview_truncated=truncated,
+                response_bytes=len(resp.content),
                 elapsed_ms=elapsed,
             )
             raise ImageAPIError(
@@ -631,11 +642,14 @@ class GPTImageClient:
 
         if not resp.is_success:
             self._log_http_failure(resp, elapsed, "Images API edit")
+            preview, truncated = self._sanitized_response_preview(resp.text)
             diagnostics = HTTPDiagnostics(
                 status_code=resp.status_code,
                 response_content_type=resp.headers.get("content-type", "-"),
                 request_ids=self._request_id_headers(resp),
-                response_preview=self._sanitized_response_preview(resp.text),
+                response_preview=preview,
+                response_preview_truncated=truncated,
+                response_bytes=len(resp.content),
                 elapsed_ms=elapsed,
             )
             raise ImageAPIError(
@@ -891,11 +905,14 @@ class GPTImageClient:
 
         if not resp.is_success:
             self._log_http_failure(resp, elapsed, f"Responses API {action}")
+            preview, truncated = self._sanitized_response_preview(resp.text)
             diagnostics = HTTPDiagnostics(
                 status_code=resp.status_code,
                 response_content_type=resp.headers.get("content-type", "-"),
                 request_ids=self._request_id_headers(resp),
-                response_preview=self._sanitized_response_preview(resp.text),
+                response_preview=preview,
+                response_preview_truncated=truncated,
+                response_bytes=len(resp.content),
                 elapsed_ms=elapsed,
             )
             raise ImageAPIError(
@@ -1019,11 +1036,14 @@ class GPTImageClient:
 
         if not resp.is_success:
             self._log_http_failure(resp, elapsed, "plan Responses")
+            preview, truncated = self._sanitized_response_preview(resp.text)
             diagnostics = HTTPDiagnostics(
                 status_code=resp.status_code,
                 response_content_type=resp.headers.get("content-type", "-"),
                 request_ids=self._request_id_headers(resp),
-                response_preview=self._sanitized_response_preview(resp.text),
+                response_preview=preview,
+                response_preview_truncated=truncated,
+                response_bytes=len(resp.content),
                 elapsed_ms=elapsed,
             )
             raise ImageAPIError(
