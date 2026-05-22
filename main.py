@@ -628,7 +628,11 @@ class GPTImage2Plugin(Star):
                 id=message_id,
                 sender_id=event.get_sender_id(),
                 sender_nickname=event.get_sender_name(),
-                chain=msg_obj.message,
+                # Do not attach the inbound message chain here.  Incoming
+                # chains can contain Image/File component objects, and some
+                # platform adapters serialize outbound components to JSON.
+                # A send-side Reply only needs the source message ID to render
+                # a native quote bubble when the adapter supports it.
                 message_str=getattr(msg_obj, "message_str", "") or "",
                 time=getattr(msg_obj, "timestamp", 0) or 0,
             )
