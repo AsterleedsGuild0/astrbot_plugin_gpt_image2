@@ -154,6 +154,17 @@
     "type": "int",
     "default": 4
   },
+  "edit_aliases": {
+    "description": "编辑命令别名",
+    "type": "list",
+    "default": [],
+    "hint": "自定义触发 /image2 edit 的消息前缀。每项是一条别名，例如 修图、改图、画图。用户发送“修图 <提示词>”并附带图片或引用图片消息时，会等同于 /image2 edit <提示词>。别名只在消息开头匹配，且别名后需要空白。",
+    "items": {
+      "description": "edit 别名",
+      "type": "string",
+      "default": ""
+    }
+  },
   "save_outputs": {
     "description": "保存生成结果",
     "type": "bool",

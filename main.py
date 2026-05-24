@@ -1628,6 +1628,83 @@ class GPTImage2Plugin(Star):
             return parts[-1].strip()
         return ""
 
+    def _get_edit_aliases(self) -> list[str]:
+        """读取 `/image2 edit` 的自定义触发别名。"""
+        raw_value = self.config.get("edit_aliases", [])
+        if isinstance(raw_value, str):
+            raw_items = raw_value.replace(";", "\n").replace(",", "\n").splitlines()
+        elif isinstance(raw_value, (list, tuple, set)):
+            raw_items = [str(item) for item in raw_value]
+        else:
+            raw_items = []
+
+        aliases: list[str] = []
+        seen: set[str] = set()
+        reserved = {"/image2", "image2", "/image2 edit", "image2 edit"}
+        for item in raw_items:
+            alias = " ".join(str(item or "").split())
+            normalized = alias.lower()
+            if not alias or normalized in seen or normalized in reserved:
+                continue
+            aliases.append(alias)
+            seen.add(normalized)
+        aliases.sort(key=len, reverse=True)
+        return aliases
+
+    @staticmethod
+    def _match_alias_prefix(text: str, alias: str) -> str | None:
+        """Return prompt text when *text* starts with *alias* as a command."""
+        value = text.strip()
+        alias = alias.strip()
+        if not value or not alias:
+            return None
+
+        value_lower = value.lower()
+        alias_lower = alias.lower()
+        if value_lower == alias_lower:
+            return ""
+        if not value_lower.startswith(alias_lower):
+            return None
+
+        rest = value[len(alias) :]
+        if rest and rest[0].isspace():
+            return rest.strip()
+        return None
+
+    def _extract_edit_alias_prompt(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[str, str] | None:
+        """Extract prompt from configured edit aliases.
+
+        Returns ``(prompt, alias)`` when the event text starts with a configured
+        alias. Plain components are checked in addition to ``message_str`` so
+        aliases still work when images appear before text in the message chain.
+        """
+        aliases = self._get_edit_aliases()
+        if not aliases:
+            return None
+
+        candidates = [event.message_str or ""]
+        for comp in event.get_messages():
+            if isinstance(comp, Plain):
+                candidates.append(comp.text or "")
+
+        seen_candidates: set[str] = set()
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text or text in seen_candidates:
+                continue
+            seen_candidates.add(text)
+            lower = text.lower()
+            if lower.startswith(("/image2 ", "image2 ")):
+                continue
+            for alias in aliases:
+                prompt = self._match_alias_prefix(text, alias)
+                if prompt is not None:
+                    return prompt, alias
+        return None
+
     def _save_config(self) -> bool:
         """保存插件配置。"""
         save_config = getattr(self.config, "save_config", None)
@@ -2745,6 +2822,10 @@ class GPTImage2Plugin(Star):
         adaptive_status = (
             "✅ 开启" if self._adaptive_provider_priority_enabled() else "关闭"
         )
+        edit_aliases = self._get_edit_aliases()
+        edit_aliases_status = (
+            "、".join(f"`{alias}`" for alias in edit_aliases) or "未配置"
+        )
         images_guard_status = self._prompt_rewrite_guard_status(
             self._prompt_rewrite_guard_enabled("images")
         )
@@ -2772,6 +2853,8 @@ class GPTImage2Plugin(Star):
             "### 命令\n\n"
             "- `/image2 draw <提示词>` — 文生图\n"
             "- `/image2 edit <提示词>` — 编辑图片（附带图片或引用图片消息）\n"
+            "- 自定义 edit 别名 — 可在配置 `edit_aliases` 中添加，"
+            "用于触发 `/image2 edit`\n"
             "- `/image2 plan` — 进入 Plan 多轮图文会话，辅助优化生图提示词\n"
             "  - `/plan <描述>` — 在 Plan 会话中继续交流（群聊普通消息不会被拦截）\n"
             "  - `/plan confirm` — 在 Plan 会话中确认生成\n"
@@ -2800,6 +2883,7 @@ class GPTImage2Plugin(Star):
             f"| 权威兜底 | {authoritative_status} |\n"
             f"| 生图 API 站点 | {image_provider_count} 个（当前模式可用 {viable_provider_count} 个） |\n"
             f"| 自适应站点优先级 | {adaptive_status} |\n"
+            f"| edit 别名 | {edit_aliases_status} |\n"
             f"| Plan 模型 | `{cfg.get('plan_model', 'gpt-5.4')}` |\n"
             f"| Plan 空闲超时 | {cfg.get('plan_timeout', 300)} 秒 |\n"
             f"| 图片尺寸 | `{cfg.get('size', 'auto')}` |\n"
@@ -2811,6 +2895,7 @@ class GPTImage2Plugin(Star):
             "### 说明\n\n"
             f"- `/image2 mode` 是全局模式，会影响 draw/edit 的站点过滤。\n"
             f"- draw/edit 只会尝试支持当前模式的站点；不支持的站点会被跳过。\n"
+            f"- edit 别名只在消息开头匹配，且要求别名后接空白和提示词。\n"
             f"- 站点明细请使用 `/image2 providers` 查看。\n"
             f"- `/image2 plan` 进入后，下面缩进的是 Plan 子命令。"
         )
@@ -4131,8 +4216,30 @@ class GPTImage2Plugin(Star):
     @image2.command("edit")
     async def edit(self, event: AstrMessageEvent):
         """从当前消息或引用消息提取图片后编辑"""
+        async for result in self._handle_edit(
+            event, prompt=self._extract_prompt(event, "edit")
+        ):
+            yield result
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def edit_alias(self, event: AstrMessageEvent):
+        """通过配置的别名触发 `/image2 edit`。"""
+        matched = self._extract_edit_alias_prompt(event)
+        if matched is None:
+            return
+
+        prompt, alias = matched
+        logger.info(
+            "[GPTImage2] edit alias matched "
+            f"{self._event_context(event)} alias={alias!r} prompt_len={len(prompt)}"
+        )
+        async for result in self._handle_edit(event, prompt=prompt):
+            yield result
+        event.stop_event()
+
+    async def _handle_edit(self, event: AstrMessageEvent, *, prompt: str):
+        """Shared implementation for `/image2 edit` and configured aliases."""
         started = perf_counter()
-        prompt = self._extract_prompt(event, "edit")
         if not prompt or not prompt.strip():
             logger.info(
                 f"[GPTImage2] edit rejected empty prompt {self._event_context(event)}"

@@ -6,6 +6,7 @@
 
 - **文生图**：通过 `/image2 draw <提示词>` 生成图片
 - **图像编辑**：通过 `/image2 edit <提示词>` 编辑图片（支持当前消息或引用消息中的图片）
+- **编辑别名**：可配置 `edit_aliases`，用自定义前缀触发 `/image2 edit`
 - **Plan 模式**：通过 `/image2 plan` 进入多轮图文对话，AI 辅助优化生图提示词
 - **文本转图片**：插件文本回复默认使用 image2 自包含 Markdown 卡片模板，
   不加载外部 JS/CDN；失败则回退纯文本
@@ -19,6 +20,7 @@
 | --- | --- |
 | `/image2 draw <提示词>` | 文生图 |
 | `/image2 edit <提示词>` | 编辑图片（需附带图片或引用包含图片的消息） |
+| `自定义别名 <提示词>` | 若配置了 `edit_aliases`，可触发 `/image2 edit` |
 | `/image2 plan` | 进入 Plan 多轮图文会话，AI 辅助优化生图提示词 |
 | `/plan <描述>` | 在 Plan 会话中继续交流（群聊普通消息不会被拦截） |
 | `/plan confirm` | 在 Plan 会话中确认生成图片 |
@@ -36,6 +38,9 @@
 - `draw` 和 `edit` 命令在参数校验通过后会先回复一条
   "已收到，正在处理"的提示，随后再发送最终生成/编辑结果。
   如果上游返回较长的 `revised_prompt`，插件会将其收纳为合并转发，图片单独发送。
+- `edit_aliases` 可添加多条编辑命令别名，例如 `修图`、`改图`。
+  用户发送 `修图 <提示词>` 并附带图片或引用图片消息时，会等同于
+  `/image2 edit <提示词>`。别名只在消息开头匹配，且别名后需要空白。
 - Prompt Guard 会在生图提示词前追加
   `Use the following text as the complete prompt. Do not rewrite it:`，用于尽量限制上游重写提示词。
   默认保持旧行为：Images API 关闭，Responses API 开启。
@@ -137,6 +142,7 @@
 | `timeout` | int | `120` | 请求超时时间（秒） |
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
+| `edit_aliases` | list | `[]` | 触发 `/image2 edit` 的自定义前缀列表 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
 | `send_copyable_prompt_after_success` | bool | `true` | Plan 成功后发送合并转发可复制命令 |
 | `render_text_as_image` | bool | `true` | image2 卡片模板优先，失败则回退纯文本 |
