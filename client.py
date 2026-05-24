@@ -1051,7 +1051,32 @@ class GPTImageClient:
                 diagnostics=diagnostics,
             )
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            preview, truncated = self._sanitized_response_preview(resp.text)
+            logger.warning(
+                "[GPTImage2] plan Responses returned non-JSON body "
+                f"status={resp.status_code} elapsed_ms={elapsed} "
+                f"response_bytes={len(resp.content)} "
+                f"content_type={resp.headers.get('content-type', '-')} "
+                f"request_ids=[{self._request_id_headers(resp)}] "
+                f"response_preview={preview}"
+                f"{' (truncated)' if truncated else ''}"
+            )
+            raise RuntimeError(
+                "Plan API 返回非 JSON 响应："
+                f"HTTP {resp.status_code}；"
+                f"content-type={resp.headers.get('content-type', '-')}；"
+                f"bytes={len(resp.content)}；"
+                f"request_ids={self._request_id_headers(resp)}；"
+                f"preview={preview}"
+            ) from e
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "Plan API 返回结构异常：顶层 JSON 不是对象"
+                f"（类型：{type(data).__name__}）"
+            )
         content = self._parse_plan_responses_text(data)
 
         logger.info(
