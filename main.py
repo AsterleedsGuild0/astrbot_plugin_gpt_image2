@@ -3110,12 +3110,11 @@ class GPTImage2Plugin(Star):
     async def stats(self, event: AstrMessageEvent, sub: str | None = None):
         """显示生图站点统计和诊断信息（管理员）"""
         stats_data = self._load_provider_stats()
-        summary = stats_data.get("summary", {})
         providers_data = stats_data.get("providers", {})
         if not isinstance(providers_data, dict):
             providers_data = {}
 
-        # ── Recent JSONL records ──────────────────────────────────
+        # ── Recent JSONL records (unchanged) ──────────────────────
         sub_str = (sub or "").strip().lower()
         if sub_str == "recent" or sub_str.startswith("recent "):
             # Parse optional count
@@ -3186,22 +3185,54 @@ class GPTImage2Plugin(Star):
             )
             return
 
-        # ── Default: aggregate overview ──────────────────────────
-        total_success = (
-            self._provider_stat_int(summary, "success_count")
-            if isinstance(summary, dict)
-            else 0
-        )
-        total_failure = (
-            self._provider_stat_int(summary, "failure_count")
-            if isinstance(summary, dict)
-            else 0
-        )
+        # ── Determine provider set ────────────────────────────────
+        show_all = sub_str == "all"
+
+        try:
+            configs = self._get_image_api_provider_configs()
+        except ValueError:
+            configs = []
+        configured_ids: set[str] = {c.provider_id for c in configs}
+
+        if show_all:
+            displayed_providers = providers_data
+            scope_tag = "（所有历史记录）"
+        else:
+            displayed_providers = {
+                pid: item
+                for pid, item in providers_data.items()
+                if pid in configured_ids
+            }
+            scope_tag = "（当前配置的 Provider）"
+
+        # ── Aggregate from displayed providers ────────────────────
+        total_success = 0
+        total_failure = 0
+        all_reasons: dict[str, int] = {}
+        all_codes: dict[str, int] = {}
+
+        for pid, item in displayed_providers.items():
+            if not isinstance(item, dict):
+                continue
+            total_success += self._provider_stat_int(item, "success_count")
+            total_failure += self._provider_stat_int(item, "failure_count")
+
+            reasons = item.get("failure_reasons", {})
+            if isinstance(reasons, dict):
+                for k, v in reasons.items():
+                    all_reasons[k] = all_reasons.get(k, 0) + self._provider_stat_int(
+                        reasons, k
+                    )
+
+            codes = item.get("failure_status_codes", {})
+            if isinstance(codes, dict):
+                for k, v in codes.items():
+                    all_codes[k] = all_codes.get(k, 0) + self._provider_stat_int(
+                        codes, k
+                    )
+
         total = total_success + total_failure
-        success_rate = (
-            summary.get("success_rate", 0) if isinstance(summary, dict) else 0
-        )
-        sr_pct = f"{success_rate * 100:.1f}%" if total > 0 else "-"
+        sr_pct = f"{round(total_success / total * 100, 1)}%" if total > 0 else "-"
 
         lines: list[str] = [
             "## 📊 Provider 生图统计\n\n",
@@ -3209,15 +3240,12 @@ class GPTImage2Plugin(Star):
             f"成功：**{total_success}** | "
             f"失败：**{total_failure}** | "
             f"成功率：**{sr_pct}**\n\n",
+            f"*{scope_tag}*\n\n",
         ]
 
         # Top failure reasons
-        all_reasons = (
-            summary.get("failure_reasons", {}) if isinstance(summary, dict) else {}
-        )
-        if isinstance(all_reasons, dict) and all_reasons:
+        if all_reasons:
             lines.append("### 🔴 主要失败原因\n\n")
-            # Show in FAILURE_REASON_ORDER for consistency
             seen_order = [r for r in self.FAILURE_REASON_ORDER if r in all_reasons]
             seen_rest = [r for r in sorted(all_reasons.keys()) if r not in seen_order]
             for reason in seen_order + seen_rest:
@@ -3227,23 +3255,22 @@ class GPTImage2Plugin(Star):
             lines.append("\n")
 
         # Top status codes
-        all_codes = (
-            summary.get("failure_status_codes", {}) if isinstance(summary, dict) else {}
-        )
-        if isinstance(all_codes, dict) and all_codes:
+        if all_codes:
             lines.append("### 🔴 主要失败状态码\n\n")
             for code, count_val in sorted(all_codes.items(), key=lambda x: -x[1]):
                 lines.append(f"- HTTP `{code}`：{count_val} 次\n")
             lines.append("\n")
 
-        # Per-provider table
-        if providers_data:
+        # ── Per-provider table (sorted by success rate desc) ──────
+        if displayed_providers:
             lines.append("### 各站点统计\n\n")
             lines.append(
                 "| 站点 | 成功 | 失败 | 成功率 | 模式 | 主要失败原因 | 最近错误 |\n"
                 "|------|------|------|--------|------|-------------|----------|\n"
             )
-            for pid, item in providers_data.items():
+
+            table_rows: list[tuple[float, str]] = []
+            for pid, item in displayed_providers.items():
                 if not isinstance(item, dict):
                     continue
                 p_name = item.get("name", pid)
@@ -3252,7 +3279,6 @@ class GPTImage2Plugin(Star):
                 p_total = p_success + p_failure
                 p_sr = f"{round(p_success / p_total * 100, 1)}%" if p_total > 0 else "-"
                 p_mode = item.get("role", "-")
-                # Top reason for this provider
                 p_reasons = item.get("failure_reasons", {})
                 top_reason = (
                     max(p_reasons, key=lambda k: p_reasons.get(k, 0))
@@ -3265,12 +3291,68 @@ class GPTImage2Plugin(Star):
                     )
                     or "-"
                 )
-                lines.append(
+                sort_key = p_success / p_total if p_total > 0 else -1.0
+                row = (
                     f"| {p_name} | {p_success} | {p_failure} | {p_sr} "
                     f"| {p_mode} | {top_reason} | {last_err} |\n"
                 )
+                table_rows.append((sort_key, row))
 
-        lines.append("\n---\n`/image2 stats recent [N]` 查看最近失败记录。")
+            # Sort descending by success rate
+            table_rows.sort(key=lambda x: x[0], reverse=True)
+            for _, row in table_rows:
+                lines.append(row)
+            lines.append("\n")
+
+            # ── Supplementary status-code table ───────────────────
+            lines.append("### 各站点状态码分布\n\n")
+            lines.append("| 站点 | 200 | 非 200 分布 |\n|------|-----|------------|\n")
+
+            sc_rows: list[tuple[float, str]] = []
+            for pid, item in displayed_providers.items():
+                if not isinstance(item, dict):
+                    continue
+                p_name = item.get("name", pid)
+                p_success = self._provider_stat_int(item, "success_count")
+                p_failure = self._provider_stat_int(item, "failure_count")
+                p_total = p_success + p_failure
+
+                p200_pct = (
+                    f"{round(p_success / p_total * 100, 1)}%" if p_total > 0 else "-"
+                )
+
+                fsc = item.get("failure_status_codes", {})
+                if isinstance(fsc, dict) and fsc and p_total > 0:
+                    non200_parts: list[str] = []
+                    sorted_codes = sorted(fsc.items(), key=lambda x: -x[1])
+                    for code, cnt in sorted_codes[:4]:
+                        prob = cnt / p_total * 100
+                        non200_parts.append(f"{code} {prob:.1f}%")
+                    if len(sorted_codes) > 4:
+                        non200_parts.append(f"等 {len(sorted_codes)} 类")
+                    non200_str = ", ".join(non200_parts)
+                elif p_total > 0 and p_failure > 0:
+                    non200_str = f"其他 {round(p_failure / p_total * 100, 1)}%"
+                else:
+                    non200_str = "-"
+
+                sort_key = p_success / p_total if p_total > 0 else -1.0
+                sc_rows.append(
+                    (
+                        sort_key,
+                        f"| {p_name} | {p200_pct} | {non200_str} |\n",
+                    )
+                )
+
+            sc_rows.sort(key=lambda x: x[0], reverse=True)
+            for _, row in sc_rows:
+                lines.append(row)
+            lines.append("\n")
+
+        lines.append(
+            "\n---\n`/image2 stats recent [N]` 查看最近失败记录。"
+            " `/image2 stats all` 查看全部历史。"
+        )
         yield await self._text_result(event, "".join(lines), action="stats")
 
     @staticmethod
