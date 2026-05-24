@@ -82,7 +82,22 @@ class PlanSessionFilter(SessionFilter):
     def _should_capture(cls, event: AstrMessageEvent, text: str) -> bool:
         if cls.extract_plan_input(event) is not None:
             return True
-        return text.startswith("/image2") or text.startswith("image2")
+        return cls._is_image2_plan_command(text)
+
+    @staticmethod
+    def _is_image2_plan_command(text: str) -> bool:
+        """Only capture `/image2 plan ...` while a Plan waiter is active.
+
+        Other `/image2 ...` commands such as `/image2 stats` and
+        `/image2 providers` must continue to reach their normal handlers even
+        while `/plan confirm` is generating images.
+        """
+        value = text.strip().lower()
+        return (
+            value == "/image2 plan"
+            or value == "image2 plan"
+            or value.startswith(("/image2 plan ", "image2 plan "))
+        )
 
     @classmethod
     def extract_plan_input(cls, event: AstrMessageEvent) -> str | None:
@@ -3939,8 +3954,8 @@ class GPTImage2Plugin(Star):
                     )
                     return
 
-            # ── 其他 /image2 命令：拦截提示 ─────────────────
-            if text_lower.startswith("/image2") or text_lower.startswith("image2"):
+            # ── 其他 /image2 plan 子命令：拦截提示 ───────────
+            if PlanSessionFilter._is_image2_plan_command(text_lower):
                 await self._send_text(
                     next_event,
                     "## ⚠️ 当前处于 Plan 会话中\n\n"
