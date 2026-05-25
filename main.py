@@ -8,6 +8,7 @@
   /image2 plan quit      退出 Plan 会话
   /image2 mode [模式]    查看/切换 API 模式（管理员）
   /image2 guard          查看/切换 Prompt Guard（管理员）
+  /image2 retry          查看/切换备用站点重试提示（管理员）
   /image2 providers      查看生图站点状态（管理员）
   /image2 stats          查看 Provider 统计与诊断（管理员）
   /image2 diag           生成诊断包（管理员）
@@ -194,6 +195,7 @@ class GPTImage2Plugin(Star):
         self._output_dir: str | None = None
         self._text_image_dir: str | None = None
         self._provider_stats_cache: dict | None = None
+        self._provider_retry_notice_state: dict[str, dict[str, object]] = {}
         self._plan_sessions: dict[str, PlanSession] = {}
 
     # ── 工具方法 ────────────────────────────────────────────────
@@ -1143,6 +1145,97 @@ class GPTImage2Plugin(Star):
         return self._normalize_bool(
             self.config.get("send_copyable_prompt_after_success"),
             default=True,
+        )
+
+    def _provider_retry_notice_global_enabled(self) -> bool:
+        return self._normalize_bool(
+            self.config.get("provider_retry_notice_enabled"),
+            default=True,
+        )
+
+    def _provider_retry_notice_session_config(self) -> dict[str, bool]:
+        value = self.config.get("provider_retry_notice_sessions", {})
+        if isinstance(value, dict):
+            items = value.items()
+        elif isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = {}
+            items = parsed.items() if isinstance(parsed, dict) else []
+        else:
+            items = []
+
+        result: dict[str, bool] = {}
+        for key, raw in items:
+            session_key = str(key or "").strip()
+            if not session_key:
+                continue
+            result[session_key] = self._normalize_bool(raw, default=True)
+        return result
+
+    def _set_provider_retry_notice_session_enabled(
+        self,
+        session_key: str,
+        enabled: bool,
+    ) -> None:
+        sessions = self._provider_retry_notice_session_config()
+        sessions[session_key] = enabled
+        self.config["provider_retry_notice_sessions"] = json.dumps(
+            sessions,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _provider_retry_notice_session_key(self, event: AstrMessageEvent) -> str:
+        return str(event.get_group_id() or event.unified_msg_origin or "-")
+
+    def _provider_retry_notice_session_enabled(self, event: AstrMessageEvent) -> bool:
+        session_key = self._provider_retry_notice_session_key(event)
+        sessions = self._provider_retry_notice_session_config()
+        return sessions.get(session_key, True)
+
+    def _provider_retry_notice_enabled(self, event: AstrMessageEvent) -> bool:
+        return (
+            self._provider_retry_notice_global_enabled()
+            and self._provider_retry_notice_session_enabled(event)
+        )
+
+    def _provider_retry_notice_interval(self) -> int:
+        try:
+            return max(0, int(self.config.get("provider_retry_notice_interval", 300)))
+        except (TypeError, ValueError):
+            return 300
+
+    @staticmethod
+    def _format_duration(seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, rest = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m" if rest == 0 else f"{minutes}m{rest}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h" if minutes == 0 else f"{hours}h{minutes}m"
+
+    def _provider_retry_notice_status_text(self, event: AstrMessageEvent) -> str:
+        global_enabled = self._provider_retry_notice_global_enabled()
+        session_enabled = self._provider_retry_notice_session_enabled(event)
+        effective = global_enabled and session_enabled
+        session_key = self._provider_retry_notice_session_key(event)
+        interval = self._provider_retry_notice_interval()
+        return (
+            "## 🔁 备用站点重试提示\n\n"
+            f"- 全局开关：{self._prompt_rewrite_guard_status(global_enabled)}\n"
+            f"- 当前会话开关：{self._prompt_rewrite_guard_status(session_enabled)}\n"
+            f"- 当前实际状态：{self._prompt_rewrite_guard_status(effective)}\n"
+            f"- 当前会话键：`{session_key}`\n"
+            f"- 合并提示最短间隔：{self._format_duration(interval)}\n\n"
+            "用法：\n"
+            "- `/image2 retry` — 查看当前状态\n"
+            "- `/image2 retry global <on|off>` — 切换全局重试提示\n"
+            "- `/image2 retry here <on|off>` — 切换当前群/会话重试提示\n"
+            "- `/image2 retry interval <秒>` — 设置合并提示最短间隔"
         )
 
     def _provider_failure_cooldown(self) -> int:
@@ -2530,14 +2623,70 @@ class GPTImage2Plugin(Star):
         total: int,
         global_mode: str = "",
     ) -> None:
-        """Notify users before trying the next provider, so fallback is visible."""
+        """Notify users before trying the next provider without spamming chats."""
+        if not self._provider_retry_notice_enabled(event):
+            return
+
+        state_key = self._provider_retry_notice_session_key(event)
+        now = time()
+        state = self._provider_retry_notice_state.setdefault(
+            state_key,
+            {"last_sent_at": 0.0, "pending": []},
+        )
+        interval = self._provider_retry_notice_interval()
+        switch_summary = (
+            f"{self._provider_user_label(failed_provider, global_mode)} → "
+            f"{self._provider_user_label(next_provider, global_mode)}："
+            f"{self._safe_markdown_preview(error_msg, limit=120)}"
+        )
+        try:
+            last_sent_at = float(str(state.get("last_sent_at") or 0.0))
+        except (TypeError, ValueError):
+            last_sent_at = 0.0
+        elapsed = now - last_sent_at
+        if last_sent_at > 0 and elapsed < interval:
+            pending = state.get("pending")
+            if not isinstance(pending, list):
+                pending = []
+            pending.append(switch_summary)
+            state["pending"] = pending[-10:]
+            logger.debug(
+                "[GPTImage2] provider switch notice suppressed "
+                f"action={action} session={state_key} elapsed_ms={int(elapsed * 1000)} "
+                f"interval={interval}s pending={len(state['pending'])}"
+            )
+            return
+
+        pending = state.get("pending")
+        if not isinstance(pending, list):
+            pending = []
+        pending_items = [str(item) for item in pending if str(item or "").strip()]
+        pending_display = pending_items[-5:]
+        hidden_pending = max(0, len(pending_items) - len(pending_display))
+        pending_lines = "\n".join(f"  - {item}" for item in pending_display)
+        hidden_text = (
+            f"\n  - ……另有 {hidden_pending} 条已省略" if hidden_pending else ""
+        )
+        suppressed_text = (
+            "\n- 距上次提示后已合并省略："
+            f"**{len(pending_items)}** 条切换提示\n"
+            f"- 合并摘要：\n{pending_lines}{hidden_text}"
+            if pending_items
+            else ""
+        )
+        interval_text = "无限流" if interval <= 0 else self._format_duration(interval)
+        state["last_sent_at"] = now
+        state["pending"] = []
+
         await self._send_processing_ack(
             event,
             "## 🔁 正在切换备用 API 站点\n\n"
             f"- 已失败：**{self._provider_user_label(failed_provider, global_mode)}**\n"
             f"- 失败原因：{self._safe_markdown_preview(error_msg, limit=220)}\n"
             f"- 即将尝试：**{self._provider_user_label(next_provider, global_mode)}**"
-            f"（第 {next_index}/{total} 个站点）",
+            f"（第 {next_index}/{total} 个站点）"
+            f"{suppressed_text}\n"
+            f"- 当前合并提示间隔：{interval_text}",
             action=f"{action}-provider-switch",
             task_anchor=True,
         )
@@ -2870,6 +3019,10 @@ class GPTImage2Plugin(Star):
         edit_aliases_status = (
             "、".join(f"`{alias}`" for alias in edit_aliases) or "未配置"
         )
+        retry_notice_status = self._prompt_rewrite_guard_status(
+            self._provider_retry_notice_global_enabled()
+        )
+        retry_notice_interval = self._provider_retry_notice_interval()
         images_guard_status = self._prompt_rewrite_guard_status(
             self._prompt_rewrite_guard_enabled("images")
         )
@@ -2908,6 +3061,8 @@ class GPTImage2Plugin(Star):
             "- `/image2 mode [模式]` — 查看/切换全局 API 模式（管理员）\n"
             "- `/image2 guard [images|responses|all] [on|off]` — "
             "查看/切换 Prompt Guard（管理员）\n"
+            "- `/image2 retry [global|here|interval] ...` — "
+            "查看/切换备用站点重试提示（管理员）\n"
             "- `/image2 providers` — 查看生图站点状态与当前模式可用性（管理员）\n"
             "- `/image2 stats` — 查看 Provider 统计、失败原因、成功率（管理员）\n"
             "- `/image2 stats recent [N]` — 查看最近 N 条失败记录（管理员）\n"
@@ -2927,6 +3082,7 @@ class GPTImage2Plugin(Star):
             f"| 权威兜底 | {authoritative_status} |\n"
             f"| 生图 API 站点 | {image_provider_count} 个（当前模式可用 {viable_provider_count} 个） |\n"
             f"| 自适应站点优先级 | {adaptive_status} |\n"
+            f"| 备用站点重试提示 | {retry_notice_status}，间隔 {self._format_duration(retry_notice_interval)} |\n"
             f"| edit 别名 | {edit_aliases_status} |\n"
             f"| Plan 模型 | `{cfg.get('plan_model', 'gpt-5.4')}` |\n"
             f"| Plan 空闲超时 | {cfg.get('plan_timeout', 300)} 秒 |\n"
@@ -2939,6 +3095,7 @@ class GPTImage2Plugin(Star):
             "### 说明\n\n"
             f"- `/image2 mode` 是全局模式，会影响 draw/edit 的站点过滤。\n"
             f"- draw/edit 只会尝试支持当前模式的站点；不支持的站点会被跳过。\n"
+            f"- `/image2 retry here off` 可关闭当前群/会话的备用站点切换提示。\n"
             f"- edit 别名只在消息开头匹配，且要求别名后接空白和提示词。\n"
             f"- 站点明细请使用 `/image2 providers` 查看。\n"
             f"- `/image2 plan` 进入后，下面缩进的是 Plan 子命令。"
@@ -3117,6 +3274,116 @@ class GPTImage2Plugin(Star):
             event,
             "## ✅ Prompt Guard 已更新\n\n" + "\n".join(rows) + f"\n\n{suffix}",
             action="guard-switched",
+        )
+
+    @image2.command("retry")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def retry(
+        self,
+        event: AstrMessageEvent,
+        target: str | None = None,
+        state: str | None = None,
+    ):
+        """查看或切换备用站点重试提示（管理员）"""
+        target_text = str(target or "").strip().lower()
+        state_text = str(state or "").strip()
+        logger.info(
+            "[GPTImage2] retry notice command received "
+            f"{self._event_context(event)} target={target_text or '-'} "
+            f"state={state_text or '-'}"
+        )
+
+        if not target_text:
+            yield await self._text_result(
+                event,
+                self._provider_retry_notice_status_text(event),
+                action="retry-help",
+            )
+            return
+
+        if target_text in {"global", "all", "全局"}:
+            next_value = self._parse_bool_switch(state_text)
+            if next_value is None:
+                yield await self._text_result(
+                    event,
+                    "## ⚠️ 重试提示状态无效\n\n用法：`/image2 retry global <on|off>`",
+                    action="retry-global-invalid",
+                )
+                return
+            old_value = self._provider_retry_notice_global_enabled()
+            self.config["provider_retry_notice_enabled"] = next_value
+            self._provider_retry_notice_state.clear()
+            saved = self._save_config()
+            suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
+            yield await self._text_result(
+                event,
+                "## ✅ 全局备用站点重试提示已更新\n\n"
+                f"{self._prompt_rewrite_guard_status(old_value)} → "
+                f"{self._prompt_rewrite_guard_status(next_value)}\n\n"
+                f"{suffix}",
+                action="retry-global-switched",
+            )
+            return
+
+        if target_text in {"here", "group", "session", "当前", "本群"}:
+            next_value = self._parse_bool_switch(state_text)
+            if next_value is None:
+                yield await self._text_result(
+                    event,
+                    "## ⚠️ 当前会话重试提示状态无效\n\n"
+                    "用法：`/image2 retry here <on|off>`",
+                    action="retry-here-invalid",
+                )
+                return
+            session_key = self._provider_retry_notice_session_key(event)
+            old_value = self._provider_retry_notice_session_enabled(event)
+            self._set_provider_retry_notice_session_enabled(session_key, next_value)
+            self._provider_retry_notice_state.pop(session_key, None)
+            saved = self._save_config()
+            suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
+            yield await self._text_result(
+                event,
+                "## ✅ 当前会话备用站点重试提示已更新\n\n"
+                f"- 会话键：`{session_key}`\n"
+                f"- 状态：{self._prompt_rewrite_guard_status(old_value)} → "
+                f"{self._prompt_rewrite_guard_status(next_value)}\n\n"
+                f"{suffix}",
+                action="retry-here-switched",
+            )
+            return
+
+        if target_text in {"interval", "cooldown", "间隔"}:
+            try:
+                next_interval = max(0, int(state_text))
+            except (TypeError, ValueError):
+                yield await self._text_result(
+                    event,
+                    "## ⚠️ 合并提示间隔无效\n\n"
+                    "用法：`/image2 retry interval <秒>`，例如 `300` 表示 5 分钟。",
+                    action="retry-interval-invalid",
+                )
+                return
+            old_interval = self._provider_retry_notice_interval()
+            self.config["provider_retry_notice_interval"] = next_interval
+            self._provider_retry_notice_state.clear()
+            saved = self._save_config()
+            suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
+            yield await self._text_result(
+                event,
+                "## ✅ 备用站点重试提示间隔已更新\n\n"
+                f"{self._format_duration(old_interval)} → "
+                f"{self._format_duration(next_interval)}\n\n"
+                f"{suffix}",
+                action="retry-interval-switched",
+            )
+            return
+
+        yield await self._text_result(
+            event,
+            "## ⚠️ 重试提示目标无效\n\n"
+            "可用目标：`global` / `here` / `interval`\n\n"
+            + self._provider_retry_notice_status_text(event),
+            action="retry-invalid-target",
         )
 
     @image2.command("providers")
