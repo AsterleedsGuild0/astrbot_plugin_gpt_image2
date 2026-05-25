@@ -1826,6 +1826,13 @@ class GPTImage2Plugin(Star):
             )
 
     @staticmethod
+    def _cancel_plan_timeout_watchdog(session: PlanSession) -> None:
+        """Plan confirm 生图期间暂停空闲超时 watchdog。"""
+        if session.timeout_task and not session.timeout_task.done():
+            session.timeout_task.cancel()
+        session.timeout_task = None
+
+    @staticmethod
     def _waiter_timeout(timeout: int) -> int:
         """session_waiter 超时略晚于 watchdog，避免抢先吞掉主动通知。"""
         return timeout + GPTImage2Plugin.PLAN_WAITER_TIMEOUT_GRACE
@@ -1921,6 +1928,28 @@ class GPTImage2Plugin(Star):
         except (TypeError, ValueError):
             api_timeout = 120
         return max(plan_config.timeout, api_timeout + 60)
+
+    def _get_plan_confirm_processing_timeout(self, plan_config: PlanConfig) -> int:
+        """Plan confirm 生图阶段的 session_waiter 保活时长。"""
+        try:
+            api_timeout = max(1, int(self.config.get("timeout", 120)))
+        except (TypeError, ValueError):
+            api_timeout = 120
+
+        try:
+            global_mode = self._normalize_api_mode(
+                self.config.get("api_mode", "images")
+            )
+            provider_count = sum(
+                1
+                for provider in self._get_image_api_provider_configs()
+                if provider.supports_mode(global_mode)
+            )
+        except ValueError:
+            provider_count = 1
+
+        attempts = max(1, provider_count)
+        return max(plan_config.timeout, attempts * (api_timeout + 30) + 60)
 
     def _get_max_input_images(self) -> int:
         """读取最多参考图数量。"""
@@ -3760,6 +3789,9 @@ class GPTImage2Plugin(Star):
 
         plan_config = self._get_plan_config()
         processing_timeout = self._get_plan_processing_timeout(plan_config)
+        confirm_processing_timeout = self._get_plan_confirm_processing_timeout(
+            plan_config,
+        )
         owner_sender_id = event.get_sender_id() or ""
 
         # 防止同一会话重复进入
@@ -3794,6 +3826,7 @@ class GPTImage2Plugin(Star):
             "[GPTImage2] plan start "
             f"{self._event_context(event)} timeout={plan_config.timeout}s "
             f"processing_timeout={processing_timeout}s "
+            f"confirm_processing_timeout={confirm_processing_timeout}s "
             f"max_rounds={plan_config.max_rounds} model={plan_config.model}"
         )
 
@@ -3864,14 +3897,10 @@ class GPTImage2Plugin(Star):
                 session = self._plan_sessions.get(session_id)
                 if session and session.final_prompt:
                     self._dedupe_plan_reference_images(session)
+                    self._cancel_plan_timeout_watchdog(session)
                     controller.keep(
-                        timeout=processing_timeout,
+                        timeout=confirm_processing_timeout,
                         reset_timeout=True,
-                    )
-                    self._reset_plan_timeout_watchdog(
-                        session_id,
-                        next_event.unified_msg_origin,
-                        processing_timeout,
                     )
                     reference_count = len(session.reference_data_urls)
                     api_mode = self.config.get("api_mode", "images")
@@ -3900,6 +3929,10 @@ class GPTImage2Plugin(Star):
                         reference_data_urls=session.reference_data_urls,
                         send_ack=False,
                     )
+                    if self._plan_sessions.get(session_id) is not session:
+                        controller.stop()
+                        return
+
                     if chain:
                         await next_event.send(MessageChain(chain=chain))
                         if self._send_copyable_prompt_after_success_enabled():
