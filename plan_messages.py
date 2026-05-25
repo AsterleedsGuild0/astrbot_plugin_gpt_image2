@@ -1,16 +1,15 @@
-"""Plan message-building pure functions for GPT Image2.
+"""GPT Image2 的 Plan 消息构建纯函数。
 
-Responsibility:
-- Build user content dict for the Responses API
-- Format/split prompt text for merged-forward nodes
-- Construct Node objects for merged-forward messages
-- Build Plan final prompt forward nodes
-- Build Plan copyable command text and forward nodes
-- Build revised prompt forward nodes and fallback text
+职责：
+- 构建 Responses API 的用户输入内容。
+- 格式化/切分提示词文本，便于合并转发。
+- 构建合并转发消息节点。
+- 构建 Plan 最终提示词转发节点。
+- 构建 Plan 可复制命令文本和转发节点。
+- 构建 revised_prompt 转发节点和回退文本。
 
-This module has no dependency on AstrBot event/send, only on
-``astrbot.api.message_components`` (Node, Plain) for constructing
-message component trees.
+本模块不依赖 AstrBot event/send，只依赖 ``astrbot.api.message_components``
+中的 Node/Plain 来构建消息组件树。
 """
 
 from __future__ import annotations
@@ -24,11 +23,11 @@ if TYPE_CHECKING:
     from .plan import PlanSession
 
 
-# ── User content for Responses API ───────────────────────────────
+# ── Responses API 用户输入内容 ───────────────────────────────────
 
 
 def build_plan_user_content(text: str, image_data_urls: list[str]) -> str | list:
-    """Build the user message content for the Responses API Plan call."""
+    """构建 Plan 调用 Responses API 时的用户消息内容。"""
     if not image_data_urls:
         return text
 
@@ -38,16 +37,16 @@ def build_plan_user_content(text: str, image_data_urls: list[str]) -> str | list
     return content
 
 
-# ── Prompt text utilities ────────────────────────────────────────
+# ── 提示词文本工具 ───────────────────────────────────────────────
 
 
 def single_line_command_prompt(prompt: str) -> str:
-    """Collapse a final prompt into one line so it can be copied as a command."""
+    """把最终提示词压成单行，便于复制为聊天命令。"""
     return " ".join(str(prompt or "").replace("\x00", " ").split())
 
 
 def split_text_for_forward(text: str, *, limit: int = 1200) -> list[str]:
-    """Split long prompt text into merged-forward friendly chunks."""
+    """把长提示词切分为适合合并转发的文本块。"""
     value = str(text or "").strip()
     if not value:
         return []
@@ -86,7 +85,7 @@ def forward_node(
     part: int | None = None,
     total: int | None = None,
 ) -> Node:
-    """Build a single merged-forward Node with the given title and text."""
+    """使用标题和正文构建单个合并转发节点。"""
     suffix = f"（{part}/{total}）" if part is not None and total else ""
     return Node(
         name="GPT Image2",
@@ -96,7 +95,7 @@ def forward_node(
 
 
 def prompt_text_nodes(title: str, text: str) -> list[Node]:
-    """Split *text* into chunks and wrap each in a forward Node."""
+    """把文本切块，并分别包装为合并转发节点。"""
     chunks = split_text_for_forward(text)
     total = len(chunks)
     if total <= 1:
@@ -107,15 +106,15 @@ def prompt_text_nodes(title: str, text: str) -> list[Node]:
     ]
 
 
-# ── Plan final prompt forward nodes ──────────────────────────────
+# ── Plan 最终提示词转发节点 ──────────────────────────────────────
 
 
 def plan_prompt_forward_nodes(session: PlanSession) -> list[Node]:
-    """Build merged-forward nodes for Chinese and English final prompts.
+    """构建中文和英文/混合最终提示词的合并转发节点。
 
     .. note::
-        Caller should run ``_dedupe_plan_reference_images(session)`` before
-        calling this function if session mutations are expected.
+        如需修改 session 去重，调用方应先执行
+        ``_dedupe_plan_reference_images(session)``。
     """
     zh_prompt = (session.final_prompt_zh or "").strip()
     final_prompt = (session.final_prompt or "").strip()
@@ -154,7 +153,7 @@ def plan_prompt_forward_nodes(session: PlanSession) -> list[Node]:
 
 
 def plan_final_prompt_fallback_text(session: PlanSession) -> str:
-    """Build plain-text fallback for when merged-forward sending fails."""
+    """构建最终提示词合并转发失败时的纯文本回退内容。"""
     zh_prompt = session.final_prompt_zh or "（模型未返回中文提示词）"
     final_prompt = session.final_prompt or "（模型未返回英文/混合提示词）"
     return (
@@ -165,11 +164,11 @@ def plan_final_prompt_fallback_text(session: PlanSession) -> str:
     )
 
 
-# ── Plan copyable command building ───────────────────────────────
+# ── Plan 可复制命令构建 ──────────────────────────────────────────
 
 
 def plan_copyable_prompt(session: PlanSession) -> str:
-    """Prefer the exact Chinese prompt for copyable IM commands."""
+    """构建可复制 IM 命令时优先使用中文提示词。"""
     return session.final_prompt_zh or session.final_prompt or ""
 
 
@@ -178,11 +177,11 @@ def _build_plan_copyable_command_text_inner(
     *,
     succeeded: bool,
 ) -> str:
-    """Build the copyable command text without calling dedupe.
+    """构建可复制命令文本；内部不执行参考图去重。
 
     .. note::
-        Caller should run ``_dedupe_plan_reference_images(session)`` before
-        calling this if session deduplication is desired.
+        如需对 session 参考图去重，调用方应先执行
+        ``_dedupe_plan_reference_images(session)``。
     """
     prompt = single_line_command_prompt(plan_copyable_prompt(session))
     reference_count = len(session.reference_data_urls)
@@ -221,29 +220,29 @@ def _build_plan_copyable_command_text_inner(
 
 
 def build_plan_copyable_command_text(session: PlanSession, *, succeeded: bool) -> str:
-    """Build a plain-text command for reusing a Plan final prompt.
+    """构建复用 Plan 最终提示词的纯文本命令。
 
     .. note::
-        Does **not** call ``_dedupe_plan_reference_images(session)`` internally.
-        If deduplication is needed, run it before calling this function.
+        内部不会调用 ``_dedupe_plan_reference_images(session)``。
+        如需去重，请在调用前完成。
     """
     return _build_plan_copyable_command_text_inner(session, succeeded=succeeded)
 
 
 def build_plan_direct_retry_command_text(session: PlanSession) -> str:
-    """Build a plain-text command for retrying outside Plan without re-planning.
+    """构建跳过重新规划、在 Plan 外直接重试的纯文本命令。
 
     .. note::
-        Does **not** call dedupe internally.
+        内部不会执行参考图去重。
     """
     return _build_plan_copyable_command_text_inner(session, succeeded=False)
 
 
 def plan_copyable_command_forward_nodes(session: PlanSession) -> list[Node]:
-    """Build merged-forward nodes for a long copyable command after success.
+    """构建 Plan 成功后长可复制命令的合并转发节点。
 
     .. note::
-        Does **not** call dedupe internally.
+        内部不会执行参考图去重。
     """
     text = _build_plan_copyable_command_text_inner(session, succeeded=True)
     title, _, rest = text.partition("\n\n")
@@ -260,7 +259,7 @@ def plan_copyable_command_forward_nodes(session: PlanSession) -> list[Node]:
     return nodes
 
 
-# ── Revised prompt forward nodes ─────────────────────────────────
+# ── revised_prompt 转发节点 ──────────────────────────────────────
 
 
 def revised_prompt_forward_nodes(
@@ -268,7 +267,7 @@ def revised_prompt_forward_nodes(
     *,
     action: str,
 ) -> list[Node]:
-    """Build merged-forward nodes for long revised prompts from image APIs."""
+    """为图片 API 返回的长 revised_prompt 构建合并转发节点。"""
     prompts = [
         (index, item.revised_prompt.strip())
         for index, item in enumerate(results, start=1)
@@ -295,7 +294,7 @@ def revised_prompt_forward_nodes(
 
 
 def revised_prompt_fallback_text(results: list[ImageResult]) -> str:
-    """Build plain-text fallback for revised prompts when merged-forward fails."""
+    """构建 revised_prompt 合并转发失败时的纯文本回退内容。"""
     items = [
         (index, item.revised_prompt.strip())
         for index, item in enumerate(results, start=1)
