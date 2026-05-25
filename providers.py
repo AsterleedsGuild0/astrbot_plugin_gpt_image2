@@ -1213,6 +1213,8 @@ class ProviderManager:
                 record["response_preview_truncated"] = diag.response_preview_truncated
                 record["response_bytes"] = diag.response_bytes
                 record["elapsed_ms"] = diag.elapsed_ms
+                if diag.response_json_summary:
+                    record["response_json_summary"] = diag.response_json_summary
             else:
                 record["error_class"] = "RuntimeError"
                 parsed_code = classify_http_status_code(error_msg)

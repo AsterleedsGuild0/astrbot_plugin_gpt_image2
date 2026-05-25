@@ -44,9 +44,9 @@ class ImageResult:
 
 @dataclass
 class HTTPDiagnostics:
-    """HTTP response metadata for provider failure records.
+    """Provider 失败记录使用的 HTTP 响应诊断元数据。
 
-    Never stores: user prompt, image data, API keys, or request bodies.
+    不存储：用户提示词、图片数据、API Key 或请求体。
     """
 
     status_code: int
@@ -56,14 +56,14 @@ class HTTPDiagnostics:
     response_preview_truncated: bool
     response_bytes: int
     elapsed_ms: int
+    response_json_summary: str = ""
 
 
 class ImageAPIError(RuntimeError):
-    """Structured error carrying HTTP response diagnostics.
+    """携带 HTTP 响应诊断信息的结构化错误。
 
-    Subclasses ``RuntimeError`` so existing ``except RuntimeError`` blocks
-    continue to catch it.  Use the ``diagnostics`` attribute to access HTTP
-    response metadata when available.
+    继承 ``RuntimeError``，确保现有 ``except RuntimeError`` 分支仍能捕获。
+    如有可用的 HTTP 响应元数据，可通过 ``diagnostics`` 属性读取。
     """
 
     def __init__(
@@ -138,19 +138,17 @@ class GPTImageClient:
 
     @staticmethod
     def _sanitized_response_preview(text: str, limit: int = 2000) -> tuple[str, bool]:
-        """Sanitize and truncate response body for diagnostics.
+        """为诊断记录清理并截断响应体预览。
 
-        Returns ``(preview, truncated)`` where *truncated* is ``True`` when
-        the sanitized preview was clipped to *limit*.
+        返回 ``(preview, truncated)``；当清理后的预览被截断到 ``limit``
+        时，``truncated`` 为 ``True``。
 
-        Strips base64 blobs, bearer tokens, API key patterns, and
-        ``sk-``/``fk-``-style keys.  The result is wrapped in ``repr()``
-        for single-line safety in logs and JSON.
+        会去除 base64 大块、Bearer Token、API Key 模式，以及 ``sk-``/``fk-``
+        风格密钥。结果使用 ``repr()`` 包裹，便于安全写入单行日志和 JSON。
         """
         if not text:
             return "repr('')", False
-        # Take a buffer beyond limit so regex redaction near the boundary
-        # has enough context and the final truncation is accurate.
+        # 多取一小段，确保边界附近的正则脱敏有足够上下文，最终截断也更准确。
         preview = text[: limit + 100]
         import re as _re
 
@@ -181,8 +179,73 @@ class GPTImageClient:
         return repr(preview), truncated
 
     @staticmethod
+    def _response_json_summary(
+        data: object, *, max_keys: int = 12, max_seq_len: int = 20
+    ) -> str:
+        """构建 JSON 响应体的安全结构摘要。
+
+        不包含：提示词文本、图片数据、base64、API Key 或任何长字符串值。
+        只描述 JSON 结构形状。
+
+        示例::
+
+            dict keys=[created,data] data_type=list data_len=0
+            dict keys=[created,data] data_type=NoneType
+            dict keys=[error] error_keys=[message,type]
+            list len=1 first_type=dict first_keys=[b64_json,revised_prompt]
+
+        ``max_keys`` 控制最多展示多少个字典 key，超出后显示为 ``+Nmore``。
+        ``max_seq_len`` 控制 ``len`` 的展示上限，超过后显示为 ``>=N``。
+        """
+
+        def _sk(keys: list[str], mx: int) -> str:
+            if len(keys) <= mx:
+                return ",".join(keys)
+            shown = ",".join(keys[:mx])
+            return f"{shown}+{len(keys) - mx}more"
+
+        def _cl(val: int, mx: int) -> str:
+            return f">={mx}" if val >= mx else str(val)
+
+        if isinstance(data, dict):
+            keys = list(data.keys())
+            keys_str = _sk(keys, max_keys)
+
+            data_val = data.get("data")
+            if data_val is None:
+                data_info = "data_type=NoneType"
+            elif isinstance(data_val, list):
+                data_info = f"data_type=list data_len={_cl(len(data_val), max_seq_len)}"
+            elif isinstance(data_val, dict):
+                data_info = (
+                    f"data_type=dict data_keys=[{_sk(list(data_val.keys()), max_keys)}]"
+                )
+            else:
+                data_info = f"data_type={type(data_val).__name__}"
+
+            err_val = data.get("error")
+            err_info = ""
+            if isinstance(err_val, dict):
+                err_info = f" error_keys=[{_sk(list(err_val.keys()), max_keys)}]"
+
+            return f"dict keys=[{keys_str}]{' ' + data_info if 'data' in keys else ''}{err_info}"
+
+        if isinstance(data, list):
+            dlen = _cl(len(data), max_seq_len)
+            first_info = ""
+            if data:
+                first = data[0]
+                if isinstance(first, dict):
+                    first_info = f" first_type=dict first_keys=[{_sk(list(first.keys()), max_keys)}]"
+                else:
+                    first_info = f" first_type={type(first).__name__}"
+            return f"list len={dlen}{first_info}"
+
+        return f"{type(data).__name__}"
+
+    @staticmethod
     def _request_id_headers(resp: httpx.Response) -> str:
-        """Extract common request ID headers from response for diagnostics."""
+        """从响应头中提取常见 request id，供诊断使用。"""
         candidates = (
             "x-request-id",
             "request-id",
@@ -203,7 +266,7 @@ class GPTImageClient:
         elapsed_ms: int,
         context: str,
     ) -> None:
-        """Log detailed non-success HTTP response diagnostics."""
+        """记录非成功 HTTP 响应的详细诊断信息。"""
         preview, truncated = self._sanitized_response_preview(resp.text, limit=500)
         request_ids = self._request_id_headers(resp)
         logger.warning(
@@ -463,8 +526,62 @@ class GPTImageClient:
                 diagnostics=diagnostics,
             )
 
-        data = resp.json()
-        results = self._parse_images_api_response(data)
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            preview, truncated = self._sanitized_response_preview(resp.text)
+            diagnostics = HTTPDiagnostics(
+                status_code=resp.status_code,
+                response_content_type=resp.headers.get("content-type", "-"),
+                request_ids=self._request_id_headers(resp),
+                response_preview=preview,
+                response_preview_truncated=truncated,
+                response_bytes=len(resp.content),
+                elapsed_ms=elapsed,
+                response_json_summary="<non-json>",
+            )
+            logger.warning(
+                "[GPTImage2] Images API generate returned non-JSON body "
+                f"status={resp.status_code} elapsed_ms={elapsed} "
+                f"response_bytes={len(resp.content)} "
+                f"content_type={resp.headers.get('content-type', '-')} "
+                f"request_ids=[{self._request_id_headers(resp)}] "
+                f"response_json_summary=<non-json> "
+                f"response_preview={preview}"
+                f"{' (truncated)' if truncated else ''}"
+            )
+            raise ImageAPIError(
+                "API 返回结构异常：响应不是有效 JSON"
+                f"（HTTP {resp.status_code}；"
+                f"content-type={resp.headers.get('content-type', '-')}；"
+                f"bytes={len(resp.content)}）",
+                diagnostics=diagnostics,
+            ) from e
+
+        try:
+            results = self._parse_images_api_response(data)
+        except RuntimeError as e:
+            preview, truncated = self._sanitized_response_preview(resp.text)
+            json_summary = self._response_json_summary(data)
+            diagnostics = HTTPDiagnostics(
+                status_code=resp.status_code,
+                response_content_type=resp.headers.get("content-type", "-"),
+                request_ids=self._request_id_headers(resp),
+                response_preview=preview,
+                response_preview_truncated=truncated,
+                response_bytes=len(resp.content),
+                elapsed_ms=elapsed,
+                response_json_summary=json_summary,
+            )
+            logger.warning(
+                "[GPTImage2] Images API generate parse failed "
+                f"status={resp.status_code} elapsed_ms={elapsed} "
+                f"response_json_summary={json_summary} "
+                f"response_preview={preview}"
+                f"{' (truncated)' if truncated else ''}"
+            )
+            raise ImageAPIError(str(e), diagnostics=diagnostics) from e
+
         logger.info(
             "[GPTImage2] Images API generate request success "
             f"elapsed_ms={elapsed} {self._result_summary(results)}"
@@ -657,8 +774,62 @@ class GPTImageClient:
                 diagnostics=diagnostics,
             )
 
-        data = resp.json()
-        results = self._parse_images_api_response(data)
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            preview, truncated = self._sanitized_response_preview(resp.text)
+            diagnostics = HTTPDiagnostics(
+                status_code=resp.status_code,
+                response_content_type=resp.headers.get("content-type", "-"),
+                request_ids=self._request_id_headers(resp),
+                response_preview=preview,
+                response_preview_truncated=truncated,
+                response_bytes=len(resp.content),
+                elapsed_ms=elapsed,
+                response_json_summary="<non-json>",
+            )
+            logger.warning(
+                "[GPTImage2] Images API edit returned non-JSON body "
+                f"status={resp.status_code} elapsed_ms={elapsed} "
+                f"response_bytes={len(resp.content)} "
+                f"content_type={resp.headers.get('content-type', '-')} "
+                f"request_ids=[{self._request_id_headers(resp)}] "
+                f"response_json_summary=<non-json> "
+                f"response_preview={preview}"
+                f"{' (truncated)' if truncated else ''}"
+            )
+            raise ImageAPIError(
+                "API 返回结构异常：响应不是有效 JSON"
+                f"（HTTP {resp.status_code}；"
+                f"content-type={resp.headers.get('content-type', '-')}；"
+                f"bytes={len(resp.content)}）",
+                diagnostics=diagnostics,
+            ) from e
+
+        try:
+            results = self._parse_images_api_response(data)
+        except RuntimeError as e:
+            preview, truncated = self._sanitized_response_preview(resp.text)
+            json_summary = self._response_json_summary(data)
+            diagnostics = HTTPDiagnostics(
+                status_code=resp.status_code,
+                response_content_type=resp.headers.get("content-type", "-"),
+                request_ids=self._request_id_headers(resp),
+                response_preview=preview,
+                response_preview_truncated=truncated,
+                response_bytes=len(resp.content),
+                elapsed_ms=elapsed,
+                response_json_summary=json_summary,
+            )
+            logger.warning(
+                "[GPTImage2] Images API edit parse failed "
+                f"status={resp.status_code} elapsed_ms={elapsed} "
+                f"response_json_summary={json_summary} "
+                f"response_preview={preview}"
+                f"{' (truncated)' if truncated else ''}"
+            )
+            raise ImageAPIError(str(e), diagnostics=diagnostics) from e
+
         logger.info(
             "[GPTImage2] Images API edit request success "
             f"elapsed_ms={elapsed} {self._result_summary(results)}"

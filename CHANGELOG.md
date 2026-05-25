@@ -6,6 +6,21 @@
 
 ---
 
+## v0.4.4 - 2026-05-25
+
+### v0.4.4 Added
+
+- Images API 返回 HTTP 2xx 但 JSON 结构异常时，现在会把脱敏响应预览和 JSON
+  结构摘要写入 `provider_failures.jsonl`。
+- `/image2 stats recent [N]` 新增展示 `response_json_summary`，便于定位站点返回
+  空 `data`、非 JSON 或非标准兼容格式的问题。
+
+### v0.4.4 Changed
+
+- 升级版本至 0.4.4。
+
+---
+
 ## v0.4.3 - 2026-05-25
 
 ### v0.4.3 Added

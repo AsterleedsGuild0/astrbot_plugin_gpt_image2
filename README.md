@@ -193,13 +193,13 @@ python scripts/package_plugin.py
 如果使用 VSCode，也可以在 Run and Debug 面板选择
 `Package AstrBot plugin (test)` 手动触发测试包打包。该配置会调用
 `python scripts/package_plugin.py --dev-version`，自动在 zip 内写入
-`v0.4.3-test.YYYYMMDD.HHMM` 形式的真实测试版本号，但不会修改工作区文件。
+`v0.4.4-test.YYYYMMDD.HHMM` 形式的真实测试版本号，但不会修改工作区文件。
 如需正式包，可选择 `Package AstrBot plugin (release)`。
 
 默认输出：
 
 ```text
-dist/astrbot_plugin_gpt_image2_233-v0.4.3.zip
+dist/astrbot_plugin_gpt_image2_233-v0.4.4.zip
 ```
 
 然后在 AstrBot WebUI 的插件页面中上传该 zip 文件安装。
