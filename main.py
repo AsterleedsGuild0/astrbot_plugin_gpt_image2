@@ -3236,9 +3236,10 @@ class GPTImage2Plugin(Star):
                 display = (
                     f"## ✅ 我已整理好图像需求\n\n"
                     f"{summary}\n\n"
-                    "完整生成提示词已保存，确认生成时会以合并转发发送。\n"
-                    "发送 `/plan confirm` 生成图片，"
-                    "或 `/plan quit` 退出。"
+                    "完整生成提示词已保存，确认生成时会以合并转发发送。可以发送\n\n"
+                    "- `/plan <内容>` 继续交流需求\n\n"
+                    "- `/plan confirm` 生成图片\n\n"
+                    "- `/plan quit` 退出。\n\n"
                 )
             elif reached_max:
                 display += (
