@@ -6,6 +6,29 @@
 
 ---
 
+## v0.4.2 - 2026-05-25
+
+### v0.4.2 Added
+
+- 新增 `/image2 retry` 管理员命令，用于查看和切换备用站点重试提示。
+- 新增 `provider_retry_notice_enabled` 全局开关，可关闭中途切换备用站点提示。
+- 新增 `provider_retry_notice_sessions` 会话级覆盖，可通过 `/image2 retry here on/off`
+  按当前群或私聊会话控制重试提示。
+- 新增 `provider_retry_notice_interval`，同一群/会话内按最短间隔合并切换提示，
+  间隔内的多次失败切换会汇总到下一条提示摘要中，减少群聊刷屏。
+
+### v0.4.2 Fixed
+
+- 修复 Plan 会话会拦截 `/image2 stats`、`/image2 providers` 等非 Plan 命令的问题。
+- 修复 `/plan confirm` 长时间多站点生图时可能被 Plan 空闲超时清理，导致提示语和
+  重试状态矛盾的问题。
+
+### v0.4.2 Changed
+
+- 升级版本至 0.4.2。
+
+---
+
 ## v0.4.1 - 2026-05-21
 
 ### v0.4.1 Fixed

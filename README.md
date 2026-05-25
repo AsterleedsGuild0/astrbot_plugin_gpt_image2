@@ -29,6 +29,7 @@
 | `/image2 plan quit` | 退出当前 Plan 会话（`cancel` 也可用） |
 | `/image2 mode [images\|responses]` | 查看或切换全局 API 模式（仅管理员） |
 | `/image2 guard [images\|responses\|all] [on\|off]` | 切换 Guard（仅管理员） |
+| `/image2 retry [global\|here\|interval] ...` | 控制备用站点重试提示（仅管理员） |
 | `/image2 providers` | 查看生图站点状态（仅管理员） |
 | `/image2 stats` | 查看 Provider 统计、失败原因、成功率（仅管理员） |
 | `/image2 stats recent [N]` | 查看最近 N 条失败记录，默认 10，上限 50（仅管理员） |
@@ -99,6 +100,16 @@
   不支持的站点在本次尝试中被跳过，不会参与跨模式重试。
   需要查看每个站点在当前模式下是否可用时，请使用 `/image2 providers`。
 
+- **备用站点重试提示**：中途切换备用站点的提示可通过
+  `provider_retry_notice_enabled` 全局关闭，也可用 `/image2 retry here off`
+  针对当前群/会话关闭。默认同一群/会话内每 300 秒最多发送一条切换提示，
+  间隔内发生的切换会合并到下一条提示摘要中；最终成功或失败结果不受该开关影响。
+  常用命令：
+  - `/image2 retry` — 查看当前状态
+  - `/image2 retry global off` — 全局关闭中途切换提示
+  - `/image2 retry here off` — 关闭当前群/会话中途切换提示
+  - `/image2 retry interval 300` — 设置合并提示最短间隔为 5 分钟
+
   开启 `adaptive_provider_priority` 后，插件会根据历史成功/失败自动调整
   本次运行时普通备用站点的尝试顺序：最近成功的站点会前置，失败站点会在
   `provider_failure_cooldown` 时间内降级。该策略不会改写 WebUI 配置；健康状态保存在
@@ -133,6 +144,9 @@
 | `authoritative_fallback_responses_model` | string | `` | 权威兜底 Resp 模型（空=不支持） |
 | `adaptive_provider_priority` | bool | `true` | 根据历史健康状态自动调整站点尝试顺序 |
 | `provider_failure_cooldown` | int | `300` | 失败站点降级冷却时间（秒） |
+| `provider_retry_notice_enabled` | bool | `true` | 全局控制备用站点中途切换提示 |
+| `provider_retry_notice_interval` | int | `300` | 同一群/会话重试提示合并间隔（秒） |
+| `provider_retry_notice_sessions` | string | `{}` | 按群/会话覆盖重试提示开关的 JSON |
 | `size` | string | `auto` | 图片尺寸：auto / 1024x1024 / 1536x1024 / 1024x1536 |
 | `quality` | string | `auto` | 图片质量：auto / low / medium / high |
 | `output_format` | string | `png` | 输出格式：png / jpeg / webp |
@@ -175,13 +189,13 @@ python scripts/package_plugin.py
 如果使用 VSCode，也可以在 Run and Debug 面板选择
 `Package AstrBot plugin (test)` 手动触发测试包打包。该配置会调用
 `python scripts/package_plugin.py --dev-version`，自动在 zip 内写入
-`v0.4.1-test.YYYYMMDD.HHMM` 形式的真实测试版本号，但不会修改工作区文件。
+`v0.4.2-test.YYYYMMDD.HHMM` 形式的真实测试版本号，但不会修改工作区文件。
 如需正式包，可选择 `Package AstrBot plugin (release)`。
 
 默认输出：
 
 ```text
-dist/astrbot_plugin_gpt_image2_233-v0.4.1.zip
+dist/astrbot_plugin_gpt_image2_233-v0.4.2.zip
 ```
 
 然后在 AstrBot WebUI 的插件页面中上传该 zip 文件安装。
