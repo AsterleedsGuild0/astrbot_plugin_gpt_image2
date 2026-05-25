@@ -25,6 +25,7 @@ PACKAGE_FILES = [
     "config_redact.py",
     "image_utils.py",
     "plan.py",
+    "plan_messages.py",
     "providers.py",
     "text_image.py",
     "metadata.yaml",

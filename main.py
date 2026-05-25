@@ -66,6 +66,21 @@ from .plan import (
     parse_final_prompt,
     parse_final_prompt_zh,
 )
+from .plan_messages import (
+    build_plan_user_content,
+    single_line_command_prompt,
+    split_text_for_forward,
+    forward_node,
+    prompt_text_nodes,
+    plan_prompt_forward_nodes as _plan_prompt_forward_nodes_pure,
+    plan_final_prompt_fallback_text,
+    plan_copyable_prompt,
+    build_plan_copyable_command_text as _build_plan_copyable_command_text_pure,
+    build_plan_direct_retry_command_text as _build_plan_direct_retry_command_text_pure,
+    plan_copyable_command_forward_nodes as _plan_copyable_command_forward_nodes_pure,
+    revised_prompt_forward_nodes as _revised_prompt_forward_nodes_pure,
+    revised_prompt_fallback_text,
+)
 from .providers import (
     ImageAPIProviderConfig,
     ProviderManager,
@@ -1397,52 +1412,15 @@ class GPTImage2Plugin(Star):
 
     @staticmethod
     def _build_plan_user_content(text: str, image_data_urls: list[str]) -> str | list:
-        """构建 Responses API 用户输入内容。"""
-        if not image_data_urls:
-            return text
-
-        content: list[dict[str, str]] = [{"type": "input_text", "text": text}]
-        for data_url in image_data_urls:
-            content.append({"type": "input_image", "image_url": data_url})
-        return content
+        return build_plan_user_content(text, image_data_urls)
 
     @staticmethod
     def _single_line_command_prompt(prompt: str) -> str:
-        """Collapse a final prompt into one line so it can be copied as a command."""
-        return " ".join(str(prompt or "").replace("\x00", " ").split())
+        return single_line_command_prompt(prompt)
 
     @staticmethod
     def _split_text_for_forward(text: str, *, limit: int = 1200) -> list[str]:
-        """Split long prompt text into merged-forward friendly chunks."""
-        value = str(text or "").strip()
-        if not value:
-            return []
-
-        chunks: list[str] = []
-        current: list[str] = []
-        current_len = 0
-        for raw_line in value.splitlines() or [value]:
-            line = raw_line.rstrip()
-            while len(line) > limit:
-                if current:
-                    chunks.append("\n".join(current).strip())
-                    current = []
-                    current_len = 0
-                chunks.append(line[:limit].strip())
-                line = line[limit:]
-
-            addition_len = len(line) + (1 if current else 0)
-            if current and current_len + addition_len > limit:
-                chunks.append("\n".join(current).strip())
-                current = [line]
-                current_len = len(line)
-            else:
-                current.append(line)
-                current_len += addition_len
-
-        if current:
-            chunks.append("\n".join(current).strip())
-        return [chunk for chunk in chunks if chunk]
+        return split_text_for_forward(text, limit=limit)
 
     @staticmethod
     def _forward_node(
@@ -1452,46 +1430,12 @@ class GPTImage2Plugin(Star):
         part: int | None = None,
         total: int | None = None,
     ) -> Node:
-        suffix = f"（{part}/{total}）" if part is not None and total else ""
-        return Node(
-            name="GPT Image2",
-            uin="233",
-            content=[Plain(f"{title}{suffix}\n\n{text}".strip())],
-        )
+        return forward_node(title, text, part=part, total=total)
 
     def _plan_prompt_forward_nodes(self, session: PlanSession) -> list[Node]:
         """Build merged-forward nodes for Chinese and English final prompts."""
         self._dedupe_plan_reference_images(session)
-        zh_prompt = (session.final_prompt_zh or "").strip()
-        final_prompt = (session.final_prompt or "").strip()
-
-        nodes = [
-            self._forward_node(
-                "🧾 Plan 最终提示词",
-                "完整提示词已收纳为合并转发，避免长英文提示词刷屏。\n"
-                "建议优先复制中文提示词复现；英文/混合提示词保留为完整生成依据。",
-            )
-        ]
-
-        if zh_prompt:
-            nodes.extend(
-                self._prompt_text_nodes("🇨🇳 中文提示词（推荐复制）", zh_prompt)
-            )
-        else:
-            nodes.append(
-                self._forward_node(
-                    "🇨🇳 中文提示词",
-                    "模型本轮没有返回 FINAL_PROMPT_ZH；请优先使用后续英文/混合提示词。",
-                )
-            )
-
-        if final_prompt:
-            nodes.extend(
-                self._prompt_text_nodes(
-                    "🌐 英文/混合提示词（完整生成依据）", final_prompt
-                )
-            )
-        return nodes
+        return _plan_prompt_forward_nodes_pure(session)
 
     async def _send_plan_final_prompt_forward(
         self,
@@ -1511,31 +1455,19 @@ class GPTImage2Plugin(Star):
                 "[GPTImage2] plan final prompt merged forward failed "
                 f"error={type(e).__name__}: {e}"
             )
-            zh_prompt = session.final_prompt_zh or "（模型未返回中文提示词）"
-            final_prompt = session.final_prompt or "（模型未返回英文/混合提示词）"
             await self._send_text(
                 event,
-                "## 🧾 将用于生成的完整提示词\n\n"
-                "合并转发发送失败，已回退为普通文本。\n\n"
-                f"### 中文提示词\n\n{zh_prompt}\n\n"
-                f"### 英文/混合提示词\n\n{final_prompt}",
+                plan_final_prompt_fallback_text(session),
                 action="plan-final-prompt-forward-fallback",
                 prefer_image=False,
             )
 
-    def _prompt_text_nodes(self, title: str, text: str) -> list[Node]:
-        chunks = self._split_text_for_forward(text)
-        total = len(chunks)
-        if total <= 1:
-            return [self._forward_node(title, chunks[0] if chunks else "-")]
-        return [
-            self._forward_node(title, chunk, part=index, total=total)
-            for index, chunk in enumerate(chunks, start=1)
-        ]
+    @staticmethod
+    def _prompt_text_nodes(title: str, text: str) -> list[Node]:
+        return prompt_text_nodes(title, text)
 
     def _plan_copyable_prompt(self, session: PlanSession) -> str:
-        """Prefer the exact Chinese prompt for copyable IM commands."""
-        return session.final_prompt_zh or session.final_prompt or ""
+        return plan_copyable_prompt(session)
 
     def _build_plan_copyable_command_text(
         self,
@@ -1545,60 +1477,17 @@ class GPTImage2Plugin(Star):
     ) -> str:
         """Build a plain-text command for reusing a Plan final prompt."""
         self._dedupe_plan_reference_images(session)
-        prompt = self._single_line_command_prompt(self._plan_copyable_prompt(session))
-        reference_count = len(session.reference_data_urls)
-        if reference_count:
-            command = f"/image2 edit {prompt}"
-            if succeeded:
-                usage_note = (
-                    f"这条命令需要配合 {reference_count} 张参考图使用。"
-                    "之后如需在其他地方复现效果，请附带相同参考图，"
-                    "或引用包含参考图的消息发送下面这条命令。"
-                )
-            else:
-                usage_note = (
-                    f"这条命令需要配合 {reference_count} 张参考图使用。"
-                    "请先发送 /plan quit 退出当前 Plan 会话，"
-                    "然后附带参考图或引用包含参考图的消息发送下面这条命令。"
-                )
-        else:
-            command = f"/image2 draw {prompt}"
-            if succeeded:
-                usage_note = (
-                    "当前 Plan 会话没有参考图。之后可直接发送下面这条命令复现效果。"
-                )
-            else:
-                usage_note = (
-                    "当前 Plan 会话没有参考图。请先发送 /plan quit 退出当前 Plan 会话，"
-                    "然后直接发送下面这条命令。"
-                )
-
-        title = (
-            "Plan 生图成功，可复制到其他地方复用的命令："
-            if succeeded
-            else "Plan 最终生图失败时可复制的直接重试命令："
-        )
-        return f"{title}\n\n{usage_note}\n\n{command}"
+        return _build_plan_copyable_command_text_pure(session, succeeded=succeeded)
 
     def _build_plan_direct_retry_command_text(self, session: PlanSession) -> str:
         """Build a plain-text command for retrying outside Plan without re-planning."""
-        return self._build_plan_copyable_command_text(session, succeeded=False)
+        self._dedupe_plan_reference_images(session)
+        return _build_plan_direct_retry_command_text_pure(session)
 
     def _plan_copyable_command_forward_nodes(self, session: PlanSession) -> list[Node]:
         """Build merged-forward nodes for a long copyable command after success."""
-        text = self._build_plan_copyable_command_text(session, succeeded=True)
-        title, _, rest = text.partition("\n\n")
-        usage_note, _, command = rest.partition("\n\n")
-
-        nodes = [
-            self._forward_node(
-                "✅ Plan 生图成功：复用说明",
-                usage_note or "可复制后续节点中的命令，在其他地方复用相同提示词。",
-            )
-        ]
-        command_text = command or text
-        nodes.extend(self._prompt_text_nodes(title or "可复制命令", command_text))
-        return nodes
+        self._dedupe_plan_reference_images(session)
+        return _plan_copyable_command_forward_nodes_pure(session)
 
     async def _send_plan_copyable_success_command(
         self,
@@ -1625,36 +1514,13 @@ class GPTImage2Plugin(Star):
                 prefer_image=False,
             )
 
+    @staticmethod
     def _revised_prompt_forward_nodes(
-        self,
         results: list[ImageResult],
         *,
         action: str,
     ) -> list[Node]:
-        """Build merged-forward nodes for long revised prompts from image APIs."""
-        prompts = [
-            (index, item.revised_prompt.strip())
-            for index, item in enumerate(results, start=1)
-            if item.revised_prompt and item.revised_prompt.strip()
-        ]
-        if not prompts:
-            return []
-
-        nodes = [
-            self._forward_node(
-                "📝 生图提示词 / 模型改写提示词",
-                "图片会单独发送；这里收纳模型返回的 revised_prompt，"
-                "避免 draw/edit 成功消息被长提示词刷屏。",
-            )
-        ]
-        for index, prompt in prompts:
-            nodes.extend(
-                self._prompt_text_nodes(
-                    f"第 {index} 张图片 revised_prompt（{action}）",
-                    prompt,
-                )
-            )
-        return nodes
+        return _revised_prompt_forward_nodes_pure(results, action=action)
 
     async def _send_revised_prompt_forward(
         self,
@@ -1678,14 +1544,7 @@ class GPTImage2Plugin(Star):
                 "[GPTImage2] revised prompt merged forward failed "
                 f"action={action} error={type(e).__name__}: {e}"
             )
-            fallback = "\n\n".join(
-                f"第 {idx} 张图片 revised_prompt:\n{prompt}"
-                for idx, prompt in [
-                    (index, item.revised_prompt.strip())
-                    for index, item in enumerate(results, start=1)
-                    if item.revised_prompt and item.revised_prompt.strip()
-                ]
-            )
+            fallback = revised_prompt_fallback_text(results)
             if fallback:
                 await self._send_text(
                     event,
