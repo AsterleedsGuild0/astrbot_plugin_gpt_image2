@@ -24,8 +24,10 @@
 | `/image2 plan` | 进入 Plan 多轮图文会话，AI 辅助优化生图提示词 |
 | `/plan <描述>` | 在 Plan 会话中继续交流（群聊普通消息不会被拦截） |
 | `/plan confirm` | 在 Plan 会话中确认生成图片 |
+| `/plan retry` | 重试上一条失败的 Plan 输入 |
 | `/plan quit` | 退出当前 Plan 会话 |
 | `/image2 plan confirm` | 在 Plan 中确认生成图片 |
+| `/image2 plan retry` | 重试上一条失败的 Plan 输入 |
 | `/image2 plan quit` | 退出当前 Plan 会话（`cancel` 也可用） |
 | `/image2 mode [images\|responses]` | 查看或切换全局 API 模式（仅管理员） |
 | `/image2 guard [images\|responses\|all] [on\|off]` | 切换 Guard（仅管理员） |
@@ -55,6 +57,8 @@
   - 在准备好时只展示中文摘要/核对项，不在中间交互中刷出完整生成提示词。
   - 你可以发送 `/plan confirm` 或 `/image2 plan confirm` 确认生成图片，
     发送 `/plan quit` 或 `/image2 plan quit` 退出（`cancel` 也可用）。
+  - 如果 Plan 模型调用失败，可发送 `/plan retry` 或 `/image2 plan retry`
+    重试上一条 Plan 输入；失败的模型调用不会消耗最大对话轮数。
   - 确认后会用合并转发发送中文提示词和英文/混合提示词，再发送正在生成提示和最终图片结果。
   - 默认还会在成功后发送一条合并转发可复制命令；可通过 `send_copyable_prompt_after_success` 关闭。
 - Plan 模式支持独立 API Key/Base URL 配置（`plan_use_custom_api`），

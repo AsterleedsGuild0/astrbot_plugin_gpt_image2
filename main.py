@@ -5,6 +5,7 @@
   /image2 edit <prompt>  从消息/引用消息提取图片并编辑
   /image2 plan           进入 Plan 多轮会话，辅助优化生图提示词
   /image2 plan confirm   在 Plan 中确认生成图片
+  /image2 plan retry     重试上一条失败的 Plan 输入
   /image2 plan quit      退出 Plan 会话
   /image2 mode [模式]    查看/切换 API 模式（管理员）
   /image2 guard          查看/切换 Prompt Guard（管理员）
@@ -1926,6 +1927,34 @@ class GPTImage2Plugin(Star):
         session.timeout_task = None
 
     @staticmethod
+    def _has_plan_retry_snapshot(session: PlanSession) -> bool:
+        """Whether the Plan session has a failed model-call input to retry."""
+        return session.last_failed_input_text is not None
+
+    @staticmethod
+    def _store_plan_retry_snapshot(
+        session: PlanSession,
+        *,
+        text: str,
+        image_urls: list[str],
+        reached_max: bool,
+        round_count: int,
+    ) -> None:
+        """Remember the exact failed Plan input so the user can `/plan retry`."""
+        session.last_failed_input_text = text
+        session.last_failed_image_urls = list(image_urls)
+        session.last_failed_reached_max = reached_max
+        session.last_failed_round_count = round_count
+
+    @staticmethod
+    def _clear_plan_retry_snapshot(session: PlanSession) -> None:
+        """Clear any pending failed Plan input snapshot after a successful round."""
+        session.last_failed_input_text = None
+        session.last_failed_image_urls.clear()
+        session.last_failed_reached_max = False
+        session.last_failed_round_count = 0
+
+    @staticmethod
     def _waiter_timeout(timeout: int) -> int:
         """session_waiter 超时略晚于 watchdog，避免抢先吞掉主动通知。"""
         return timeout + GPTImage2Plugin.PLAN_WAITER_TIMEOUT_GRACE
@@ -3055,8 +3084,10 @@ class GPTImage2Plugin(Star):
             "- `/image2 plan` — 进入 Plan 多轮图文会话，辅助优化生图提示词\n"
             "  - `/plan <描述>` — 在 Plan 会话中继续交流（群聊普通消息不会被拦截）\n"
             "  - `/plan confirm` — 在 Plan 会话中确认生成\n"
+            "  - `/plan retry` — 重试上一条失败的 Plan 输入\n"
             "  - `/plan quit` — 退出当前 Plan 会话\n"
             "  - `/image2 plan confirm` — 在 Plan 中确认生成（自动带参考图）\n"
+            "  - `/image2 plan retry` — 重试上一条失败的 Plan 输入\n"
             "  - `/image2 plan quit` — 退出 Plan 会话（`cancel` 也可用）\n"
             "- `/image2 mode [模式]` — 查看/切换全局 API 模式（管理员）\n"
             "- `/image2 guard [images|responses|all] [on|off]` — "
@@ -4014,6 +4045,24 @@ class GPTImage2Plugin(Star):
                 )
             return
 
+        if action in {"retry", "resend", "again", "重试"}:
+            if self._has_active_plan_waiter(session_id):
+                return
+            if session_id in self._plan_sessions:
+                self._cleanup_plan(session_id)
+                yield await self._text_result(
+                    event,
+                    "## ⚠️ Plan 会话已失效\n\n请重新使用 `/image2 plan` 进入。",
+                    action="plan-retry-stale",
+                )
+            else:
+                yield await self._text_result(
+                    event,
+                    "## ⚠️ 没有进行中的 Plan 会话\n\n请先使用 `/image2 plan` 进入。",
+                    action="plan-retry-missing-external",
+                )
+            return
+
         if action in {"quit", "cancel"}:
             if self._has_active_plan_waiter(session_id):
                 return
@@ -4039,8 +4088,10 @@ class GPTImage2Plugin(Star):
                 "- `/image2 plan` — 进入 Plan\n"
                 "- `/plan <描述>` — 在 Plan 会话中继续交流\n"
                 "- `/plan confirm` — 确认生成\n"
+                "- `/plan retry` — 重试上一条失败的 Plan 输入\n"
                 "- `/plan quit` — 退出\n"
                 "- `/image2 plan confirm` — 确认生成\n"
+                "- `/image2 plan retry` — 重试上一条失败的 Plan 输入\n"
                 "- `/image2 plan quit` — 退出",
                 action="plan-invalid-action",
             )
@@ -4107,9 +4158,123 @@ class GPTImage2Plugin(Star):
             f"- 当前参考图：**{len(session.reference_data_urls)}** 张\n"
             f"- 空闲超时：**{plan_config.timeout}** 秒\n\n"
             "发送 `/plan confirm` 或 `/image2 plan confirm` 用当前提示词生成图片。\n"
+            "如果模型调用失败，可发送 `/plan retry` 重试上一条 Plan 输入。\n"
             "发送 `/plan quit` 或 `/image2 plan quit` 退出。",
             action="plan-enter",
         )
+
+        async def run_plan_model_round(
+            next_event: AstrMessageEvent,
+            controller: SessionController,
+            session: PlanSession,
+            *,
+            text: str,
+            image_urls_for_message: list[str],
+            next_round_count: int,
+            reached_max: bool,
+            retrying: bool = False,
+        ) -> None:
+            """Call the Plan model once and keep a retry snapshot on failure."""
+            messages = list(session.history)
+            if not messages:
+                messages.append({"role": "developer", "content": PLAN_SYSTEM_PROMPT})
+
+            user_message = {
+                "role": "user",
+                "content": self._build_plan_user_content(
+                    text,
+                    image_urls_for_message,
+                ),
+            }
+            messages.append(user_message)
+
+            if reached_max:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Please provide the final image generation prompt "
+                            "using [FINAL_PROMPT] format now."
+                        ),
+                    }
+                )
+
+            try:
+                reply = await plan_client.plan_responses(
+                    messages,
+                    model=plan_config.model,
+                )
+            except RuntimeError as e:
+                self._store_plan_retry_snapshot(
+                    session,
+                    text=text,
+                    image_urls=image_urls_for_message,
+                    reached_max=reached_max,
+                    round_count=next_round_count,
+                )
+                logger.warning(
+                    "[GPTImage2] plan Responses failed "
+                    f"{self._event_context(next_event)} round={next_round_count} "
+                    f"retrying={retrying} error={e}"
+                )
+                await self._send_text(
+                    next_event,
+                    f"## ⚠️ 模型调用失败\n\n`{e}`\n\n"
+                    "- 发送 `/plan retry` 重试上一条 Plan 输入\n"
+                    "- 或发送 `/plan <内容>` 继续补充\n"
+                    "- 或发送 `/plan quit` 退出",
+                    action="plan-model-error",
+                )
+                controller.keep(
+                    timeout=self._waiter_timeout(plan_config.timeout),
+                    reset_timeout=True,
+                )
+                self._reset_plan_timeout_watchdog(
+                    session_id,
+                    next_event.unified_msg_origin,
+                    plan_config.timeout,
+                )
+                return
+
+            final_prompt = parse_final_prompt(reply)
+            final_prompt_zh = parse_final_prompt_zh(reply)
+            session.history = messages + [{"role": "assistant", "content": reply}]
+            session.round_count = next_round_count
+            self._clear_plan_retry_snapshot(session)
+            if final_prompt:
+                session.final_prompt = final_prompt
+                session.final_prompt_zh = final_prompt_zh or final_prompt
+
+            # 构建展示文本：用户说明保持中文，最终 prompt 可中英混合，
+            # 需要出现在图中的文字应保留原文。
+            display = remove_final_prompt_section(reply)
+            if final_prompt:
+                summary = display or "我已根据你的描述和参考图整理好图像需求。"
+                display = (
+                    f"## ✅ 我已整理好图像需求\n\n"
+                    f"{summary}\n\n"
+                    "完整生成提示词已保存，确认生成时会以合并转发发送。\n"
+                    "发送 `/plan confirm` 生成图片，"
+                    "或 `/plan quit` 退出。"
+                )
+            elif reached_max:
+                display += (
+                    "\n\n**已达到最大对话轮数。**"
+                    "但模型还没有给出可确认的最终提示词。"
+                    "请使用 `/plan <补充信息>` 继续补充，"
+                    "或发送 `/plan quit` 退出。"
+                )
+
+            await self._send_text(next_event, display, action="plan-display")
+            controller.keep(
+                timeout=self._waiter_timeout(plan_config.timeout),
+                reset_timeout=True,
+            )
+            self._reset_plan_timeout_watchdog(
+                session_id,
+                next_event.unified_msg_origin,
+                plan_config.timeout,
+            )
 
         @session_waiter(
             timeout=self._waiter_timeout(plan_config.timeout),
@@ -4150,6 +4315,70 @@ class GPTImage2Plugin(Star):
                 )
                 self._cleanup_plan(session_id)
                 controller.stop()
+                return
+
+            # ── 重试上一条失败的 Plan 输入 ─────────────────────
+            if text_lower in {
+                "/image2 plan retry",
+                "image2 plan retry",
+                "/image2 plan resend",
+                "image2 plan resend",
+                "/image2 plan 重试",
+                "image2 plan 重试",
+            } or plan_input_lower in {"retry", "resend", "again", "重试"}:
+                session = self._plan_sessions.get(session_id)
+                if session is None:
+                    await self._send_text(
+                        next_event,
+                        "## ⚠️ Plan 会话已失效\n\n请重新使用 `/image2 plan` 进入。",
+                        action="plan-session-missing",
+                    )
+                    controller.stop()
+                    return
+
+                if not self._has_plan_retry_snapshot(session):
+                    await self._send_text(
+                        next_event,
+                        "## ⚠️ 没有可重试的 Plan 输入\n\n"
+                        "请使用 `/plan <图像需求>` 继续描述，"
+                        "或发送 `/plan quit` 退出。",
+                        action="plan-retry-missing",
+                    )
+                    controller.keep(
+                        timeout=self._waiter_timeout(plan_config.timeout),
+                        reset_timeout=True,
+                    )
+                    self._reset_plan_timeout_watchdog(
+                        session_id,
+                        next_event.unified_msg_origin,
+                        plan_config.timeout,
+                    )
+                    return
+
+                controller.keep(timeout=processing_timeout, reset_timeout=True)
+                self._reset_plan_timeout_watchdog(
+                    session_id,
+                    next_event.unified_msg_origin,
+                    processing_timeout,
+                )
+                await self._send_processing_ack(
+                    next_event,
+                    "✅ 正在重试上一条 Plan 输入，请稍候…",
+                    action="plan-retry-ack",
+                    prefer_image=False,
+                )
+                await run_plan_model_round(
+                    next_event,
+                    controller,
+                    session,
+                    text=session.last_failed_input_text or "",
+                    image_urls_for_message=list(session.last_failed_image_urls),
+                    next_round_count=(
+                        session.last_failed_round_count or session.round_count + 1
+                    ),
+                    reached_max=session.last_failed_reached_max,
+                    retrying=True,
+                )
                 return
 
             # ── 确认生成 ────────────────────────────────────
@@ -4260,6 +4489,7 @@ class GPTImage2Plugin(Star):
                     next_event,
                     "## ⚠️ 当前处于 Plan 会话中\n\n"
                     "请先使用 `/plan confirm` 或 `/image2 plan confirm` 生成图片\n"
+                    "或 `/plan retry` 重试上一条失败的 Plan 输入，"
                     "或 `/plan quit` 退出。",
                     action="plan-command-blocked",
                 )
@@ -4349,103 +4579,22 @@ class GPTImage2Plugin(Star):
                 prefer_image=False,
             )
 
-            session.round_count += 1
-
-            # 构造 Responses API input
-            messages = list(session.history)
-            if not messages:
-                messages.append({"role": "developer", "content": PLAN_SYSTEM_PROMPT})
-
             image_urls_for_message = new_reference_urls
             if not session.history and session.reference_data_urls:
                 image_urls_for_message = list(session.reference_data_urls)
 
-            user_message = {
-                "role": "user",
-                "content": self._build_plan_user_content(text, image_urls_for_message),
-            }
-            messages.append(user_message)
-
-            # 检查轮数上限
-            reached_max = session.round_count >= plan_config.max_rounds
-            if reached_max:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Please provide the final image generation prompt "
-                            "using [FINAL_PROMPT] format now."
-                        ),
-                    }
-                )
-
-            # 调用 Responses API 规划
-            try:
-                reply = await plan_client.plan_responses(
-                    messages,
-                    model=plan_config.model,
-                )
-            except RuntimeError as e:
-                logger.warning(
-                    "[GPTImage2] plan Responses failed "
-                    f"{self._event_context(next_event)} round={session.round_count} "
-                    f"error={e}"
-                )
-                await self._send_text(
-                    next_event,
-                    f"## ⚠️ 模型调用失败\n\n`{e}`\n\n"
-                    "请使用 `/plan <内容>` 重试，或发送 `/plan quit` 退出。",
-                    action="plan-model-error",
-                )
-                controller.keep(
-                    timeout=self._waiter_timeout(plan_config.timeout),
-                    reset_timeout=True,
-                )
-                self._reset_plan_timeout_watchdog(
-                    session_id,
-                    next_event.unified_msg_origin,
-                    plan_config.timeout,
-                )
-                return
-
-            # 解析 final prompt
-            final_prompt = parse_final_prompt(reply)
-            final_prompt_zh = parse_final_prompt_zh(reply)
-            session.history = messages + [{"role": "assistant", "content": reply}]
-            if final_prompt:
-                session.final_prompt = final_prompt
-                session.final_prompt_zh = final_prompt_zh or final_prompt
-
-            # 构建展示文本：用户说明保持中文，最终 prompt 可中英混合，
-            # 需要出现在图中的文字应保留原文。
-            display = remove_final_prompt_section(reply)
-            if final_prompt:
-                summary = display or "我已根据你的描述和参考图整理好图像需求。"
-                display = (
-                    f"## ✅ 我已整理好图像需求\n\n"
-                    f"{summary}\n\n"
-                    "完整生成提示词已保存，确认生成时会以合并转发发送。\n"
-                    "发送 `/plan confirm` 生成图片，"
-                    "或 `/plan quit` 退出。"
-                )
-            elif reached_max:
-                display += (
-                    "\n\n**已达到最大对话轮数。**"
-                    "但模型还没有给出可确认的最终提示词。"
-                    "请使用 `/plan <补充信息>` 继续补充，"
-                    "或发送 `/plan quit` 退出。"
-                )
-
-            await self._send_text(next_event, display, action="plan-display")
-            controller.keep(
-                timeout=self._waiter_timeout(plan_config.timeout),
-                reset_timeout=True,
+            next_round_count = session.round_count + 1
+            reached_max = next_round_count >= plan_config.max_rounds
+            await run_plan_model_round(
+                next_event,
+                controller,
+                session,
+                text=text,
+                image_urls_for_message=image_urls_for_message,
+                next_round_count=next_round_count,
+                reached_max=reached_max,
             )
-            self._reset_plan_timeout_watchdog(
-                session_id,
-                next_event.unified_msg_origin,
-                plan_config.timeout,
-            )
+            return
 
         try:
             await plan_waiter(event, session_filter=PlanSessionFilter())

@@ -22,6 +22,10 @@ class PlanSession:
     history: list[dict] = field(default_factory=list)
     reference_images: list = field(default_factory=list)
     reference_data_urls: list[str] = field(default_factory=list)
+    last_failed_input_text: Optional[str] = None
+    last_failed_image_urls: list[str] = field(default_factory=list)
+    last_failed_reached_max: bool = False
+    last_failed_round_count: int = 0
     timeout_task: asyncio.Task | None = None
     timeout_generation: int = 0
 
