@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from dataclasses import dataclass
 import hashlib
 import io
 import json
@@ -50,7 +49,7 @@ from astrbot.core.utils.session_waiter import (
 from PIL import Image as PILImage
 
 from .card_renderer import build_markdown_card
-from .client import GPTImageClient, ImageParams, ImageResult, ImageAPIError
+from .client import GPTImageClient, ImageParams, ImageResult
 from .config_redact import redact_config_value
 from .image_utils import (
     ensure_output_dir,
@@ -66,6 +65,36 @@ from .plan import (
     remove_final_prompt_section,
     parse_final_prompt,
     parse_final_prompt_zh,
+)
+from .providers import (
+    ImageAPIProviderConfig,
+    ProviderManager,
+    FAILURE_REASON_ORDER,
+    classify_failure_reason,
+    classify_http_status_code,
+    failure_reason_is_retryable,
+    should_try_next_image_provider,
+    is_image_input_unsupported,
+    normalize_api_mode,
+    normalize_provider_role,
+    normalize_bool,
+    build_provider_id,
+    parse_fallback_api_provider_string,
+    provider_stat_int,
+    provider_stat_float,
+    provider_health_score,
+    provider_error_summary,
+    provider_user_label,
+    safe_text_preview,
+    safe_markdown_preview,
+    format_duration,
+    prompt_rewrite_guard_config_key,
+    prompt_rewrite_guard_default,
+    prompt_rewrite_guard_status,
+    parse_bool_switch,
+    trim_jsonl,
+    read_recent_failure_records,
+    redact_provider_stats,
 )
 
 
@@ -144,42 +173,6 @@ class PlanSessionFilter(SessionFilter):
         return None
 
 
-@dataclass(frozen=True)
-class ImageAPIProviderConfig:
-    """Draw/edit API provider config. Plan mode keeps its own config path."""
-
-    name: str
-    api_key: str
-    base_url: str
-    model: str  # Images API 模型；空字符串 = 不支持 Images
-    responses_model: str  # Responses API 模型；空字符串 = 不支持 Responses
-    provider_id: str
-    configured_order: int
-    role: str = "normal"  # "primary" | "normal" | "authoritative_fallback"
-    adaptive: bool = True
-
-    @property
-    def images_supported(self) -> bool:
-        return bool(self.model)
-
-    @property
-    def responses_supported(self) -> bool:
-        return bool(self.responses_model)
-
-    def supports_mode(self, mode: str) -> bool:
-        if mode == "images":
-            return self.images_supported
-        if mode == "responses":
-            return self.responses_supported
-        return False
-
-    def model_for_mode(self, mode: str) -> str:
-        """返回该模式下应使用的模型名，调用方保证 mode 已通过 supports_mode 检查。"""
-        if mode == "images":
-            return self.model
-        return self.responses_model
-
-
 @register(
     "gpt_image2",
     "233",
@@ -195,9 +188,15 @@ class GPTImage2Plugin(Star):
         self.plugin_name = "astrbot_plugin_gpt_image2"
         self._output_dir: str | None = None
         self._text_image_dir: str | None = None
-        self._provider_stats_cache: dict | None = None
-        self._provider_retry_notice_state: dict[str, dict[str, object]] = {}
         self._plan_sessions: dict[str, PlanSession] = {}
+        self._provider_manager = ProviderManager(
+            config,
+            lambda: str(getattr(self, "name", self.plugin_name)),
+        )
+        # Retry notice throttling state (shared ref; also accessible via manager)
+        self._provider_retry_notice_state = (
+            self._provider_manager._provider_retry_notice_state
+        )
 
     # ── 工具方法 ────────────────────────────────────────────────
 
@@ -596,23 +595,16 @@ class GPTImage2Plugin(Star):
         if not data:
             return "-"
         text = data[:limit].decode("utf-8", errors="replace")
-        return GPTImage2Plugin._safe_text_preview(text, limit=limit)
+        return safe_text_preview(text, limit=limit)
 
     @staticmethod
     def _safe_text_preview(text: str, *, limit: int = 160) -> str:
-        normalized = " ".join(text.replace("\x00", "�").split())
-        if len(normalized) > limit:
-            normalized = normalized[:limit] + "…"
-        return repr(normalized)
+        return safe_text_preview(text, limit=limit)
 
     @staticmethod
     def _safe_markdown_preview(text: str, *, limit: int = 160) -> str:
         """Compact provider errors for Markdown cards without inline-code breakage."""
-        normalized = " ".join(str(text).replace("\x00", "�").split())
-        normalized = normalized.replace("`", "'")
-        if len(normalized) > limit:
-            normalized = normalized[:limit].rstrip() + "…"
-        return normalized or "-"
+        return safe_markdown_preview(text, limit=limit)
 
     @staticmethod
     def _task_tag(event: AstrMessageEvent) -> str:
@@ -782,171 +774,13 @@ class GPTImage2Plugin(Star):
         )
 
     def _get_image_api_provider_configs(self) -> list[ImageAPIProviderConfig]:
-        """Build ordered draw/edit provider list: primary + normal backups + authoritative."""
-        configs: list[ImageAPIProviderConfig] = []
-        base_url = str(self.config.get("base_url", "https://api.openai.com/v1") or "")
-        api_key = str(self.config.get("api_key", "") or "")
-        model = str(self.config.get("model", "gpt-image-2") or "gpt-image-2")
-        responses_model = str(
-            self.config.get("responses_model", "gpt-5.5") or "gpt-5.5"
-        )
-        primary_name = (
-            str(self.config.get("primary_provider_name", "") or "").strip() or "primary"
-        )
-
-        if api_key.strip():
-            configs.append(
-                ImageAPIProviderConfig(
-                    name=primary_name,
-                    api_key=api_key.strip(),
-                    base_url=base_url.strip() or "https://api.openai.com/v1",
-                    model=model.strip() or "gpt-image-2",
-                    responses_model=responses_model.strip() or "gpt-5.5",
-                    provider_id="name:primary",
-                    configured_order=0,
-                    role="primary",
-                    adaptive=False,
-                )
-            )
-
-        # Build authoritative fallback from dedicated config section
-        auth_enabled = self._normalize_bool(
-            self.config.get("authoritative_fallback_enabled"), default=False
-        )
-        auth_provider: ImageAPIProviderConfig | None = None
-        if auth_enabled:
-            auth_name = (
-                str(self.config.get("authoritative_fallback_name", "") or "").strip()
-                or "authoritative-fallback"
-            )
-            auth_base_url = (
-                str(
-                    self.config.get("authoritative_fallback_base_url", "") or ""
-                ).strip()
-                or base_url.strip()
-            )
-            auth_api_key = (
-                str(self.config.get("authoritative_fallback_api_key", "") or "").strip()
-                or api_key.strip()
-            )
-            auth_model = str(
-                self.config.get("authoritative_fallback_images_model", "") or ""
-            ).strip()
-            auth_responses_model = str(
-                self.config.get("authoritative_fallback_responses_model", "") or ""
-            ).strip()
-
-            if auth_api_key and auth_base_url:
-                if not auth_model and not auth_responses_model:
-                    logger.warning(
-                        "[GPTImage2] authoritative_fallback enabled but both "
-                        "images model and responses model are empty; skipped"
-                    )
-                else:
-                    auth_provider = ImageAPIProviderConfig(
-                        name=auth_name,
-                        api_key=auth_api_key,
-                        base_url=auth_base_url,
-                        model=auth_model,
-                        responses_model=auth_responses_model,
-                        provider_id=self._build_provider_id(
-                            auth_name,
-                            auth_base_url,
-                            auth_model,
-                            auth_responses_model,
-                        ),
-                        configured_order=9999,
-                        role="authoritative_fallback",
-                        adaptive=False,
-                    )
-            else:
-                logger.warning(
-                    "[GPTImage2] authoritative_fallback_enabled but missing "
-                    "api_key or base_url, skipped"
-                )
-
-        # Parse fallback_api_providers
-        for index, item in enumerate(self._get_fallback_api_provider_items(), start=1):
-            provider = self._parse_fallback_api_provider(
-                item,
-                index=index,
-                default_api_key=api_key,
-                default_base_url=base_url,
-                default_model=model,
-                default_responses_model=responses_model,
-            )
-            if provider is not None:
-                # Check for legacy authoritative_fallback in the list
-                if provider.role == "authoritative_fallback":
-                    if auth_provider is not None:
-                        logger.warning(
-                            "[GPTImage2] ignoring authoritative_fallback from "
-                            f"fallback_api_providers name={provider.name} "
-                            "because dedicated authoritative_fallback config is enabled"
-                        )
-                        continue
-                    auth_provider = provider
-                    continue
-                configs.append(provider)
-
-        if auth_provider is not None:
-            configs.append(auth_provider)
-
-        if not configs:
-            raise ValueError(
-                "未配置任何可用的生图 API Key。请配置 api_key，"
-                "或在 fallback_api_providers 中配置 api_key。"
-            )
-        return self._rank_image_api_provider_configs(configs)
+        return self._provider_manager.get_image_api_provider_configs()
 
     def _get_fallback_api_provider_items(self) -> list:
-        value = self.config.get("fallback_api_providers", [])
-        if value is None or value == "":
-            return []
-        if isinstance(value, list):
-            return value
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"[GPTImage2] fallback_api_providers JSON parse failed error={e}"
-                )
-                return []
-            return parsed if isinstance(parsed, list) else []
-        logger.warning(
-            "[GPTImage2] fallback_api_providers ignored invalid type "
-            f"type={type(value).__name__}"
-        )
-        return []
+        return self._provider_manager.get_fallback_api_provider_items()
 
     def _resolve_fallback_capabilities(self, data: dict) -> str:
-        """Resolve capabilities from explicit field or legacy api_mode.
-
-        Returns "images", "responses", or "all".
-        """
-        raw = str(data.get("capabilities") or "").strip().lower()
-        if raw in {"images", "responses"}:
-            return raw
-        if raw in {"all", "both"}:
-            return "all"
-        if not raw:
-            api_mode = str(data.get("api_mode") or "").strip().lower()
-            if api_mode == "images":
-                logger.info(
-                    "[GPTImage2] auto-inferred capabilities=images from legacy "
-                    f"api_mode for provider {data.get('name', '-')}; "
-                    "consider using capabilities=images"
-                )
-                return "images"
-            if api_mode == "responses":
-                logger.info(
-                    "[GPTImage2] auto-inferred capabilities=responses from legacy "
-                    f"api_mode for provider {data.get('name', '-')}; "
-                    "consider using capabilities=responses"
-                )
-                return "responses"
-        return "all"
+        return self._provider_manager.resolve_fallback_capabilities(data)
 
     def _parse_fallback_api_provider(
         self,
@@ -958,164 +792,45 @@ class GPTImage2Plugin(Star):
         default_model: str,
         default_responses_model: str,
     ) -> ImageAPIProviderConfig | None:
-        """Parse one fallback provider from WebUI list string or legacy dict."""
-        if isinstance(item, dict):
-            data = dict(item)
-        elif isinstance(item, str):
-            data = self._parse_fallback_api_provider_string(item)
-        else:
-            logger.warning(
-                "[GPTImage2] skip invalid fallback API provider "
-                f"index={index} type={type(item).__name__}"
-            )
-            return None
-
-        if not data:
-            return None
-
-        explicit_name = str(data.get("name") or "").strip()
-        provider_name = explicit_name or f"fallback-{index}"
-        provider_base_url = str(data.get("base_url") or default_base_url).strip()
-        provider_api_key = str(data.get("api_key") or default_api_key).strip()
-        provider_role = self._normalize_provider_role(data.get("role") or "normal")
-        provider_adaptive = self._normalize_bool(
-            data.get("adaptive"), default=provider_role != "authoritative_fallback"
-        )
-
-        # Capabilities resolution
-        capabilities = self._resolve_fallback_capabilities(data)
-        if capabilities == "images":
-            provider_model = str(data.get("model") or default_model).strip()
-            provider_responses_model = ""
-        elif capabilities == "responses":
-            provider_model = ""
-            provider_responses_model = str(
-                data.get("responses_model") or default_responses_model
-            ).strip()
-        else:  # "all"
-            provider_model = str(data.get("model") or default_model).strip()
-            provider_responses_model = str(
-                data.get("responses_model") or default_responses_model
-            ).strip()
-
-        if not provider_base_url:
-            logger.warning(
-                "[GPTImage2] skip fallback API provider without base_url "
-                f"index={index} name={provider_name or '-'}"
-            )
-            return None
-        if not provider_api_key:
-            logger.warning(
-                "[GPTImage2] skip fallback API provider without api_key "
-                f"index={index} name={provider_name or '-'}"
-            )
-            return None
-        if not provider_model and not provider_responses_model:
-            logger.warning(
-                "[GPTImage2] skip fallback API provider with no supported "
-                f"capabilities index={index} name={provider_name or '-'}"
-            )
-            return None
-
-        return ImageAPIProviderConfig(
-            name=provider_name or f"fallback-{index}",
-            api_key=provider_api_key,
-            base_url=provider_base_url or "https://api.openai.com/v1",
-            model=provider_model,
-            responses_model=provider_responses_model,
-            provider_id=self._build_provider_id(
-                explicit_name,
-                provider_base_url,
-                provider_model,
-                provider_responses_model,
-            ),
-            configured_order=index,
-            role=provider_role,
-            adaptive=provider_adaptive,
+        return self._provider_manager.parse_fallback_api_provider(
+            item,
+            index=index,
+            default_api_key=default_api_key,
+            default_base_url=default_base_url,
+            default_model=default_model,
+            default_responses_model=default_responses_model,
         )
 
     @staticmethod
     def _normalize_api_mode(value: object) -> str:
-        mode = str(value or "images").strip().lower()
-        return mode if mode in {"images", "responses"} else "images"
+        return normalize_api_mode(value)
 
     @staticmethod
     def _normalize_provider_role(value: object) -> str:
-        role = str(value or "normal").strip().lower().replace("-", "_")
-        aliases = {
-            "official": "authoritative_fallback",
-            "official_fallback": "authoritative_fallback",
-            "authoritative": "authoritative_fallback",
-            "authority": "authoritative_fallback",
-            "authority_fallback": "authoritative_fallback",
-            "fallback_authoritative": "authoritative_fallback",
-        }
-        role = aliases.get(role, role)
-        return role if role in {"normal", "authoritative_fallback"} else "normal"
+        return normalize_provider_role(value)
 
     @staticmethod
     def _normalize_bool(value: object, *, default: bool) -> bool:
-        if value is None or value == "":
-            return default
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        return str(value).strip().lower() not in {"0", "false", "no", "off"}
+        return normalize_bool(value, default=default)
 
     @staticmethod
     def _prompt_rewrite_guard_config_key(api_mode: str) -> str:
-        return (
-            "responses_prompt_rewrite_guard"
-            if api_mode == "responses"
-            else "images_prompt_rewrite_guard"
-        )
+        return prompt_rewrite_guard_config_key(api_mode)
 
     @staticmethod
     def _prompt_rewrite_guard_default(api_mode: str) -> bool:
-        return api_mode == "responses"
+        return prompt_rewrite_guard_default(api_mode)
 
     def _prompt_rewrite_guard_enabled(self, api_mode: str) -> bool:
-        key = self._prompt_rewrite_guard_config_key(api_mode)
-        return self._normalize_bool(
-            self.config.get(key),
-            default=self._prompt_rewrite_guard_default(api_mode),
-        )
+        return self._provider_manager.prompt_rewrite_guard_enabled(api_mode)
 
-    @classmethod
-    def _prompt_rewrite_guard_status(cls, enabled: bool) -> str:
-        return "✅ 开启" if enabled else "关闭"
+    @staticmethod
+    def _prompt_rewrite_guard_status(enabled: bool) -> str:
+        return prompt_rewrite_guard_status(enabled)
 
     @staticmethod
     def _parse_bool_switch(value: object) -> bool | None:
-        text = str(value or "").strip().lower()
-        if text in {
-            "1",
-            "true",
-            "yes",
-            "y",
-            "on",
-            "enable",
-            "enabled",
-            "开启",
-            "开",
-            "启用",
-        }:
-            return True
-        if text in {
-            "0",
-            "false",
-            "no",
-            "n",
-            "off",
-            "disable",
-            "disabled",
-            "关闭",
-            "关",
-            "禁用",
-        }:
-            return False
-        return None
+        return parse_bool_switch(value)
 
     @staticmethod
     def _build_provider_id(
@@ -1124,23 +839,10 @@ class GPTImage2Plugin(Star):
         model: str,
         responses_model: str,
     ) -> str:
-        if name.strip():
-            return f"name:{name.strip().lower()}"
-        source = "|".join(
-            [
-                base_url.strip().rstrip("/"),
-                model.strip(),
-                responses_model.strip(),
-            ]
-        )
-        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
-        return f"config:{digest}"
+        return build_provider_id(name, base_url, model, responses_model)
 
     def _adaptive_provider_priority_enabled(self) -> bool:
-        value = self.config.get("adaptive_provider_priority", True)
-        if isinstance(value, str):
-            return value.strip().lower() not in {"0", "false", "no", "off"}
-        return bool(value)
+        return self._provider_manager.adaptive_provider_priority_enabled()
 
     def _send_copyable_prompt_after_success_enabled(self) -> bool:
         return self._normalize_bool(
@@ -1149,43 +851,18 @@ class GPTImage2Plugin(Star):
         )
 
     def _provider_retry_notice_global_enabled(self) -> bool:
-        return self._normalize_bool(
-            self.config.get("provider_retry_notice_enabled"),
-            default=True,
-        )
+        return self._provider_manager.provider_retry_notice_global_enabled()
 
     def _provider_retry_notice_session_config(self) -> dict[str, bool]:
-        value = self.config.get("provider_retry_notice_sessions", {})
-        if isinstance(value, dict):
-            items = value.items()
-        elif isinstance(value, str) and value.strip():
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError:
-                parsed = {}
-            items = parsed.items() if isinstance(parsed, dict) else []
-        else:
-            items = []
-
-        result: dict[str, bool] = {}
-        for key, raw in items:
-            session_key = str(key or "").strip()
-            if not session_key:
-                continue
-            result[session_key] = self._normalize_bool(raw, default=True)
-        return result
+        return self._provider_manager.provider_retry_notice_session_config()
 
     def _set_provider_retry_notice_session_enabled(
         self,
         session_key: str,
         enabled: bool,
     ) -> None:
-        sessions = self._provider_retry_notice_session_config()
-        sessions[session_key] = enabled
-        self.config["provider_retry_notice_sessions"] = json.dumps(
-            sessions,
-            ensure_ascii=False,
-            sort_keys=True,
+        self._provider_manager.set_provider_retry_notice_session_enabled(
+            session_key, enabled
         )
 
     def _provider_retry_notice_session_key(self, event: AstrMessageEvent) -> str:
@@ -1203,21 +880,11 @@ class GPTImage2Plugin(Star):
         )
 
     def _provider_retry_notice_interval(self) -> int:
-        try:
-            return max(0, int(self.config.get("provider_retry_notice_interval", 300)))
-        except (TypeError, ValueError):
-            return 300
+        return self._provider_manager.provider_retry_notice_interval()
 
     @staticmethod
     def _format_duration(seconds: int) -> str:
-        seconds = max(0, int(seconds))
-        if seconds < 60:
-            return f"{seconds}s"
-        minutes, rest = divmod(seconds, 60)
-        if minutes < 60:
-            return f"{minutes}m" if rest == 0 else f"{minutes}m{rest}s"
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}h" if minutes == 0 else f"{hours}h{minutes}m"
+        return format_duration(seconds)
 
     def _provider_retry_notice_status_text(self, event: AstrMessageEvent) -> str:
         global_enabled = self._provider_retry_notice_global_enabled()
@@ -1240,28 +907,13 @@ class GPTImage2Plugin(Star):
         )
 
     def _provider_failure_cooldown(self) -> int:
-        try:
-            return max(0, int(self.config.get("provider_failure_cooldown", 300)))
-        except (TypeError, ValueError):
-            return 300
+        return self._provider_manager.provider_failure_cooldown()
 
     def _provider_stats_path(self) -> Path:
-        plugin_name = getattr(self, "name", self.plugin_name)
-        return (
-            Path(get_astrbot_data_path())
-            / "plugin_data"
-            / plugin_name
-            / "provider_stats.json"
-        )
+        return self._provider_manager.provider_stats_path()
 
     def _provider_failures_jsonl_path(self) -> Path:
-        plugin_name = getattr(self, "name", self.plugin_name)
-        return (
-            Path(get_astrbot_data_path())
-            / "plugin_data"
-            / plugin_name
-            / "provider_failures.jsonl"
-        )
+        return self._provider_manager.provider_failures_jsonl_path()
 
     def _append_provider_failure_record(
         self,
@@ -1274,229 +926,49 @@ class GPTImage2Plugin(Star):
         elapsed_ms: int | None = None,
         error: BaseException | None = None,
     ) -> None:
-        """Append a sanitized failure record to provider_failures.jsonl.
-
-        When ``error`` is an :class:`ImageAPIError` with ``diagnostics``,
-        HTTP response metadata (``status_code``, ``response_content_type``,
-        ``request_ids``, ``response_preview``, ``elapsed_ms``) are written
-        to the record.
-
-        Never stores: user prompt, image data, API key, or request bodies.
-        """
-        from urllib.parse import urlparse
-
-        reason_key = self._classify_failure_reason(error_msg)
-
-        # Sanitize base_url: host + path only, no query, no API key
-        try:
-            parsed = urlparse(provider.base_url)
-            url_host: str = parsed.hostname or "-"
-            url_path: str = parsed.path or "-"
-        except Exception:
-            url_host = "-"
-            url_path = "-"
-
-        record: dict[str, object] = {
-            "timestamp": time(),
-            "provider_id": provider.provider_id,
-            "provider_name": provider.name,
-            "base_url_host": url_host,
-            "base_url_path": url_path,
-            "role": provider.role,
-            "action": action,
-            "attempt_index": attempt_index,
-            "attempt_total": attempt_total,
-            "reason_key": reason_key,
-            "message_preview": self._safe_text_preview(error_msg, limit=240),
-            "retryable": self._should_try_next_image_provider(error_msg),
-        }
-
-        # Extract structured diagnostics from ImageAPIError if available
-        if (
-            error is not None
-            and isinstance(error, ImageAPIError)
-            and error.diagnostics is not None
-        ):
-            diag = error.diagnostics
-            record["error_class"] = "ImageAPIError"
-            record["status_code"] = diag.status_code
-            record["response_content_type"] = diag.response_content_type
-            record["request_ids"] = diag.request_ids
-            record["response_preview"] = diag.response_preview
-            record["response_preview_truncated"] = diag.response_preview_truncated
-            record["response_bytes"] = diag.response_bytes
-            record["elapsed_ms"] = diag.elapsed_ms
-        else:
-            record["error_class"] = "RuntimeError"
-            parsed_code = self._classify_http_status_code(error_msg)
-            if parsed_code is not None:
-                record["status_code"] = parsed_code
-            if elapsed_ms is not None:
-                record["elapsed_ms"] = elapsed_ms
-
-        path = self._provider_failures_jsonl_path()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            # Trim to last ~5000 lines to avoid unbounded growth
-            self._trim_jsonl(path, max_lines=5000)
-        except Exception as e:
-            logger.warning(
-                "[GPTImage2] failed to append provider failure record "
-                f"error={type(e).__name__}: {e}"
-            )
+        """Append a sanitized failure record to provider_failures.jsonl."""
+        self._provider_manager.append_provider_failure_record(
+            provider,
+            error_msg=error_msg,
+            action=action,
+            attempt_index=attempt_index,
+            attempt_total=attempt_total,
+            elapsed_ms=elapsed_ms,
+            error=error,
+        )
 
     @staticmethod
     def _trim_jsonl(path: Path, max_lines: int = 5000) -> None:
-        """Trim JSONL file to keep only the last max_lines entries."""
-        try:
-            if not path.exists() or path.stat().st_size < 1024 * 100:
-                return
-            lines = path.read_text(encoding="utf-8").splitlines()
-            if len(lines) <= max_lines:
-                return
-            with path.open("w", encoding="utf-8") as f:
-                f.write("\n".join(lines[-max_lines:]) + "\n")
-        except Exception as e:
-            logger.debug(
-                f"[GPTImage2] jsonl trim skipped error={type(e).__name__}: {e}"
-            )
+        trim_jsonl(path, max_lines=max_lines)
 
     def _load_provider_stats(self) -> dict:
-        if self._provider_stats_cache is not None:
-            return self._provider_stats_cache
-
-        path = self._provider_stats_path()
-        if not path.exists():
-            self._provider_stats_cache = {"version": 1, "providers": {}}
-            return self._provider_stats_cache
-
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.warning(
-                "[GPTImage2] provider stats load failed "
-                f"path={path} error={type(e).__name__}: {e}"
-            )
-            data = {"version": 1, "providers": {}}
-
-        if not isinstance(data, dict):
-            data = {"version": 1, "providers": {}}
-        if not isinstance(data.get("providers"), dict):
-            data["providers"] = {}
-        data.setdefault("version", 1)
-        self._provider_stats_cache = data
-        return data
+        return self._provider_manager.load_provider_stats()
 
     def _save_provider_stats(self) -> None:
-        if self._provider_stats_cache is None:
-            return
-        path = self._provider_stats_path()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(self._provider_stats_cache, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as e:
-            logger.warning(
-                "[GPTImage2] provider stats save failed "
-                f"path={path} error={type(e).__name__}: {e}"
-            )
+        self._provider_manager.save_provider_stats()
 
     @staticmethod
     def _provider_stat_int(item: dict, key: str) -> int:
-        try:
-            return int(item.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0
+        return provider_stat_int(item, key)
 
     @staticmethod
     def _provider_stat_float(item: dict, key: str) -> float:
-        try:
-            return float(item.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
+        return provider_stat_float(item, key)
 
     def _provider_health_score(self, item: dict, now: float) -> float:
-        success_count = self._provider_stat_int(item, "success_count")
-        failure_count = self._provider_stat_int(item, "failure_count")
-        consecutive_failures = self._provider_stat_int(item, "consecutive_failures")
-        last_success_at = self._provider_stat_float(item, "last_success_at")
-        last_failure_at = self._provider_stat_float(item, "last_failure_at")
-        cooldown_until = self._provider_stat_float(item, "cooldown_until")
-
-        score = min(success_count, 20) * 2.0
-        score -= min(failure_count, 20) * 1.5
-        score -= min(consecutive_failures, 10) * 8.0
-
-        if last_success_at > 0:
-            success_age = max(0.0, now - last_success_at)
-            score += max(0.0, 50.0 * (1.0 - success_age / 3600.0))
-        if last_failure_at > 0:
-            failure_age = max(0.0, now - last_failure_at)
-            score -= max(0.0, 20.0 * (1.0 - failure_age / 900.0))
-        if cooldown_until > now:
-            score -= 100.0
-        return score
+        return provider_health_score(item, now)
 
     def _adaptive_sort_normal_providers(
         self,
         normal: list[ImageAPIProviderConfig],
     ) -> list[ImageAPIProviderConfig]:
-        """Sort normal backups by health score (adaptive) then configured_order."""
-        if len(normal) <= 1:
-            return normal
-
-        adaptive_enabled = self._adaptive_provider_priority_enabled()
-        stats = self._load_provider_stats().get("providers", {})
-        now = time()
-
-        ranked: list[tuple[bool, float, int, ImageAPIProviderConfig]] = []
-        for provider in normal:
-            item = stats.get(provider.provider_id, {})
-            item = item if isinstance(item, dict) else {}
-            cooldown_until = self._provider_stat_float(item, "cooldown_until")
-            adaptive_for_provider = adaptive_enabled and provider.adaptive
-            cooldown_active = adaptive_for_provider and cooldown_until > now
-            score = (
-                self._provider_health_score(item, now) if adaptive_for_provider else 0.0
-            )
-            ranked.append(
-                (
-                    cooldown_active,
-                    -score,
-                    provider.configured_order,
-                    provider,
-                )
-            )
-
-        ranked.sort(key=lambda x: (x[0], x[1], x[2]))
-        return [item[3] for item in ranked]
+        return self._provider_manager.adaptive_sort_normal_providers(normal)
 
     def _rank_image_api_provider_configs(
         self,
         configs: list[ImageAPIProviderConfig],
     ) -> list[ImageAPIProviderConfig]:
-        """Three-segment sort: primary first, normal sorted, authoritative last."""
-        if len(configs) <= 1:
-            return configs
-
-        primary = [c for c in configs if c.role == "primary"]
-        authoritative = [c for c in configs if c.role == "authoritative_fallback"]
-        normal = [c for c in configs if c.role == "normal"]
-
-        # Only normal backups participate in adaptive sorting
-        normal = self._adaptive_sort_normal_providers(normal)
-
-        result = primary + normal + authoritative
-        if [p.provider_id for p in result] != [p.provider_id for p in configs]:
-            logger.info(
-                "[GPTImage2] provider priority reordered "
-                f"order={[p.name for p in result]}"
-            )
-        return result
+        return self._provider_manager.rank_image_api_provider_configs(configs)
 
     def _record_image_provider_result(
         self,
@@ -1505,173 +977,16 @@ class GPTImage2Plugin(Star):
         success: bool,
         error_msg: str = "",
     ) -> None:
-        if not self._adaptive_provider_priority_enabled():
-            return
-
-        stats = self._load_provider_stats()
-        providers = stats.setdefault("providers", {})
-        if not isinstance(providers, dict):
-            providers = {}
-            stats["providers"] = providers
-
-        item = providers.get(provider.provider_id)
-        if not isinstance(item, dict):
-            item = {}
-            providers[provider.provider_id] = item
-
-        now = time()
-        item.update(
-            {
-                "name": provider.name,
-                "base_url": provider.base_url,
-                "api_mode": self.config.get("api_mode", "images"),  # legacy
-                "model": provider.model,
-                "responses_model": provider.responses_model,
-                "images_model": provider.model,
-                "configured_order": provider.configured_order,
-                "role": provider.role,
-                "adaptive": provider.adaptive,
-                "updated_at": now,
-            }
+        self._provider_manager.record_image_provider_result(
+            provider, success=success, error_msg=error_msg
         )
 
-        if success:
-            item["success_count"] = self._provider_stat_int(item, "success_count") + 1
-            item["consecutive_failures"] = 0
-            item["last_success_at"] = now
-            item["cooldown_until"] = 0
-            item.pop("last_error", None)
-        else:
-            item["failure_count"] = self._provider_stat_int(item, "failure_count") + 1
-            item["consecutive_failures"] = (
-                self._provider_stat_int(item, "consecutive_failures") + 1
-            )
-            item["last_failure_at"] = now
-            item["cooldown_until"] = now + self._provider_failure_cooldown()
-            item["last_error"] = self._safe_markdown_preview(error_msg, limit=240)
-
-            # v2: failure reason classification
-            reason_key = self._classify_failure_reason(error_msg)
-            reasons = item.setdefault("failure_reasons", {})
-            if not isinstance(reasons, dict):
-                reasons = {}
-                item["failure_reasons"] = reasons
-            reasons[reason_key] = reasons.get(reason_key, 0) + 1
-
-            # v2: failure status code counts
-            status_code = self._classify_http_status_code(error_msg)
-            if status_code is not None:
-                code_str = str(status_code)
-                codes = item.setdefault("failure_status_codes", {})
-                if not isinstance(codes, dict):
-                    codes = {}
-                    item["failure_status_codes"] = codes
-                codes[code_str] = codes.get(code_str, 0) + 1
-
-        # Update aggregate summary
-        self._update_provider_stats_summary()
-        self._save_provider_stats()
-
     def _update_provider_stats_summary(self) -> None:
-        """Recalculate top-level aggregate summary from per-provider stats."""
-        stats = self._load_provider_stats()
-        providers = stats.get("providers", {})
-        if not isinstance(providers, dict):
-            return
-
-        total_success = 0
-        total_failure = 0
-        all_reasons: dict[str, int] = {}
-        all_codes: dict[str, int] = {}
-
-        for item in providers.values():
-            if not isinstance(item, dict):
-                continue
-            total_success += self._provider_stat_int(item, "success_count")
-            total_failure += self._provider_stat_int(item, "failure_count")
-
-            reasons = item.get("failure_reasons", {})
-            if isinstance(reasons, dict):
-                for key, count in reasons.items():
-                    all_reasons[key] = all_reasons.get(key, 0) + count
-
-            codes = item.get("failure_status_codes", {})
-            if isinstance(codes, dict):
-                for code, count in codes.items():
-                    all_codes[code] = all_codes.get(code, 0) + count
-
-        total = total_success + total_failure
-        success_rate = round(total_success / total, 4) if total > 0 else 0.0
-
-        # Sort by count descending
-        sorted_reasons = dict(sorted(all_reasons.items(), key=lambda x: -x[1]))
-        sorted_codes = dict(sorted(all_codes.items(), key=lambda x: -x[1]))
-
-        stats["summary"] = {
-            "success_count": total_success,
-            "failure_count": total_failure,
-            "success_rate": success_rate,
-            "failure_reasons": sorted_reasons,
-            "failure_status_codes": sorted_codes,
-            "updated_at": time(),
-        }
-        stats["version"] = 2
+        self._provider_manager.update_provider_stats_summary()
 
     @staticmethod
     def _parse_fallback_api_provider_string(value: str) -> dict[str, str]:
-        text = value.strip()
-        if not text:
-            return {}
-
-        if text.startswith("{"):
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    "[GPTImage2] fallback API provider JSON item parse failed "
-                    f"error={e}"
-                )
-                return {}
-            return parsed if isinstance(parsed, dict) else {}
-
-        if "=" not in text:
-            return {"base_url": text}
-
-        data: dict[str, str] = {}
-        for chunk in text.replace(";", ",").split(","):
-            if "=" not in chunk:
-                continue
-            key, raw = chunk.split("=", 1)
-            key = key.strip().lower().replace("-", "_")
-            raw = raw.strip()
-            if key in {"url", "base", "baseurl", "base_url"}:
-                key = "base_url"
-            elif key in {"key", "apikey", "api_key"}:
-                key = "api_key"
-            elif key in {"responses", "responses_model", "response_model"}:
-                key = "responses_model"
-            elif key in {"api", "api_mode", "apimode"}:
-                key = "api_mode"
-            elif key in {"role", "provider_role"}:
-                key = "role"
-            elif key in {"adaptive", "adapt", "adaptive_priority"}:
-                key = "adaptive"
-            elif key in {"cap", "capabilities", "capability"}:
-                key = "capabilities"
-            elif key not in {
-                "name",
-                "base_url",
-                "api_key",
-                "api_mode",
-                "role",
-                "adaptive",
-                "model",
-                "responses_model",
-                "capabilities",
-            }:
-                continue
-            data[key] = raw
-        return data
+        return parse_fallback_api_provider_string(value)
 
     def _get_params(self) -> ImageParams:
         """从配置创建参数模型"""
@@ -2457,188 +1772,38 @@ class GPTImage2Plugin(Star):
 
     @staticmethod
     def _is_image_input_unsupported(error_msg: str) -> bool:
-        """判断错误是否表示模型不支持图片输入。"""
-        lower = error_msg.lower()
-        return (
-            "does not support image input" in lower
-            or "does not support image" in lower
-            or ("cannot read" in lower and "image" in lower)
-            or "image input is not supported" in lower
-            or ("model does not support" in lower and "image" in lower)
-        )
+        return is_image_input_unsupported(error_msg)
 
     # ── Failure classification ──────────────────────────────────
 
-    FAILURE_REASON_ORDER = [
-        "network_timeout",
-        "network_connect",
-        "network_proxy",
-        "network_protocol",
-        "http_400",
-        "http_401",
-        "http_403",
-        "http_404",
-        "http_413",
-        "http_422",
-        "http_429",
-        "http_5xx",
-        "http_524",
-        "html_error_page",
-        "api_schema_error",
-        "provider_compatibility",
-        "unknown",
-    ]
+    FAILURE_REASON_ORDER = FAILURE_REASON_ORDER
 
-    @classmethod
-    def _classify_failure_reason(cls, error_msg: str) -> str:
-        """Classify failure reason from error message for telemetry."""
-        lower = error_msg.lower()
+    @staticmethod
+    def _classify_failure_reason(error_msg: str) -> str:
+        return classify_failure_reason(error_msg)
 
-        # Network errors (from _build_network_error_msg)
-        if "timeoutexception" in lower or (
-            "网络请求失败" in error_msg and "超时" in error_msg
-        ):
-            return "network_timeout"
-        if "proxyerror" in lower or "代理连接失败" in error_msg:
-            return "network_proxy"
-        if "remoteprotocolerror" in lower or "协议异常" in error_msg:
-            return "network_protocol"
-        if (
-            "connecterror" in lower
-            or "连接失败" in error_msg
-            or "connection refused" in lower
-        ):
-            return "network_connect"
-        if "networkerror" in lower or "网络传输异常" in error_msg:
-            return "network_connect"
+    @staticmethod
+    def _classify_http_status_code(error_msg: str) -> int | None:
+        return classify_http_status_code(error_msg)
 
-        # HTML error page
-        if "html 错误页" in error_msg or ("html" in lower and "error" in lower):
-            return "html_error_page"
+    @staticmethod
+    def _failure_reason_is_retryable(reason_key: str) -> bool:
+        return failure_reason_is_retryable(reason_key)
 
-        # HTTP status code classification
-        if error_msg.startswith("HTTP "):
-            parts = error_msg.split(maxsplit=2)
-            try:
-                status_code = int(parts[1])
-            except (IndexError, ValueError):
-                return "unknown"
-            if status_code == 400:
-                return "http_400"
-            if status_code == 401:
-                return "http_401"
-            if status_code == 403:
-                return "http_403"
-            if status_code == 404:
-                return "http_404"
-            if status_code == 413:
-                return "http_413"
-            if status_code == 422:
-                return "http_422"
-            if status_code == 429:
-                return "http_429"
-            if status_code == 524:
-                return "http_524"
-            if 500 <= status_code < 600:
-                return "http_5xx"
+    @staticmethod
+    def _should_try_next_image_provider(error_msg: str) -> bool:
+        return should_try_next_image_provider(error_msg)
 
-        # API schema errors
-        if "api 返回错误" in error_msg or "api 返回结构异常" in error_msg:
-            return "api_schema_error"
-
-        # Provider compatibility
-        compat_phrases = {
-            "does not support",
-            "not supported",
-            "unsupported",
-            "unknown parameter",
-            "invalid parameter",
-            "unexpected parameter",
-            "not allowed",
-            "cannot",
-        }
-        if any(phrase in lower for phrase in compat_phrases):
-            return "provider_compatibility"
-
-        return "unknown"
-
-    @classmethod
-    def _classify_http_status_code(cls, error_msg: str) -> int | None:
-        """Extract HTTP status code from error message, if parseable."""
-        if error_msg.startswith("HTTP "):
-            parts = error_msg.split(maxsplit=2)
-            try:
-                return int(parts[1])
-            except (IndexError, ValueError):
-                pass
-        return None
-
-    @classmethod
-    def _failure_reason_is_retryable(cls, reason_key: str) -> bool:
-        """Whether a failure reason should trigger fallback retry."""
-        non_retryable = {"http_401", "http_403"}
-        return reason_key not in non_retryable
-
-    @classmethod
-    def _should_try_next_image_provider(cls, error_msg: str) -> bool:
-        """Return whether a draw/edit failure is likely provider-specific."""
-        lower = error_msg.lower()
-        if cls._is_image_input_unsupported(error_msg):
-            return True
-        if (
-            "网络请求失败" in error_msg
-            or "connecterror" in lower
-            or "timeout" in lower
-            or "timed out" in lower
-            or "connection" in lower
-            or "api 返回错误" in error_msg
-            or "api 返回结构异常" in error_msg
-            or "html 错误页" in error_msg
-            or "invalid endpoint for image generation models" in lower
-        ):
-            return True
-        if not error_msg.startswith("HTTP "):
-            return False
-        parts = error_msg.split(maxsplit=2)
-        try:
-            status_code = int(parts[1])
-        except (IndexError, ValueError):
-            return False
-        return status_code in {
-            400,
-            401,
-            403,
-            408,
-            409,
-            429,
-            500,
-            502,
-            503,
-            504,
-            520,
-            522,
-            524,
-        }
-
-    @classmethod
-    def _provider_error_summary(cls, provider_errors: list[tuple[str, str]]) -> str:
-        if not provider_errors:
-            return ""
-        lines = ["\n\n已尝试的 API 站点："]
-        for name, error in provider_errors:
-            lines.append(
-                f"- **{name}**：{cls._safe_markdown_preview(error, limit=160)}"
-            )
-        return "\n".join(lines)
+    @staticmethod
+    def _provider_error_summary(provider_errors: list[tuple[str, str]]) -> str:
+        return provider_error_summary(provider_errors)
 
     @staticmethod
     def _provider_user_label(
         provider: ImageAPIProviderConfig,
         global_mode: str = "",
     ) -> str:
-        suffix = " / 权威兜底" if provider.role == "authoritative_fallback" else ""
-        mode_label = f" / {global_mode}" if global_mode else ""
-        return f"{provider.name}{mode_label}{suffix}"
+        return provider_user_label(provider, global_mode)
 
     async def _send_provider_switch_notice(
         self,
@@ -3788,32 +2953,10 @@ class GPTImage2Plugin(Star):
         *,
         path: Path | None = None,
     ) -> list[dict]:
-        """Read the last N records from provider_failures.jsonl."""
-        if path is None:
-            return []
-        try:
-            if not path.exists():
-                return []
-            lines = path.read_text(encoding="utf-8").splitlines()
-            selected = lines[-count:]
-            records: list[dict] = []
-            for line in selected:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-            return records
-        except Exception:
-            return []
+        return read_recent_failure_records(count, path=path)
 
     def _read_recent_failure_records_inst(self, count: int) -> list[dict]:
-        """Instance wrapper reading from the plugin's JSONL path."""
-        return self._read_recent_failure_records(
-            count, path=self._provider_failures_jsonl_path()
-        )
+        return self._provider_manager.read_recent_failure_records_inst(count)
 
     @image2.command("diag")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -3983,26 +3126,7 @@ class GPTImage2Plugin(Star):
 
     @staticmethod
     def _redact_provider_stats(stats_data: dict) -> dict:
-        """Return a copy of stats dict with API-key-like data removed from URLs."""
-        import copy as _copy
-        from urllib.parse import urlparse as _urlparse_inner
-
-        result = _copy.deepcopy(stats_data)
-        providers = result.get("providers", {})
-        if not isinstance(providers, dict):
-            return result
-        for item in providers.values():
-            if not isinstance(item, dict):
-                continue
-            base_url = item.get("base_url", "")
-            if base_url:
-                try:
-                    parsed = _urlparse_inner(base_url)
-                    redacted = f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
-                    item["base_url"] = redacted
-                except Exception:
-                    item["base_url"] = "<redacted>"
-        return result
+        return redact_provider_stats(stats_data)
 
     def _write_diag_redacted_config(self, zf: object) -> None:
         """Write a redacted copy of plugin config into the diagnostic zip.
