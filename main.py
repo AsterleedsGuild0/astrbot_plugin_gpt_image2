@@ -1,8 +1,8 @@
 """GPT Image2 AstrBot 插件
 
 命令组 /image2：
-  /image2 draw <prompt>  文生图
-  /image2 edit <prompt>  从消息/引用消息提取图片并编辑
+  /image2 draw <prompt>  文生图；附带/引用图片时图生图
+  /image2 edit <prompt>  显式图片编辑（必须附带或引用图片）
   /image2 plan           进入 Plan 多轮会话，辅助优化生图提示词
   /image2 plan confirm   在 Plan 中确认生成图片
   /image2 plan retry     重试上一条失败的 Plan 输入
@@ -182,7 +182,7 @@ class PlanSessionFilter(SessionFilter):
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.4.4",
+    "0.4.5",
 )
 class GPTImage2Plugin(Star):
     PLAN_WAITER_TIMEOUT_GRACE = 10
@@ -884,9 +884,9 @@ class GPTImage2Plugin(Star):
             return parts[-1].strip()
         return ""
 
-    def _get_edit_aliases(self) -> list[str]:
-        """读取 `/image2 edit` 的自定义触发别名。"""
-        raw_value = self.config.get("edit_aliases", [])
+    def _get_draw_aliases(self) -> list[str]:
+        """读取统一 `/image2 draw` 的自定义触发别名。"""
+        raw_value = self.config.get("draw_aliases", [])
         if isinstance(raw_value, str):
             raw_items = raw_value.replace(";", "\n").replace(",", "\n").splitlines()
         elif isinstance(raw_value, (list, tuple, set)):
@@ -896,7 +896,14 @@ class GPTImage2Plugin(Star):
 
         aliases: list[str] = []
         seen: set[str] = set()
-        reserved = {"/image2", "image2", "/image2 edit", "image2 edit"}
+        reserved = {
+            "/image2",
+            "image2",
+            "/image2 draw",
+            "image2 draw",
+            "/image2 edit",
+            "image2 edit",
+        }
         for item in raw_items:
             alias = " ".join(str(item or "").split())
             normalized = alias.lower()
@@ -927,17 +934,17 @@ class GPTImage2Plugin(Star):
             return rest.strip()
         return None
 
-    def _extract_edit_alias_prompt(
+    def _extract_draw_alias_prompt(
         self,
         event: AstrMessageEvent,
     ) -> tuple[str, str] | None:
-        """Extract prompt from configured edit aliases.
+        """从配置的 draw 别名中提取提示词。
 
-        Returns ``(prompt, alias)`` when the event text starts with a configured
-        alias. Plain components are checked in addition to ``message_str`` so
-        aliases still work when images appear before text in the message chain.
+        当消息文本以配置别名开头时返回 ``(prompt, alias)``。
+        除 ``message_str`` 外也检查 Plain 组件，确保图片在前、文字在后的
+        消息链里别名仍能生效。
         """
-        aliases = self._get_edit_aliases()
+        aliases = self._get_draw_aliases()
         if not aliases:
             return None
 
@@ -1852,9 +1859,9 @@ class GPTImage2Plugin(Star):
             if self._provider_manager.adaptive_provider_priority_enabled()
             else "关闭"
         )
-        edit_aliases = self._get_edit_aliases()
-        edit_aliases_status = (
-            "、".join(f"`{alias}`" for alias in edit_aliases) or "未配置"
+        draw_aliases = self._get_draw_aliases()
+        draw_aliases_status = (
+            "、".join(f"`{alias}`" for alias in draw_aliases) or "未配置"
         )
         retry_notice_status = prompt_rewrite_guard_status(
             self._provider_manager.provider_retry_notice_global_enabled()
@@ -1885,10 +1892,10 @@ class GPTImage2Plugin(Star):
         help_md = (
             "## 📋 GPT Image2 使用说明\n\n"
             "### 命令\n\n"
-            "- `/image2 draw <提示词>` — 文生图\n"
-            "- `/image2 edit <提示词>` — 编辑图片（附带图片或引用图片消息）\n"
-            "- 自定义 edit 别名 — 可在配置 `edit_aliases` 中添加，"
-            "用于触发 `/image2 edit`\n"
+            "- `/image2 draw <提示词>` — 文生图；附带图片或引用图片时自动图生图\n"
+            "- `/image2 edit <提示词>` — 显式图片编辑（必须附带图片或引用图片消息）\n"
+            "- 自定义 draw 别名 — 可在配置 `draw_aliases` 中添加，"
+            "用于触发统一 `/image2 draw`\n"
             "- `/image2 plan` — 进入 Plan 多轮图文会话，辅助优化生图提示词\n"
             "  - `/plan <描述>` — 在 Plan 会话中继续交流（群聊普通消息不会被拦截）\n"
             "  - `/plan confirm` — 在 Plan 会话中确认生成\n"
@@ -1922,7 +1929,7 @@ class GPTImage2Plugin(Star):
             f"| 生图 API 站点 | {image_provider_count} 个（当前模式可用 {viable_provider_count} 个） |\n"
             f"| 自适应站点优先级 | {adaptive_status} |\n"
             f"| 备用站点重试提示 | {retry_notice_status}，间隔 {format_duration(retry_notice_interval)} |\n"
-            f"| edit 别名 | {edit_aliases_status} |\n"
+            f"| draw 别名 | {draw_aliases_status} |\n"
             f"| Plan 模型 | `{cfg.get('plan_model', 'gpt-5.4')}` |\n"
             f"| Plan 空闲超时 | {cfg.get('plan_timeout', 300)} 秒 |\n"
             f"| 图片尺寸 | `{cfg.get('size', 'auto')}` |\n"
@@ -1935,7 +1942,7 @@ class GPTImage2Plugin(Star):
             f"- `/image2 mode` 是全局模式，会影响 draw/edit 的站点过滤。\n"
             f"- draw/edit 只会尝试支持当前模式的站点；不支持的站点会被跳过。\n"
             f"- `/image2 retry here off` 可关闭当前群/会话的备用站点切换提示。\n"
-            f"- edit 别名只在消息开头匹配，且要求别名后接空白和提示词。\n"
+            f"- draw 别名只在消息开头匹配，且要求别名后接空白和提示词。\n"
             f"- 站点明细请使用 `/image2 providers` 查看。\n"
             f"- `/image2 plan` 进入后，下面缩进的是 Plan 子命令。"
         )
@@ -2319,7 +2326,7 @@ class GPTImage2Plugin(Star):
                 config=self.config,
                 failures_path=failures_path,
                 plugin_name=plugin_name,
-                plugin_version="0.4.4",
+                plugin_version="0.4.5",
                 generated_at=timestamp,
             )
         except Exception as e:
@@ -3003,9 +3010,23 @@ class GPTImage2Plugin(Star):
 
     @image2.command("draw")
     async def draw(self, event: AstrMessageEvent):
-        """文生图"""
+        """统一绘图入口：无图文生图，有图图生图。"""
+        async for result in self._handle_draw(
+            event,
+            prompt=self._extract_prompt(event, "draw"),
+            action="draw",
+        ):
+            yield result
+
+    async def _handle_draw(
+        self,
+        event: AstrMessageEvent,
+        *,
+        prompt: str,
+        action: str,
+    ):
+        """统一 draw 实现：自动根据消息/引用中的图片决定是否图生图。"""
         started = perf_counter()
-        prompt = self._extract_prompt(event, "draw")
         if not prompt or not prompt.strip():
             logger.info(
                 f"[GPTImage2] draw rejected empty prompt {self._event_context(event)}"
@@ -3019,15 +3040,24 @@ class GPTImage2Plugin(Star):
 
         prompt = prompt.strip()
         api_mode = self.config.get("api_mode", "images")
+        messages = event.get_messages()
+        max_input = int(self.config.get("max_input_images", 4))
+        images = extract_images_from_event(messages, max_input)
 
         logger.info(
             "[GPTImage2] draw start "
             f"{self._event_context(event)} mode={api_mode} prompt_len={len(prompt)} "
+            f"message_components={len(messages)} input_images={len(images)} "
             f"{self._params_summary(self._get_params())} "
             f"save_outputs={self.config.get('save_outputs', True)}"
         )
 
-        chain = await self._generate_draw_chain(event, prompt, action="draw")
+        chain = await self._generate_draw_chain(
+            event,
+            prompt,
+            action=action,
+            reference_images=images,
+        )
         if chain:
             logger.info(
                 "[GPTImage2] draw reply ready "
@@ -3050,23 +3080,25 @@ class GPTImage2Plugin(Star):
             yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def edit_alias(self, event: AstrMessageEvent):
-        """通过配置的别名触发 `/image2 edit`。"""
-        matched = self._extract_edit_alias_prompt(event)
+    async def draw_alias(self, event: AstrMessageEvent):
+        """通过配置的别名触发统一 `/image2 draw`。"""
+        matched = self._extract_draw_alias_prompt(event)
         if matched is None:
             return
 
         prompt, alias = matched
         logger.info(
-            "[GPTImage2] edit alias matched "
+            "[GPTImage2] draw alias matched "
             f"{self._event_context(event)} alias={alias!r} prompt_len={len(prompt)}"
         )
-        async for result in self._handle_edit(event, prompt=prompt):
+        async for result in self._handle_draw(
+            event, prompt=prompt, action="draw-alias"
+        ):
             yield result
         event.stop_event()
 
     async def _handle_edit(self, event: AstrMessageEvent, *, prompt: str):
-        """Shared implementation for `/image2 edit` and configured aliases."""
+        """显式 `/image2 edit` 实现：必须检测到输入图片。"""
         started = perf_counter()
         if not prompt or not prompt.strip():
             logger.info(

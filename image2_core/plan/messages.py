@@ -186,7 +186,7 @@ def _build_plan_copyable_command_text_inner(
     prompt = single_line_command_prompt(plan_copyable_prompt(session))
     reference_count = len(session.reference_data_urls)
     if reference_count:
-        command = f"/image2 edit {prompt}"
+        command = f"/image2 draw {prompt}"
         if succeeded:
             usage_note = (
                 f"这条命令需要配合 {reference_count} 张参考图使用。"

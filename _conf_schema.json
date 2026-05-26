@@ -172,13 +172,13 @@
     "type": "int",
     "default": 4
   },
-  "edit_aliases": {
-    "description": "编辑命令别名",
+  "draw_aliases": {
+    "description": "绘图命令别名",
     "type": "list",
     "default": [],
-    "hint": "自定义触发 /image2 edit 的消息前缀。每项是一条别名，例如 修图、改图、画图。用户发送“修图 <提示词>”并附带图片或引用图片消息时，会等同于 /image2 edit <提示词>。别名只在消息开头匹配，且别名后需要空白。",
+    "hint": "自定义触发统一 /image2 draw 的消息前缀。每项是一条别名，例如 画图、出图、修图。用户发送“画图 <提示词>”时等同于 /image2 draw <提示词>；若附带图片或引用图片则自动走图生图/编辑路径，否则走文生图。别名只在消息开头匹配，且别名后需要空白。",
     "items": {
-      "description": "edit 别名",
+      "description": "draw 别名",
       "type": "string",
       "default": ""
     }
@@ -192,7 +192,7 @@
     "description": "Plan 成功后发送可复制命令",
     "type": "bool",
     "default": true,
-    "hint": "开启后 /plan confirm 成功生图会额外发送一条合并转发 /image2 draw 或 /image2 edit 命令，方便复制到其他地方复用；关闭可减少群聊刷屏。失败时的直接重试命令不受此项影响。"
+    "hint": "开启后 /plan confirm 成功生图会额外发送一条合并转发 /image2 draw 命令，方便复制到其他地方复用；带参考图时请附带或引用相同参考图。关闭可减少群聊刷屏。失败时的直接重试命令不受此项影响。"
   },
   "render_text_as_image": {
     "description": "文本回复转图片",

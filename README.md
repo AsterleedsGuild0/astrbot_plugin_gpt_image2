@@ -4,9 +4,9 @@
 
 ## 功能
 
-- **文生图**：通过 `/image2 draw <提示词>` 生成图片
-- **图像编辑**：通过 `/image2 edit <提示词>` 编辑图片（支持当前消息或引用消息中的图片）
-- **编辑别名**：可配置 `edit_aliases`，用自定义前缀触发 `/image2 edit`
+- **统一绘图**：通过 `/image2 draw <提示词>` 生成图片；附带或引用图片时自动图生图/编辑
+- **显式图像编辑**：通过 `/image2 edit <提示词>` 严格编辑图片（必须附带或引用图片）
+- **绘图别名**：可配置 `draw_aliases`，用自定义前缀触发统一 `/image2 draw`
 - **Plan 模式**：通过 `/image2 plan` 进入多轮图文对话，AI 辅助优化生图提示词
 - **文本转图片**：插件文本回复默认使用 image2 自包含 Markdown 卡片模板，
   不加载外部 JS/CDN；失败则回退纯文本
@@ -18,9 +18,9 @@
 
 | 命令 | 说明 |
 | --- | --- |
-| `/image2 draw <提示词>` | 文生图 |
-| `/image2 edit <提示词>` | 编辑图片（需附带图片或引用包含图片的消息） |
-| `自定义别名 <提示词>` | 若配置了 `edit_aliases`，可触发 `/image2 edit` |
+| `/image2 draw <提示词>` | 统一绘图；无图时文生图，附带或引用图片时图生图/编辑 |
+| `/image2 edit <提示词>` | 显式图片编辑；必须附带图片或引用包含图片的消息 |
+| `自定义别名 <提示词>` | 若配置了 `draw_aliases`，可触发统一 `/image2 draw` |
 | `/image2 plan` | 进入 Plan 多轮图文会话，AI 辅助优化生图提示词 |
 | `/plan <描述>` | 在 Plan 会话中继续交流（群聊普通消息不会被拦截） |
 | `/plan confirm` | 在 Plan 会话中确认生成图片 |
@@ -41,9 +41,9 @@
 - `draw` 和 `edit` 命令在参数校验通过后会先回复一条
   "已收到，正在处理"的提示，随后再发送最终生成/编辑结果。
   如果上游返回较长的 `revised_prompt`，插件会将其收纳为合并转发，图片单独发送。
-- `edit_aliases` 可添加多条编辑命令别名，例如 `修图`、`改图`。
-  用户发送 `修图 <提示词>` 并附带图片或引用图片消息时，会等同于
-  `/image2 edit <提示词>`。别名只在消息开头匹配，且别名后需要空白。
+- `draw_aliases` 可添加多条统一绘图别名，例如 `画图`、`出图`、`修图`。
+  用户发送 `修图 <提示词>` 时会等同于 `/image2 draw <提示词>`；若消息中附带图片
+  或引用图片，则自动走图生图/编辑路径，否则走文生图。别名只在消息开头匹配，且别名后需要空白。
 - Prompt Guard 会在生图提示词前追加
   `Use the following text as the complete prompt. Do not rewrite it:`，用于尽量限制上游重写提示词。
   默认保持旧行为：Images API 关闭，Responses API 开启。
@@ -160,7 +160,7 @@
 | `timeout` | int | `120` | 请求超时时间（秒） |
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片（建议开启） |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
-| `edit_aliases` | list | `[]` | 触发 `/image2 edit` 的自定义前缀列表 |
+| `draw_aliases` | list | `[]` | 触发统一 `/image2 draw` 的自定义前缀列表 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
 | `send_copyable_prompt_after_success` | bool | `true` | Plan 成功后发送合并转发可复制命令 |
 | `render_text_as_image` | bool | `true` | image2 卡片模板优先，失败则回退纯文本 |
@@ -193,13 +193,13 @@ python scripts/package_plugin.py
 如果使用 VSCode，也可以在 Run and Debug 面板选择
 `Package AstrBot plugin (test)` 手动触发测试包打包。该配置会调用
 `python scripts/package_plugin.py --dev-version`，自动在 zip 内写入
-`v0.4.4-test.YYYYMMDD.HHMM` 形式的真实测试版本号，但不会修改工作区文件。
+`v0.4.5-test.YYYYMMDD.HHMM` 形式的真实测试版本号，但不会修改工作区文件。
 如需正式包，可选择 `Package AstrBot plugin (release)`。
 
 默认输出：
 
 ```text
-dist/astrbot_plugin_gpt_image2_233-v0.4.4.zip
+dist/astrbot_plugin_gpt_image2_233-v0.4.5.zip
 ```
 
 然后在 AstrBot WebUI 的插件页面中上传该 zip 文件安装。
