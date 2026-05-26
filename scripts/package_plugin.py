@@ -23,6 +23,7 @@ PACKAGE_FILES = [
     "card_renderer.py",
     "client.py",
     "config_redact.py",
+    "diagnostics.py",
     "image_utils.py",
     "plan.py",
     "plan_messages.py",

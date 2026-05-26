@@ -22,7 +22,6 @@ import asyncio
 import base64
 import hashlib
 import io
-import json
 from pathlib import Path
 import time as _time_module
 from time import perf_counter, time
@@ -50,7 +49,6 @@ from PIL import Image as PILImage
 
 from .card_renderer import build_markdown_card
 from .client import GPTImageClient, ImageParams, ImageResult
-from .config_redact import redact_config_value
 from .image_utils import (
     ensure_output_dir,
     extract_images_from_event,
@@ -81,6 +79,11 @@ from .plan_messages import (
     revised_prompt_forward_nodes as _revised_prompt_forward_nodes_pure,
     revised_prompt_fallback_text,
 )
+from .diagnostics import (
+    build_stats_recent_markdown,
+    build_stats_summary_markdown,
+    build_diag_zip,
+)
 from .providers import (
     ImageAPIProviderConfig,
     ProviderManager,
@@ -109,7 +112,6 @@ from .providers import (
     parse_bool_switch,
     trim_jsonl,
     read_recent_failure_records,
-    redact_provider_stats,
 )
 
 
@@ -2565,10 +2567,10 @@ class GPTImage2Plugin(Star):
         if not isinstance(providers_data, dict):
             providers_data = {}
 
-        # ── Recent JSONL records (unchanged) ──────────────────────
+        # ── 最近 JSONL 失败记录 ───────────────────────────────────
         sub_str = (sub or "").strip().lower()
         if sub_str == "recent" or sub_str.startswith("recent "):
-            # Parse optional count
+            # 解析可选条数。
             count = 10
             parts = sub_str.split(maxsplit=1)
             if len(parts) > 1:
@@ -2577,237 +2579,26 @@ class GPTImage2Plugin(Star):
                 except (TypeError, ValueError):
                     count = 10
             records = self._read_recent_failure_records_inst(count)
-            if not records:
-                yield await self._text_result(
-                    event,
-                    "## 📊 最近失败记录\n\n（无记录）",
-                    action="stats-recent-empty",
-                )
-                return
-            lines = [f"## 📊 最近 {len(records)} 条失败记录\n\n"]
-            for rec in records:
-                ts = rec.get("timestamp", 0)
-                ts_str = (
-                    _time_module.strftime(
-                        "%Y-%m-%d %H:%M:%S", _time_module.localtime(ts)
-                    )
-                    if ts
-                    else "-"
-                )
-                provider_name = rec.get("provider_name", "-")
-                reason = rec.get("reason_key", "unknown")
-                action_rec = rec.get("action", "-")
-                status = rec.get("status_code", "-")
-                ctype = rec.get("response_content_type", "")
-                rid = rec.get("request_ids", "")
-                preview = rec.get("response_preview", "")
-                preview_truncated = rec.get("response_preview_truncated", False)
-                resp_bytes = rec.get("response_bytes", "")
-                json_summary = rec.get("response_json_summary", "")
-
-                rec_lines = [
-                    f"- **{ts_str}** | {provider_name} | "
-                    f"{action_rec} | `{reason}` | HTTP {status}"
-                ]
-                # Show content-type and request IDs when available
-                meta_parts = []
-                if ctype:
-                    meta_parts.append(f"ctype={ctype}")
-                if rid and rid != "-":
-                    meta_parts.append(f"rid={rid}")
-                if resp_bytes != "":
-                    meta_parts.append(f"bytes={resp_bytes}")
-                if preview_truncated:
-                    meta_parts.append("preview_truncated")
-                if json_summary:
-                    meta_parts.append(f"json={json_summary}")
-                if meta_parts:
-                    rec_lines.append(f"  - {', '.join(meta_parts)}")
-                # Show response preview when available — clipped to 240 chars
-                # for readability in Markdown
-                if preview and preview != "repr('')":
-                    preview_short = (
-                        preview[:240] + "…" if len(preview) > 240 else preview
-                    )
-                    rec_lines.append(f"  - preview: `{preview_short}`")
-                lines.append("\n".join(rec_lines))
-            lines.append("\n\n完整记录见 `provider_failures.jsonl`。")
             yield await self._text_result(
                 event,
-                "".join(lines),
-                action="stats-recent",
+                build_stats_recent_markdown(records),
+                action="stats-recent" if records else "stats-recent-empty",
             )
             return
 
-        # ── Determine provider set ────────────────────────────────
+        # ── 确定统计展示范围 ───────────────────────────────────────
         show_all = sub_str == "all"
 
         try:
             configs = self._get_image_api_provider_configs()
         except ValueError:
             configs = []
-        configured_ids: set[str] = {c.provider_id for c in configs}
 
-        if show_all:
-            displayed_providers = providers_data
-            scope_tag = "（所有历史记录）"
-        else:
-            displayed_providers = {
-                pid: item
-                for pid, item in providers_data.items()
-                if pid in configured_ids
-            }
-            scope_tag = "（当前配置的 Provider）"
-
-        # ── Aggregate from displayed providers ────────────────────
-        total_success = 0
-        total_failure = 0
-        all_reasons: dict[str, int] = {}
-        all_codes: dict[str, int] = {}
-
-        for pid, item in displayed_providers.items():
-            if not isinstance(item, dict):
-                continue
-            total_success += self._provider_stat_int(item, "success_count")
-            total_failure += self._provider_stat_int(item, "failure_count")
-
-            reasons = item.get("failure_reasons", {})
-            if isinstance(reasons, dict):
-                for k, v in reasons.items():
-                    all_reasons[k] = all_reasons.get(k, 0) + self._provider_stat_int(
-                        reasons, k
-                    )
-
-            codes = item.get("failure_status_codes", {})
-            if isinstance(codes, dict):
-                for k, v in codes.items():
-                    all_codes[k] = all_codes.get(k, 0) + self._provider_stat_int(
-                        codes, k
-                    )
-
-        total = total_success + total_failure
-        sr_pct = f"{round(total_success / total * 100, 1)}%" if total > 0 else "-"
-
-        lines: list[str] = [
-            "## 📊 Provider 生图统计\n\n",
-            f"总请求：**{total}** 次 | "
-            f"成功：**{total_success}** | "
-            f"失败：**{total_failure}** | "
-            f"成功率：**{sr_pct}**\n\n",
-            f"*{scope_tag}*\n\n",
-        ]
-
-        # Top failure reasons
-        if all_reasons:
-            lines.append("### 🔴 主要失败原因\n\n")
-            seen_order = [r for r in self.FAILURE_REASON_ORDER if r in all_reasons]
-            seen_rest = [r for r in sorted(all_reasons.keys()) if r not in seen_order]
-            for reason in seen_order + seen_rest:
-                count_val = all_reasons.get(reason, 0)
-                if count_val > 0:
-                    lines.append(f"- `{reason}`：{count_val} 次\n")
-            lines.append("\n")
-
-        # Top status codes
-        if all_codes:
-            lines.append("### 🔴 主要失败状态码\n\n")
-            for code, count_val in sorted(all_codes.items(), key=lambda x: -x[1]):
-                lines.append(f"- HTTP `{code}`：{count_val} 次\n")
-            lines.append("\n")
-
-        # ── Per-provider table (sorted by success rate desc) ──────
-        if displayed_providers:
-            lines.append("### 各站点统计\n\n")
-            lines.append(
-                "| 站点 | 成功 | 失败 | 成功率 | 模式 | 主要失败原因 | 最近错误 |\n"
-                "|------|------|------|--------|------|-------------|----------|\n"
-            )
-
-            table_rows: list[tuple[float, str]] = []
-            for pid, item in displayed_providers.items():
-                if not isinstance(item, dict):
-                    continue
-                p_name = item.get("name", pid)
-                p_success = self._provider_stat_int(item, "success_count")
-                p_failure = self._provider_stat_int(item, "failure_count")
-                p_total = p_success + p_failure
-                p_sr = f"{round(p_success / p_total * 100, 1)}%" if p_total > 0 else "-"
-                p_mode = item.get("role", "-")
-                p_reasons = item.get("failure_reasons", {})
-                top_reason = (
-                    max(p_reasons, key=lambda k: p_reasons.get(k, 0))
-                    if isinstance(p_reasons, dict) and p_reasons
-                    else "-"
-                )
-                last_err = (
-                    self._safe_text_preview(
-                        str(item.get("last_error", "") or ""), limit=60
-                    )
-                    or "-"
-                )
-                sort_key = p_success / p_total if p_total > 0 else -1.0
-                row = (
-                    f"| {p_name} | {p_success} | {p_failure} | {p_sr} "
-                    f"| {p_mode} | {top_reason} | {last_err} |\n"
-                )
-                table_rows.append((sort_key, row))
-
-            # Sort descending by success rate
-            table_rows.sort(key=lambda x: x[0], reverse=True)
-            for _, row in table_rows:
-                lines.append(row)
-            lines.append("\n")
-
-            # ── Supplementary status-code table ───────────────────
-            lines.append("### 各站点状态码分布\n\n")
-            lines.append("| 站点 | 200 | 非 200 分布 |\n|------|-----|------------|\n")
-
-            sc_rows: list[tuple[float, str]] = []
-            for pid, item in displayed_providers.items():
-                if not isinstance(item, dict):
-                    continue
-                p_name = item.get("name", pid)
-                p_success = self._provider_stat_int(item, "success_count")
-                p_failure = self._provider_stat_int(item, "failure_count")
-                p_total = p_success + p_failure
-
-                p200_pct = (
-                    f"{round(p_success / p_total * 100, 1)}%" if p_total > 0 else "-"
-                )
-
-                fsc = item.get("failure_status_codes", {})
-                if isinstance(fsc, dict) and fsc and p_total > 0:
-                    non200_parts: list[str] = []
-                    sorted_codes = sorted(fsc.items(), key=lambda x: -x[1])
-                    for code, cnt in sorted_codes[:4]:
-                        prob = cnt / p_total * 100
-                        non200_parts.append(f"{code} {prob:.1f}%")
-                    if len(sorted_codes) > 4:
-                        non200_parts.append(f"等 {len(sorted_codes)} 类")
-                    non200_str = ", ".join(non200_parts)
-                elif p_total > 0 and p_failure > 0:
-                    non200_str = f"其他 {round(p_failure / p_total * 100, 1)}%"
-                else:
-                    non200_str = "-"
-
-                sort_key = p_success / p_total if p_total > 0 else -1.0
-                sc_rows.append(
-                    (
-                        sort_key,
-                        f"| {p_name} | {p200_pct} | {non200_str} |\n",
-                    )
-                )
-
-            sc_rows.sort(key=lambda x: x[0], reverse=True)
-            for _, row in sc_rows:
-                lines.append(row)
-            lines.append("\n")
-
-        lines.append(
-            "\n---\n`/image2 stats recent [N]` 查看最近失败记录。"
-            " `/image2 stats all` 查看全部历史。"
+        yield await self._text_result(
+            event,
+            build_stats_summary_markdown(stats_data, configs, show_all=show_all),
+            action="stats",
         )
-        yield await self._text_result(event, "".join(lines), action="stats")
 
     @staticmethod
     def _read_recent_failure_records(
@@ -2824,86 +2615,23 @@ class GPTImage2Plugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def diag(self, event: AstrMessageEvent):
         """生成诊断信息压缩包（管理员）"""
-        import zipfile as _zipfile
-
         plugin_name = getattr(self, "name", self.plugin_name)
         plugin_data_root = Path(get_astrbot_data_path()) / "plugin_data" / plugin_name
         diag_dir = plugin_data_root / "diagnostics"
-        diag_dir.mkdir(parents=True, exist_ok=True)
         timestamp = _time_module.strftime("%Y%m%d-%H%M%S")
         zip_path = diag_dir / f"diag-{plugin_name}-{timestamp}.zip"
         stats_data = self._load_provider_stats()
+        failures_path = self._provider_failures_jsonl_path()
 
         try:
-            with _zipfile.ZipFile(str(zip_path), "w", _zipfile.ZIP_DEFLATED) as zf:
-                # 1. summary.md
-                self._write_diag_summary(zf, stats_data)
-
-                # 2. provider_stats.json (redacted - remove API keys from base_url)
-                redacted_stats = self._redact_provider_stats(stats_data)
-                zf.writestr(
-                    "provider_stats.json",
-                    json.dumps(redacted_stats, ensure_ascii=False, indent=2),
-                )
-
-                # 3. recent failures JSONL (last 100) — always included
-                failures_path = self._provider_failures_jsonl_path()
-                failures_content = ""
-                if failures_path.exists():
-                    try:
-                        all_lines = failures_path.read_text(
-                            encoding="utf-8"
-                        ).splitlines()
-                        recent = all_lines[-100:]
-                        failures_content = "\n".join(recent) + "\n" if recent else ""
-                    except Exception:
-                        pass
-                zf.writestr("provider_failures.jsonl", failures_content)
-
-                # 4. config_redacted.json
-                self._write_diag_redacted_config(zf)
-
-                # 5. version.txt
-                zf.writestr(
-                    "version.txt",
-                    f"Plugin: {plugin_name}\nVersion: 0.4.4\nGenerated: {timestamp}\n",
-                )
-
-            # Try sending as a File component
-            try:
-                from astrbot.api.message_components import File as AstrFile
-
-                file_size = zip_path.stat().st_size
-                yield event.chain_result(
-                    [
-                        Plain(f"📦 诊断包已生成（{file_size} bytes）："),
-                        AstrFile(file=str(zip_path), name=zip_path.name),
-                    ]
-                )
-                logger.info(
-                    "[GPTImage2] diagnostic zip sent as File component "
-                    f"path={zip_path} size={file_size}"
-                )
-                return
-            except ImportError:
-                logger.info(
-                    "[GPTImage2] File component not available, "
-                    "falling back to text path"
-                )
-            except Exception as e:
-                logger.warning(
-                    "[GPTImage2] File component send failed "
-                    f"error={type(e).__name__}: {e}"
-                )
-
-            # Fallback: return path as text
-            yield await self._text_result(
-                event,
-                f"## 📦 诊断包已生成\n\n路径：`{zip_path}`\n\n"
-                f"大小：{zip_path.stat().st_size} bytes\n\n"
-                "包含：summary.md, provider_stats.json, "
-                "provider_failures.jsonl, config_redacted.json, version.txt",
-                action="diag-fallback",
+            build_diag_zip(
+                zip_path,
+                stats_data=stats_data,
+                config=self.config,
+                failures_path=failures_path,
+                plugin_name=plugin_name,
+                plugin_version="0.4.4",
+                generated_at=timestamp,
             )
         except Exception as e:
             logger.error(
@@ -2918,91 +2646,41 @@ class GPTImage2Plugin(Star):
                 "请检查文件权限或磁盘空间。",
                 action="diag-error",
             )
+            return
 
-    def _write_diag_summary(
-        self,
-        zf: object,
-        stats_data: dict,
-    ) -> None:
-        """Write summary.md into the diagnostic zip."""
-        summary = stats_data.get("summary", {})
-        providers = stats_data.get("providers", {})
-        lines = [
-            "# GPT Image2 诊断摘要\n\n",
-            f"生成时间：{_time_module.strftime('%Y-%m-%d %H:%M:%S')}\n\n",
-            "---\n\n",
-            "## 聚合统计\n\n",
-        ]
-        if isinstance(summary, dict):
-            s_success = self._provider_stat_int(summary, "success_count")
-            s_failure = self._provider_stat_int(summary, "failure_count")
-            s_total = s_success + s_failure
-            s_rate = summary.get("success_rate", 0)
-            sr_pct = f"{s_rate * 100:.1f}%" if s_total > 0 else "-"
-            lines.extend(
+        # 优先尝试作为 File 组件发送。
+        try:
+            from astrbot.api.message_components import File as AstrFile
+
+            file_size = zip_path.stat().st_size
+            yield event.chain_result(
                 [
-                    f"- 总请求：{s_total}\n",
-                    f"- 成功：{s_success}\n",
-                    f"- 失败：{s_failure}\n",
-                    f"- 成功率：{sr_pct}\n\n",
+                    Plain(f"📦 诊断包已生成（{file_size} bytes）："),
+                    AstrFile(file=str(zip_path), name=zip_path.name),
                 ]
             )
+            logger.info(
+                "[GPTImage2] diagnostic zip sent as File component "
+                f"path={zip_path} size={file_size}"
+            )
+            return
+        except ImportError:
+            logger.info(
+                "[GPTImage2] File component not available, falling back to text path"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[GPTImage2] File component send failed error={type(e).__name__}: {e}"
+            )
 
-            reasons = summary.get("failure_reasons", {})
-            if isinstance(reasons, dict) and reasons:
-                lines.append("### 失败原因分布\n\n")
-                for reason, count2 in sorted(reasons.items(), key=lambda x: -x[1]):
-                    lines.append(f"- {reason}: {count2}\n")
-                lines.append("\n")
-
-            codes = summary.get("failure_status_codes", {})
-            if isinstance(codes, dict) and codes:
-                lines.append("### 失败状态码分布\n\n")
-                for code, count2 in sorted(codes.items(), key=lambda x: -x[1]):
-                    lines.append(f"- HTTP {code}: {count2}\n")
-                lines.append("\n")
-
-        lines.append("## 各站点统计\n\n")
-        if isinstance(providers, dict):
-            for pid, item in providers.items():
-                if not isinstance(item, dict):
-                    continue
-                p_name = item.get("name", pid)
-                p_success = self._provider_stat_int(item, "success_count")
-                p_failure = self._provider_stat_int(item, "failure_count")
-                p_total = p_success + p_failure
-                p_rate = f"{round(p_success / p_total * 100, 1)}%" if p_total else "-"
-                lines.extend(
-                    [
-                        f"### {p_name}\n\n",
-                        f"- provider_id: {pid}\n",
-                        f"- role: {item.get('role', '-')}\n",
-                        f"- success_count: {p_success}\n",
-                        f"- failure_count: {p_failure}\n",
-                        f"- success_rate: {p_rate}\n",
-                        f"- last_error: "
-                        f"{self._safe_text_preview(str(item.get('last_error', '') or ''), limit=120)}\n\n",
-                    ]
-                )
-        zf.writestr("summary.md", "".join(lines))
-
-    @staticmethod
-    def _redact_provider_stats(stats_data: dict) -> dict:
-        return redact_provider_stats(stats_data)
-
-    def _write_diag_redacted_config(self, zf: object) -> None:
-        """Write a redacted copy of plugin config into the diagnostic zip.
-
-        Uses :func:`redact_config_value` for recursive, pattern-based redaction
-        that handles nested dicts/lists, fallback provider strings, JSON-encoded
-        values, and URL credentials.
-        """
-        redacted = redact_config_value(self.config)
-        if not isinstance(redacted, dict):
-            redacted = {"_error": "redact_config_value returned non-dict"}
-        zf.writestr(
-            "config_redacted.json",
-            json.dumps(redacted, ensure_ascii=False, indent=2),
+        # Fallback: return path as text
+        yield await self._text_result(
+            event,
+            f"## 📦 诊断包已生成\n\n路径：`{zip_path}`\n\n"
+            f"大小：{zip_path.stat().st_size} bytes\n\n"
+            "包含：summary.md, provider_stats.json, "
+            "provider_failures.jsonl, config_redacted.json, version.txt",
+            action="diag-fallback",
         )
 
     # ── Plan 模式 ────────────────────────────────────────────
