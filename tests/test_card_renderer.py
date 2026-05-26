@@ -3,8 +3,8 @@
 import unittest
 import html
 
-import card_renderer
-from card_renderer import markdown_to_html, build_markdown_card
+from image2_core.rendering import card_renderer
+from image2_core.rendering.card_renderer import markdown_to_html, build_markdown_card
 
 
 class TestNestedLists(unittest.TestCase):

@@ -1201,7 +1201,7 @@ class ProviderManager:
         # Extract structured diagnostics from ImageAPIError if available
         if error is not None and type(error).__name__ == "ImageAPIError":
             # Avoid importing ImageAPIError at module top to prevent cycles
-            from .client import ImageAPIError as _IAE
+            from ..api.client import ImageAPIError as _IAE
 
             if isinstance(error, _IAE) and error.diagnostics is not None:
                 diag = error.diagnostics

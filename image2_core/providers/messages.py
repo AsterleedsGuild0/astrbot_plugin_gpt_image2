@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from .providers import ImageAPIProviderConfig
+from .manager import ImageAPIProviderConfig
 
 
 def build_providers_status_markdown(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from config_redact import redact_config_value
+from image2_core.diagnostics.redact import redact_config_value
 
 
 class TestRedactConfigValue(unittest.TestCase):

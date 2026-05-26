@@ -47,16 +47,16 @@ from astrbot.core.utils.session_waiter import (
 )
 from PIL import Image as PILImage
 
-from .card_renderer import build_markdown_card
-from .client import GPTImageClient, ImageParams, ImageResult
-from .image_utils import (
+from .image2_core.rendering.card_renderer import build_markdown_card
+from .image2_core.api.client import GPTImageClient, ImageParams, ImageResult
+from .image2_core.images.utils import (
     ensure_output_dir,
     extract_images_from_event,
     image_to_data_url,
     image_to_file_path,
     save_base64_to_file,
 )
-from .plan import (
+from .image2_core.plan.session import (
     PLAN_SYSTEM_PROMPT,
     PlanConfig,
     PlanSession,
@@ -64,7 +64,7 @@ from .plan import (
     parse_final_prompt,
     parse_final_prompt_zh,
 )
-from .plan_messages import (
+from .image2_core.plan.messages import (
     build_plan_user_content,
     single_line_command_prompt,
     split_text_for_forward,
@@ -79,13 +79,13 @@ from .plan_messages import (
     revised_prompt_forward_nodes as _revised_prompt_forward_nodes_pure,
     revised_prompt_fallback_text,
 )
-from .diagnostics import (
+from .image2_core.diagnostics.reports import (
     build_stats_recent_markdown,
     build_stats_summary_markdown,
     build_diag_zip,
 )
-from .provider_messages import build_providers_status_markdown
-from .providers import (
+from .image2_core.providers.messages import build_providers_status_markdown
+from .image2_core.providers.manager import (
     ImageAPIProviderConfig,
     ProviderManager,
     should_try_next_image_provider,

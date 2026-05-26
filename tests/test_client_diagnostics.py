@@ -15,7 +15,7 @@ astrbot_api.logger = MagicMock()
 sys.modules["astrbot"] = MagicMock()
 sys.modules["astrbot.api"] = astrbot_api
 
-from client import GPTImageClient, HTTPDiagnostics  # noqa: E402
+from image2_core.api.client import GPTImageClient, HTTPDiagnostics  # noqa: E402
 
 
 class TestResponseJsonSummary(unittest.TestCase):

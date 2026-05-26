@@ -18,18 +18,8 @@ except ImportError as exc:  # pragma: no cover - PyYAML exists in AstrBot envs.
 ROOT = Path(__file__).resolve().parents[1]
 DIST_DIR = ROOT / "dist"
 
-PACKAGE_FILES = [
+PACKAGE_ROOT_FILES = [
     "main.py",
-    "card_renderer.py",
-    "client.py",
-    "config_redact.py",
-    "diagnostics.py",
-    "image_utils.py",
-    "plan.py",
-    "plan_messages.py",
-    "provider_messages.py",
-    "providers.py",
-    "text_image.py",
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",
@@ -37,6 +27,25 @@ PACKAGE_FILES = [
     "README.md",
     "LICENSE",
 ]
+
+PACKAGE_DIRS = [
+    "image2_core",
+]
+
+
+def iter_package_files() -> list[str]:
+    """返回发布包文件列表，递归包含内部 Python 包。"""
+    files = list(PACKAGE_ROOT_FILES)
+    for relative_dir in PACKAGE_DIRS:
+        package_dir = ROOT / relative_dir
+        if not package_dir.is_dir():
+            raise FileNotFoundError(f"Missing package dir: {relative_dir}")
+        files.extend(
+            path.relative_to(ROOT).as_posix()
+            for path in sorted(package_dir.rglob("*.py"))
+            if path.is_file()
+        )
+    return files
 
 
 def read_metadata() -> dict:
@@ -73,7 +82,8 @@ def build_archive(
     patch_versions = package_version != source_version
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    missing = [path for path in PACKAGE_FILES if not (ROOT / path).is_file()]
+    package_files = iter_package_files()
+    missing = [path for path in package_files if not (ROOT / path).is_file()]
     if missing:
         raise FileNotFoundError(f"Missing package file(s): {', '.join(missing)}")
 
@@ -84,7 +94,7 @@ def build_archive(
             # before any file entries.
             archive.writestr(f"{plugin_name}/", "")
 
-        for relative in PACKAGE_FILES:
+        for relative in package_files:
             source = ROOT / relative
             archive_name = relative if flat else f"{plugin_name}/{relative}"
             content = (

@@ -19,8 +19,8 @@ from typing import TYPE_CHECKING
 from astrbot.api.message_components import Node, Plain
 
 if TYPE_CHECKING:
-    from .client import ImageResult
-    from .plan import PlanSession
+    from ..api.client import ImageResult
+    from .session import PlanSession
 
 
 # ── Responses API 用户输入内容 ───────────────────────────────────

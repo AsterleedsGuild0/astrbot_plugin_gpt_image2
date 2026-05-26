@@ -14,8 +14,8 @@ import time as _time_module
 import zipfile
 from pathlib import Path
 
-from .config_redact import redact_config_value
-from .providers import (
+from .redact import redact_config_value
+from ..providers.manager import (
     ImageAPIProviderConfig,
     FAILURE_REASON_ORDER,
     provider_stat_int,
