@@ -87,31 +87,18 @@ from .diagnostics import (
 from .providers import (
     ImageAPIProviderConfig,
     ProviderManager,
-    FAILURE_REASON_ORDER,
-    classify_failure_reason,
-    classify_http_status_code,
-    failure_reason_is_retryable,
     should_try_next_image_provider,
     is_image_input_unsupported,
     normalize_api_mode,
-    normalize_provider_role,
     normalize_bool,
-    build_provider_id,
-    parse_fallback_api_provider_string,
-    provider_stat_int,
-    provider_stat_float,
-    provider_health_score,
     provider_error_summary,
     provider_user_label,
     safe_text_preview,
     safe_markdown_preview,
     format_duration,
     prompt_rewrite_guard_config_key,
-    prompt_rewrite_guard_default,
     prompt_rewrite_guard_status,
     parse_bool_switch,
-    trim_jsonl,
-    read_recent_failure_records,
 )
 
 
@@ -770,7 +757,7 @@ class GPTImage2Plugin(Star):
 
     def _get_client(self) -> GPTImageClient:
         """从配置创建图片 API 客户端"""
-        providers = self._get_image_api_provider_configs()
+        providers = self._provider_manager.get_image_api_provider_configs()
         return self._build_image_api_client(providers[0])
 
     def _build_image_api_client(
@@ -784,102 +771,18 @@ class GPTImage2Plugin(Star):
             responses_model=provider.responses_model,
             timeout=self.config.get("timeout", 120),
             response_format_b64_json=self.config.get("response_format_b64_json", True),
-            images_prompt_rewrite_guard=self._prompt_rewrite_guard_enabled("images"),
-            responses_prompt_rewrite_guard=self._prompt_rewrite_guard_enabled(
+            images_prompt_rewrite_guard=self._provider_manager.prompt_rewrite_guard_enabled(
+                "images"
+            ),
+            responses_prompt_rewrite_guard=self._provider_manager.prompt_rewrite_guard_enabled(
                 "responses"
             ),
         )
 
-    def _get_image_api_provider_configs(self) -> list[ImageAPIProviderConfig]:
-        return self._provider_manager.get_image_api_provider_configs()
-
-    def _get_fallback_api_provider_items(self) -> list:
-        return self._provider_manager.get_fallback_api_provider_items()
-
-    def _resolve_fallback_capabilities(self, data: dict) -> str:
-        return self._provider_manager.resolve_fallback_capabilities(data)
-
-    def _parse_fallback_api_provider(
-        self,
-        item: object,
-        *,
-        index: int,
-        default_api_key: str,
-        default_base_url: str,
-        default_model: str,
-        default_responses_model: str,
-    ) -> ImageAPIProviderConfig | None:
-        return self._provider_manager.parse_fallback_api_provider(
-            item,
-            index=index,
-            default_api_key=default_api_key,
-            default_base_url=default_base_url,
-            default_model=default_model,
-            default_responses_model=default_responses_model,
-        )
-
-    @staticmethod
-    def _normalize_api_mode(value: object) -> str:
-        return normalize_api_mode(value)
-
-    @staticmethod
-    def _normalize_provider_role(value: object) -> str:
-        return normalize_provider_role(value)
-
-    @staticmethod
-    def _normalize_bool(value: object, *, default: bool) -> bool:
-        return normalize_bool(value, default=default)
-
-    @staticmethod
-    def _prompt_rewrite_guard_config_key(api_mode: str) -> str:
-        return prompt_rewrite_guard_config_key(api_mode)
-
-    @staticmethod
-    def _prompt_rewrite_guard_default(api_mode: str) -> bool:
-        return prompt_rewrite_guard_default(api_mode)
-
-    def _prompt_rewrite_guard_enabled(self, api_mode: str) -> bool:
-        return self._provider_manager.prompt_rewrite_guard_enabled(api_mode)
-
-    @staticmethod
-    def _prompt_rewrite_guard_status(enabled: bool) -> str:
-        return prompt_rewrite_guard_status(enabled)
-
-    @staticmethod
-    def _parse_bool_switch(value: object) -> bool | None:
-        return parse_bool_switch(value)
-
-    @staticmethod
-    def _build_provider_id(
-        name: str,
-        base_url: str,
-        model: str,
-        responses_model: str,
-    ) -> str:
-        return build_provider_id(name, base_url, model, responses_model)
-
-    def _adaptive_provider_priority_enabled(self) -> bool:
-        return self._provider_manager.adaptive_provider_priority_enabled()
-
     def _send_copyable_prompt_after_success_enabled(self) -> bool:
-        return self._normalize_bool(
+        return normalize_bool(
             self.config.get("send_copyable_prompt_after_success"),
             default=True,
-        )
-
-    def _provider_retry_notice_global_enabled(self) -> bool:
-        return self._provider_manager.provider_retry_notice_global_enabled()
-
-    def _provider_retry_notice_session_config(self) -> dict[str, bool]:
-        return self._provider_manager.provider_retry_notice_session_config()
-
-    def _set_provider_retry_notice_session_enabled(
-        self,
-        session_key: str,
-        enabled: bool,
-    ) -> None:
-        self._provider_manager.set_provider_retry_notice_session_enabled(
-            session_key, enabled
         )
 
     def _provider_retry_notice_session_key(self, event: AstrMessageEvent) -> str:
@@ -887,123 +790,34 @@ class GPTImage2Plugin(Star):
 
     def _provider_retry_notice_session_enabled(self, event: AstrMessageEvent) -> bool:
         session_key = self._provider_retry_notice_session_key(event)
-        sessions = self._provider_retry_notice_session_config()
+        sessions = self._provider_manager.provider_retry_notice_session_config()
         return sessions.get(session_key, True)
 
     def _provider_retry_notice_enabled(self, event: AstrMessageEvent) -> bool:
         return (
-            self._provider_retry_notice_global_enabled()
+            self._provider_manager.provider_retry_notice_global_enabled()
             and self._provider_retry_notice_session_enabled(event)
         )
 
-    def _provider_retry_notice_interval(self) -> int:
-        return self._provider_manager.provider_retry_notice_interval()
-
-    @staticmethod
-    def _format_duration(seconds: int) -> str:
-        return format_duration(seconds)
-
     def _provider_retry_notice_status_text(self, event: AstrMessageEvent) -> str:
-        global_enabled = self._provider_retry_notice_global_enabled()
+        global_enabled = self._provider_manager.provider_retry_notice_global_enabled()
         session_enabled = self._provider_retry_notice_session_enabled(event)
         effective = global_enabled and session_enabled
         session_key = self._provider_retry_notice_session_key(event)
-        interval = self._provider_retry_notice_interval()
+        interval = self._provider_manager.provider_retry_notice_interval()
         return (
             "## 🔁 备用站点重试提示\n\n"
-            f"- 全局开关：{self._prompt_rewrite_guard_status(global_enabled)}\n"
-            f"- 当前会话开关：{self._prompt_rewrite_guard_status(session_enabled)}\n"
-            f"- 当前实际状态：{self._prompt_rewrite_guard_status(effective)}\n"
+            f"- 全局开关：{prompt_rewrite_guard_status(global_enabled)}\n"
+            f"- 当前会话开关：{prompt_rewrite_guard_status(session_enabled)}\n"
+            f"- 当前实际状态：{prompt_rewrite_guard_status(effective)}\n"
             f"- 当前会话键：`{session_key}`\n"
-            f"- 合并提示最短间隔：{self._format_duration(interval)}\n\n"
+            f"- 合并提示最短间隔：{format_duration(interval)}\n\n"
             "用法：\n"
             "- `/image2 retry` — 查看当前状态\n"
             "- `/image2 retry global <on|off>` — 切换全局重试提示\n"
             "- `/image2 retry here <on|off>` — 切换当前群/会话重试提示\n"
             "- `/image2 retry interval <秒>` — 设置合并提示最短间隔"
         )
-
-    def _provider_failure_cooldown(self) -> int:
-        return self._provider_manager.provider_failure_cooldown()
-
-    def _provider_stats_path(self) -> Path:
-        return self._provider_manager.provider_stats_path()
-
-    def _provider_failures_jsonl_path(self) -> Path:
-        return self._provider_manager.provider_failures_jsonl_path()
-
-    def _append_provider_failure_record(
-        self,
-        provider: ImageAPIProviderConfig,
-        *,
-        error_msg: str,
-        action: str,
-        attempt_index: int,
-        attempt_total: int,
-        elapsed_ms: int | None = None,
-        error: BaseException | None = None,
-    ) -> None:
-        """Append a sanitized failure record to provider_failures.jsonl."""
-        self._provider_manager.append_provider_failure_record(
-            provider,
-            error_msg=error_msg,
-            action=action,
-            attempt_index=attempt_index,
-            attempt_total=attempt_total,
-            elapsed_ms=elapsed_ms,
-            error=error,
-        )
-
-    @staticmethod
-    def _trim_jsonl(path: Path, max_lines: int = 5000) -> None:
-        trim_jsonl(path, max_lines=max_lines)
-
-    def _load_provider_stats(self) -> dict:
-        return self._provider_manager.load_provider_stats()
-
-    def _save_provider_stats(self) -> None:
-        self._provider_manager.save_provider_stats()
-
-    @staticmethod
-    def _provider_stat_int(item: dict, key: str) -> int:
-        return provider_stat_int(item, key)
-
-    @staticmethod
-    def _provider_stat_float(item: dict, key: str) -> float:
-        return provider_stat_float(item, key)
-
-    def _provider_health_score(self, item: dict, now: float) -> float:
-        return provider_health_score(item, now)
-
-    def _adaptive_sort_normal_providers(
-        self,
-        normal: list[ImageAPIProviderConfig],
-    ) -> list[ImageAPIProviderConfig]:
-        return self._provider_manager.adaptive_sort_normal_providers(normal)
-
-    def _rank_image_api_provider_configs(
-        self,
-        configs: list[ImageAPIProviderConfig],
-    ) -> list[ImageAPIProviderConfig]:
-        return self._provider_manager.rank_image_api_provider_configs(configs)
-
-    def _record_image_provider_result(
-        self,
-        provider: ImageAPIProviderConfig,
-        *,
-        success: bool,
-        error_msg: str = "",
-    ) -> None:
-        self._provider_manager.record_image_provider_result(
-            provider, success=success, error_msg=error_msg
-        )
-
-    def _update_provider_stats_summary(self) -> None:
-        self._provider_manager.update_provider_stats_summary()
-
-    @staticmethod
-    def _parse_fallback_api_provider_string(value: str) -> dict[str, str]:
-        return parse_fallback_api_provider_string(value)
 
     def _get_params(self) -> ImageParams:
         """从配置创建参数模型"""
@@ -1229,8 +1043,10 @@ class GPTImage2Plugin(Star):
             responses_model=self.config.get("responses_model", "gpt-5.5"),
             timeout=self.config.get("timeout", 120),
             response_format_b64_json=self.config.get("response_format_b64_json", True),
-            images_prompt_rewrite_guard=self._prompt_rewrite_guard_enabled("images"),
-            responses_prompt_rewrite_guard=self._prompt_rewrite_guard_enabled(
+            images_prompt_rewrite_guard=self._provider_manager.prompt_rewrite_guard_enabled(
+                "images"
+            ),
+            responses_prompt_rewrite_guard=self._provider_manager.prompt_rewrite_guard_enabled(
                 "responses"
             ),
         )
@@ -1391,12 +1207,10 @@ class GPTImage2Plugin(Star):
             api_timeout = 120
 
         try:
-            global_mode = self._normalize_api_mode(
-                self.config.get("api_mode", "images")
-            )
+            global_mode = normalize_api_mode(self.config.get("api_mode", "images"))
             provider_count = sum(
                 1
-                for provider in self._get_image_api_provider_configs()
+                for provider in self._provider_manager.get_image_api_provider_configs()
                 if provider.supports_mode(global_mode)
             )
         except ValueError:
@@ -1631,41 +1445,6 @@ class GPTImage2Plugin(Star):
                 f"after_images={len(dedup_images)} after_urls={len(dedup_urls)}"
             )
 
-    @staticmethod
-    def _is_image_input_unsupported(error_msg: str) -> bool:
-        return is_image_input_unsupported(error_msg)
-
-    # ── Failure classification ──────────────────────────────────
-
-    FAILURE_REASON_ORDER = FAILURE_REASON_ORDER
-
-    @staticmethod
-    def _classify_failure_reason(error_msg: str) -> str:
-        return classify_failure_reason(error_msg)
-
-    @staticmethod
-    def _classify_http_status_code(error_msg: str) -> int | None:
-        return classify_http_status_code(error_msg)
-
-    @staticmethod
-    def _failure_reason_is_retryable(reason_key: str) -> bool:
-        return failure_reason_is_retryable(reason_key)
-
-    @staticmethod
-    def _should_try_next_image_provider(error_msg: str) -> bool:
-        return should_try_next_image_provider(error_msg)
-
-    @staticmethod
-    def _provider_error_summary(provider_errors: list[tuple[str, str]]) -> str:
-        return provider_error_summary(provider_errors)
-
-    @staticmethod
-    def _provider_user_label(
-        provider: ImageAPIProviderConfig,
-        global_mode: str = "",
-    ) -> str:
-        return provider_user_label(provider, global_mode)
-
     async def _send_provider_switch_notice(
         self,
         event: AstrMessageEvent,
@@ -1688,10 +1467,10 @@ class GPTImage2Plugin(Star):
             state_key,
             {"last_sent_at": 0.0, "pending": []},
         )
-        interval = self._provider_retry_notice_interval()
+        interval = self._provider_manager.provider_retry_notice_interval()
         switch_summary = (
-            f"{self._provider_user_label(failed_provider, global_mode)} → "
-            f"{self._provider_user_label(next_provider, global_mode)}："
+            f"{provider_user_label(failed_provider, global_mode)} → "
+            f"{provider_user_label(next_provider, global_mode)}："
             f"{self._safe_markdown_preview(error_msg, limit=120)}"
         )
         try:
@@ -1729,16 +1508,16 @@ class GPTImage2Plugin(Star):
             if pending_items
             else ""
         )
-        interval_text = "无限流" if interval <= 0 else self._format_duration(interval)
+        interval_text = "无限流" if interval <= 0 else format_duration(interval)
         state["last_sent_at"] = now
         state["pending"] = []
 
         await self._send_processing_ack(
             event,
             "## 🔁 正在切换备用 API 站点\n\n"
-            f"- 已失败：**{self._provider_user_label(failed_provider, global_mode)}**\n"
+            f"- 已失败：**{provider_user_label(failed_provider, global_mode)}**\n"
             f"- 失败原因：{self._safe_markdown_preview(error_msg, limit=220)}\n"
-            f"- 即将尝试：**{self._provider_user_label(next_provider, global_mode)}**"
+            f"- 即将尝试：**{provider_user_label(next_provider, global_mode)}**"
             f"（第 {next_index}/{total} 个站点）"
             f"{suppressed_text}\n"
             f"- 当前合并提示间隔：{interval_text}",
@@ -1761,7 +1540,7 @@ class GPTImage2Plugin(Star):
         tag_prefix = f"[任务 #{task_tag}]\n\n" if task_tag else ""
         return Plain(
             tag_prefix + "✅ 生图成功："
-            f"{self._provider_user_label(provider, global_mode)}"
+            f"{provider_user_label(provider, global_mode)}"
             f"（第 {attempt_index}/{total} 个站点{retry_text}，耗时 {elapsed_ms}ms）\n"
         )
 
@@ -1845,12 +1624,12 @@ class GPTImage2Plugin(Star):
             消息组件列表（可空），供 caller yield chain_result 或 event.send
         """
         try:
-            provider_configs = self._get_image_api_provider_configs()
+            provider_configs = self._provider_manager.get_image_api_provider_configs()
         except ValueError as e:
             await self._send_text(event, str(e), action=f"{action}-config-error")
             return []
 
-        global_mode = self._normalize_api_mode(self.config.get("api_mode", "images"))
+        global_mode = normalize_api_mode(self.config.get("api_mode", "images"))
 
         # Filter providers by global mode support
         viable = [p for p in provider_configs if p.supports_mode(global_mode)]
@@ -1918,19 +1697,21 @@ class GPTImage2Plugin(Star):
                     reference_count=reference_count,
                     action=provider_action,
                 )
-                self._record_image_provider_result(provider, success=True)
+                self._provider_manager.record_image_provider_result(
+                    provider, success=True
+                )
                 selected_provider = provider
                 selected_attempt_index = index
                 break
             except RuntimeError as e:
                 error_msg = str(e)
                 attempt_elapsed = self._elapsed_ms(attempt_start)
-                self._record_image_provider_result(
+                self._provider_manager.record_image_provider_result(
                     provider,
                     success=False,
                     error_msg=error_msg,
                 )
-                self._append_provider_failure_record(
+                self._provider_manager.append_provider_failure_record(
                     provider,
                     error_msg=error_msg,
                     action=action,
@@ -1948,9 +1729,7 @@ class GPTImage2Plugin(Star):
                     f"{len(viable)} role={provider.role} "
                     f"elapsed_ms={attempt_elapsed} error={e}"
                 )
-                if index < len(viable) and self._should_try_next_image_provider(
-                    error_msg
-                ):
+                if index < len(viable) and should_try_next_image_provider(error_msg):
                     await self._send_provider_switch_notice(
                         event,
                         action=action,
@@ -1963,8 +1742,8 @@ class GPTImage2Plugin(Star):
                     )
                     continue
 
-                provider_summary = self._provider_error_summary(provider_errors)
-                if reference_count and self._is_image_input_unsupported(error_msg):
+                provider_summary = provider_error_summary(provider_errors)
+                if reference_count and is_image_input_unsupported(error_msg):
                     await self._send_text(
                         event,
                         "## ⚠️ 上游拒绝读取参考图\n\n"
@@ -2009,7 +1788,7 @@ class GPTImage2Plugin(Star):
             await self._send_text(
                 event,
                 "## ⚠️ GPT Image2 调用失败\n\n所有 API 站点均未返回结果。"
-                f"{self._provider_error_summary(provider_errors)}",
+                f"{provider_error_summary(provider_errors)}",
                 action=f"{action}-provider-empty",
                 task_anchor=True,
             )
@@ -2068,30 +1847,32 @@ class GPTImage2Plugin(Star):
         t2i_status = "✅ 开启" if self._render_text_as_image_enabled() else "关闭"
         save_status = "✅ 开启" if cfg.get("save_outputs", True) else "关闭"
         adaptive_status = (
-            "✅ 开启" if self._adaptive_provider_priority_enabled() else "关闭"
+            "✅ 开启"
+            if self._provider_manager.adaptive_provider_priority_enabled()
+            else "关闭"
         )
         edit_aliases = self._get_edit_aliases()
         edit_aliases_status = (
             "、".join(f"`{alias}`" for alias in edit_aliases) or "未配置"
         )
-        retry_notice_status = self._prompt_rewrite_guard_status(
-            self._provider_retry_notice_global_enabled()
+        retry_notice_status = prompt_rewrite_guard_status(
+            self._provider_manager.provider_retry_notice_global_enabled()
         )
-        retry_notice_interval = self._provider_retry_notice_interval()
-        images_guard_status = self._prompt_rewrite_guard_status(
-            self._prompt_rewrite_guard_enabled("images")
+        retry_notice_interval = self._provider_manager.provider_retry_notice_interval()
+        images_guard_status = prompt_rewrite_guard_status(
+            self._provider_manager.prompt_rewrite_guard_enabled("images")
         )
-        responses_guard_status = self._prompt_rewrite_guard_status(
-            self._prompt_rewrite_guard_enabled("responses")
+        responses_guard_status = prompt_rewrite_guard_status(
+            self._provider_manager.prompt_rewrite_guard_enabled("responses")
         )
-        current_mode = self._normalize_api_mode(cfg.get("api_mode", "images"))
+        current_mode = normalize_api_mode(cfg.get("api_mode", "images"))
         primary_provider_name = str(cfg.get("primary_provider_name", "") or "primary")
-        authoritative_enabled = self._normalize_bool(
+        authoritative_enabled = normalize_bool(
             cfg.get("authoritative_fallback_enabled"), default=False
         )
         authoritative_status = "✅ 开启" if authoritative_enabled else "❌ 关闭"
         try:
-            provider_configs = self._get_image_api_provider_configs()
+            provider_configs = self._provider_manager.get_image_api_provider_configs()
             image_provider_count = len(provider_configs)
             viable_provider_count = sum(
                 1 for p in provider_configs if p.supports_mode(current_mode)
@@ -2139,7 +1920,7 @@ class GPTImage2Plugin(Star):
             f"| 权威兜底 | {authoritative_status} |\n"
             f"| 生图 API 站点 | {image_provider_count} 个（当前模式可用 {viable_provider_count} 个） |\n"
             f"| 自适应站点优先级 | {adaptive_status} |\n"
-            f"| 备用站点重试提示 | {retry_notice_status}，间隔 {self._format_duration(retry_notice_interval)} |\n"
+            f"| 备用站点重试提示 | {retry_notice_status}，间隔 {format_duration(retry_notice_interval)} |\n"
             f"| edit 别名 | {edit_aliases_status} |\n"
             f"| Plan 模型 | `{cfg.get('plan_model', 'gpt-5.4')}` |\n"
             f"| Plan 空闲超时 | {cfg.get('plan_timeout', 300)} 秒 |\n"
@@ -2164,7 +1945,7 @@ class GPTImage2Plugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def mode(self, event: AstrMessageEvent, mode: str | None = None):
         """查看或切换 API 模式（管理员）"""
-        current_mode = self._normalize_api_mode(self.config.get("api_mode", "images"))
+        current_mode = normalize_api_mode(self.config.get("api_mode", "images"))
         logger.info(
             "[GPTImage2] mode command received "
             f"{self._event_context(event)} current_mode={current_mode} "
@@ -2201,7 +1982,7 @@ class GPTImage2Plugin(Star):
             return
 
         try:
-            provider_configs = self._get_image_api_provider_configs()
+            provider_configs = self._provider_manager.get_image_api_provider_configs()
             provider_count = len(provider_configs)
             viable_provider_count = sum(
                 1 for p in provider_configs if p.supports_mode(next_mode)
@@ -2260,12 +2041,14 @@ class GPTImage2Plugin(Star):
             "both": "all",
             "全部": "all",
         }
-        current_images = self._prompt_rewrite_guard_enabled("images")
-        current_responses = self._prompt_rewrite_guard_enabled("responses")
+        current_images = self._provider_manager.prompt_rewrite_guard_enabled("images")
+        current_responses = self._provider_manager.prompt_rewrite_guard_enabled(
+            "responses"
+        )
         status_md = (
             "## Prompt Guard\n\n"
-            f"- Images API：{self._prompt_rewrite_guard_status(current_images)}\n"
-            f"- Responses API：{self._prompt_rewrite_guard_status(current_responses)}\n\n"
+            f"- Images API：{prompt_rewrite_guard_status(current_images)}\n"
+            f"- Responses API：{prompt_rewrite_guard_status(current_responses)}\n\n"
             "用法：`/image2 guard <images|responses|all> <on|off>`"
         )
 
@@ -2294,7 +2077,7 @@ class GPTImage2Plugin(Star):
             yield await self._text_result(event, status_md, action="guard-target-help")
             return
 
-        next_value = self._parse_bool_switch(state)
+        next_value = parse_bool_switch(state)
         if next_value is None:
             yield await self._text_result(
                 event,
@@ -2312,12 +2095,12 @@ class GPTImage2Plugin(Star):
         )
         rows: list[str] = []
         for api_mode in targets:
-            key = self._prompt_rewrite_guard_config_key(api_mode)
-            old_value = self._prompt_rewrite_guard_enabled(api_mode)
+            key = prompt_rewrite_guard_config_key(api_mode)
+            old_value = self._provider_manager.prompt_rewrite_guard_enabled(api_mode)
             self.config[key] = next_value
             rows.append(
-                f"- {api_mode}：{self._prompt_rewrite_guard_status(old_value)} → "
-                f"{self._prompt_rewrite_guard_status(next_value)}"
+                f"- {api_mode}：{prompt_rewrite_guard_status(old_value)} → "
+                f"{prompt_rewrite_guard_status(next_value)}"
             )
 
         saved = self._save_config()
@@ -2359,7 +2142,7 @@ class GPTImage2Plugin(Star):
             return
 
         if target_text in {"global", "all", "全局"}:
-            next_value = self._parse_bool_switch(state_text)
+            next_value = parse_bool_switch(state_text)
             if next_value is None:
                 yield await self._text_result(
                     event,
@@ -2367,7 +2150,7 @@ class GPTImage2Plugin(Star):
                     action="retry-global-invalid",
                 )
                 return
-            old_value = self._provider_retry_notice_global_enabled()
+            old_value = self._provider_manager.provider_retry_notice_global_enabled()
             self.config["provider_retry_notice_enabled"] = next_value
             self._provider_retry_notice_state.clear()
             saved = self._save_config()
@@ -2375,15 +2158,15 @@ class GPTImage2Plugin(Star):
             yield await self._text_result(
                 event,
                 "## ✅ 全局备用站点重试提示已更新\n\n"
-                f"{self._prompt_rewrite_guard_status(old_value)} → "
-                f"{self._prompt_rewrite_guard_status(next_value)}\n\n"
+                f"{prompt_rewrite_guard_status(old_value)} → "
+                f"{prompt_rewrite_guard_status(next_value)}\n\n"
                 f"{suffix}",
                 action="retry-global-switched",
             )
             return
 
         if target_text in {"here", "group", "session", "当前", "本群"}:
-            next_value = self._parse_bool_switch(state_text)
+            next_value = parse_bool_switch(state_text)
             if next_value is None:
                 yield await self._text_result(
                     event,
@@ -2394,7 +2177,9 @@ class GPTImage2Plugin(Star):
                 return
             session_key = self._provider_retry_notice_session_key(event)
             old_value = self._provider_retry_notice_session_enabled(event)
-            self._set_provider_retry_notice_session_enabled(session_key, next_value)
+            self._provider_manager.set_provider_retry_notice_session_enabled(
+                session_key, next_value
+            )
             self._provider_retry_notice_state.pop(session_key, None)
             saved = self._save_config()
             suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
@@ -2402,8 +2187,8 @@ class GPTImage2Plugin(Star):
                 event,
                 "## ✅ 当前会话备用站点重试提示已更新\n\n"
                 f"- 会话键：`{session_key}`\n"
-                f"- 状态：{self._prompt_rewrite_guard_status(old_value)} → "
-                f"{self._prompt_rewrite_guard_status(next_value)}\n\n"
+                f"- 状态：{prompt_rewrite_guard_status(old_value)} → "
+                f"{prompt_rewrite_guard_status(next_value)}\n\n"
                 f"{suffix}",
                 action="retry-here-switched",
             )
@@ -2420,7 +2205,7 @@ class GPTImage2Plugin(Star):
                     action="retry-interval-invalid",
                 )
                 return
-            old_interval = self._provider_retry_notice_interval()
+            old_interval = self._provider_manager.provider_retry_notice_interval()
             self.config["provider_retry_notice_interval"] = next_interval
             self._provider_retry_notice_state.clear()
             saved = self._save_config()
@@ -2428,8 +2213,8 @@ class GPTImage2Plugin(Star):
             yield await self._text_result(
                 event,
                 "## ✅ 备用站点重试提示间隔已更新\n\n"
-                f"{self._format_duration(old_interval)} → "
-                f"{self._format_duration(next_interval)}\n\n"
+                f"{format_duration(old_interval)} → "
+                f"{format_duration(next_interval)}\n\n"
                 f"{suffix}",
                 action="retry-interval-switched",
             )
@@ -2447,10 +2232,10 @@ class GPTImage2Plugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def providers(self, event: AstrMessageEvent):
         """显示当前生图站点状态（管理员）"""
-        global_mode = self._normalize_api_mode(self.config.get("api_mode", "images"))
+        global_mode = normalize_api_mode(self.config.get("api_mode", "images"))
 
         try:
-            configs = self._get_image_api_provider_configs()
+            configs = self._provider_manager.get_image_api_provider_configs()
         except ValueError as e:
             yield await self._text_result(
                 event,
@@ -2459,7 +2244,7 @@ class GPTImage2Plugin(Star):
             )
             return
 
-        stats = self._load_provider_stats().get("providers", {})
+        stats = self._provider_manager.load_provider_stats().get("providers", {})
         now = time()
 
         primary = [c for c in configs if c.role == "primary"]
@@ -2562,7 +2347,7 @@ class GPTImage2Plugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def stats(self, event: AstrMessageEvent, sub: str | None = None):
         """显示生图站点统计和诊断信息（管理员）"""
-        stats_data = self._load_provider_stats()
+        stats_data = self._provider_manager.load_provider_stats()
         providers_data = stats_data.get("providers", {})
         if not isinstance(providers_data, dict):
             providers_data = {}
@@ -2578,7 +2363,7 @@ class GPTImage2Plugin(Star):
                     count = max(1, min(50, int(parts[1].strip())))
                 except (TypeError, ValueError):
                     count = 10
-            records = self._read_recent_failure_records_inst(count)
+            records = self._provider_manager.read_recent_failure_records_inst(count)
             yield await self._text_result(
                 event,
                 build_stats_recent_markdown(records),
@@ -2590,7 +2375,7 @@ class GPTImage2Plugin(Star):
         show_all = sub_str == "all"
 
         try:
-            configs = self._get_image_api_provider_configs()
+            configs = self._provider_manager.get_image_api_provider_configs()
         except ValueError:
             configs = []
 
@@ -2599,17 +2384,6 @@ class GPTImage2Plugin(Star):
             build_stats_summary_markdown(stats_data, configs, show_all=show_all),
             action="stats",
         )
-
-    @staticmethod
-    def _read_recent_failure_records(
-        count: int,
-        *,
-        path: Path | None = None,
-    ) -> list[dict]:
-        return read_recent_failure_records(count, path=path)
-
-    def _read_recent_failure_records_inst(self, count: int) -> list[dict]:
-        return self._provider_manager.read_recent_failure_records_inst(count)
 
     @image2.command("diag")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -2620,8 +2394,8 @@ class GPTImage2Plugin(Star):
         diag_dir = plugin_data_root / "diagnostics"
         timestamp = _time_module.strftime("%Y%m%d-%H%M%S")
         zip_path = diag_dir / f"diag-{plugin_name}-{timestamp}.zip"
-        stats_data = self._load_provider_stats()
-        failures_path = self._provider_failures_jsonl_path()
+        stats_data = self._provider_manager.load_provider_stats()
+        failures_path = self._provider_manager.provider_failures_jsonl_path()
 
         try:
             build_diag_zip(
