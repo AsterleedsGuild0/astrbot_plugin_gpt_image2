@@ -24,6 +24,99 @@ from ..providers.manager import (
 )
 
 
+def _positive_count_items(raw_counts: object) -> list[tuple[str, int]]:
+    """从统计字典中提取正整数计数项。"""
+    if not isinstance(raw_counts, dict):
+        return []
+    items: list[tuple[str, int]] = []
+    for key in raw_counts:
+        count = provider_stat_int(raw_counts, key)
+        if count > 0:
+            items.append((str(key), count))
+    return items
+
+
+def _failure_reason_sort_key(item: tuple[str, int]) -> tuple[int, int, str]:
+    """按计数和预定义原因顺序稳定排序失败原因。"""
+    reason, count = item
+    try:
+        order_index = FAILURE_REASON_ORDER.index(reason)
+    except ValueError:
+        order_index = len(FAILURE_REASON_ORDER)
+    return (order_index, -count, reason)
+
+
+def _failure_distribution_buckets(
+    provider_item: dict, failure_count: int
+) -> list[tuple[str, int]]:
+    """构建完整失败分布，包含 HTTP 状态码和无响应状态的失败原因。"""
+    failure_count = max(0, failure_count)
+    if failure_count <= 0:
+        return []
+
+    code_items = _positive_count_items(provider_item.get("failure_status_codes", {}))
+    code_items.sort(key=lambda x: (-x[1], x[0]))
+
+    buckets: list[tuple[str, int]] = []
+    remaining_failure_count = failure_count
+    for code, count in code_items:
+        if remaining_failure_count <= 0:
+            break
+        used = min(count, remaining_failure_count)
+        buckets.append((f"HTTP {code}", used))
+        remaining_failure_count -= used
+
+    no_status_count = remaining_failure_count
+    if no_status_count <= 0:
+        return buckets
+
+    reason_items = [
+        (reason, count)
+        for reason, count in _positive_count_items(
+            provider_item.get("failure_reasons", {})
+        )
+        if not reason.startswith("http_")
+    ]
+    reason_items.sort(key=_failure_reason_sort_key)
+
+    remaining = no_status_count
+    for reason, count in reason_items:
+        if remaining <= 0:
+            break
+        used = min(count, remaining)
+        if used > 0:
+            buckets.append((reason, used))
+            remaining -= used
+
+    if remaining > 0:
+        buckets.append(("无响应状态/未细分", remaining))
+    return buckets
+
+
+def _format_failure_distribution(
+    provider_item: dict,
+    *,
+    total_count: int,
+    failure_count: int,
+    max_parts: int = 6,
+) -> str:
+    """格式化 Provider 失败分布，确保无状态失败也计入百分比。"""
+    if total_count <= 0 or failure_count <= 0:
+        return "-"
+
+    buckets = _failure_distribution_buckets(provider_item, failure_count)
+    if not buckets:
+        return f"其他 {failure_count / total_count * 100:.1f}%"
+
+    if len(buckets) > max_parts:
+        head = buckets[: max_parts - 1]
+        rest_count = sum(count for _label, count in buckets[max_parts - 1 :])
+        buckets = head + [("其他", rest_count)]
+
+    parts = [f"{label} {count / total_count * 100:.1f}%" for label, count in buckets]
+    return ", ".join(parts)
+
+
 def build_stats_recent_markdown(records: list[dict]) -> str:
     """构建 ``/image2 stats recent [N]`` 的 Markdown 展示。"""
     if not records:
@@ -140,11 +233,14 @@ def build_stats_summary_markdown(
                 lines.append(f"- `{reason}`：{count_val} 次\n")
         lines.append("\n")
 
-    # 主要失败状态码。
+    # 主要 HTTP 失败状态码；超时/网络错误等无响应状态失败见上方失败原因。
     if all_codes:
-        lines.append("### 🔴 主要失败状态码\n\n")
+        lines.append("### 主要 HTTP 失败状态码\n\n")
         for code, count_val in sorted(all_codes.items(), key=lambda x: -x[1]):
             lines.append(f"- HTTP `{code}`：{count_val} 次\n")
+        no_status_count = max(0, total_failure - sum(all_codes.values()))
+        if no_status_count > 0:
+            lines.append(f"- 无响应状态/未细分：{no_status_count} 次\n")
         lines.append("\n")
 
     # 各 Provider 表格按成功率降序展示。
@@ -187,9 +283,9 @@ def build_stats_summary_markdown(
             lines.append(row)
         lines.append("\n")
 
-        # 补充展示各 Provider 的状态码分布。
-        lines.append("### 各站点状态码分布\n\n")
-        lines.append("| 站点 | 200 | 非 200 分布 |\n|------|-----|------------|\n")
+        # 补充展示各 Provider 的响应/失败分布。
+        lines.append("### 各站点响应分布\n\n")
+        lines.append("| 站点 | 成功 | 失败分布 |\n|------|------|----------|\n")
 
         sc_rows: list[tuple[float, str]] = []
         for pid, item in displayed_providers.items():
@@ -202,26 +298,17 @@ def build_stats_summary_markdown(
 
             p200_pct = f"{round(p_success / p_total * 100, 1)}%" if p_total > 0 else "-"
 
-            fsc = item.get("failure_status_codes", {})
-            if isinstance(fsc, dict) and fsc and p_total > 0:
-                non200_parts: list[str] = []
-                sorted_codes = sorted(fsc.items(), key=lambda x: -x[1])
-                for code, cnt in sorted_codes[:4]:
-                    prob = cnt / p_total * 100
-                    non200_parts.append(f"{code} {prob:.1f}%")
-                if len(sorted_codes) > 4:
-                    non200_parts.append(f"等 {len(sorted_codes)} 类")
-                non200_str = ", ".join(non200_parts)
-            elif p_total > 0 and p_failure > 0:
-                non200_str = f"其他 {round(p_failure / p_total * 100, 1)}%"
-            else:
-                non200_str = "-"
+            failure_distribution = _format_failure_distribution(
+                item,
+                total_count=p_total,
+                failure_count=p_failure,
+            )
 
             sort_key = p_success / p_total if p_total > 0 else -1.0
             sc_rows.append(
                 (
                     sort_key,
-                    f"| {p_name} | {p200_pct} | {non200_str} |\n",
+                    f"| {p_name} | {p200_pct} | {failure_distribution} |\n",
                 )
             )
 
@@ -269,11 +356,15 @@ def build_diag_summary_markdown(stats_data: dict) -> str:
                 lines.append(f"- {reason}: {count2}\n")
             lines.append("\n")
 
-        codes = summary.get("failure_status_codes", {})
-        if isinstance(codes, dict) and codes:
-            lines.append("### 失败状态码分布\n\n")
-            for code, count2 in sorted(codes.items(), key=lambda x: -x[1]):
+        code_items = _positive_count_items(summary.get("failure_status_codes", {}))
+        code_total = sum(count for _code, count in code_items)
+        no_status_total = max(0, s_failure - code_total)
+        if code_items or no_status_total > 0:
+            lines.append("### HTTP 失败状态码分布\n\n")
+            for code, count2 in sorted(code_items, key=lambda x: -x[1]):
                 lines.append(f"- HTTP {code}: {count2}\n")
+            if no_status_total > 0:
+                lines.append(f"- 无响应状态/未细分: {no_status_total}\n")
             lines.append("\n")
 
     lines.append("## 各站点统计\n\n")

@@ -1718,6 +1718,7 @@ class GPTImage2Plugin(Star):
                     provider,
                     success=False,
                     error_msg=error_msg,
+                    error=e,
                 )
                 self._provider_manager.append_provider_failure_record(
                     provider,
