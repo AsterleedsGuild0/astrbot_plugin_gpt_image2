@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 from pathlib import Path
 from time import time
 
@@ -32,18 +33,18 @@ from astrbot.api import logger
 
 def safe_text_preview(text: str, *, limit: int = 160) -> str:
     """Compact safe text preview for diagnostics."""
-    normalized = " ".join(text.replace("\x00", "\ufffd").split())
+    normalized = " ".join(text.replace("\x00", "?").split())
     if len(normalized) > limit:
-        normalized = normalized[:limit] + "\u2026"
+        normalized = normalized[:limit] + "..."
     return repr(normalized)
 
 
 def safe_markdown_preview(text: str, *, limit: int = 160) -> str:
     """Compact provider errors for Markdown cards without inline-code breakage."""
-    normalized = " ".join(str(text).replace("\x00", "\ufffd").split())
+    normalized = " ".join(str(text).replace("\x00", "?").split())
     normalized = normalized.replace("`", "'")
     if len(normalized) > limit:
-        normalized = normalized[:limit].rstrip() + "\u2026"
+        normalized = normalized[:limit].rstrip() + "..."
     return normalized or "-"
 
 
@@ -183,25 +184,24 @@ def classify_failure_reason(error_msg: str) -> str:
 
     # Network errors
     if "timeoutexception" in lower or (
-        "\u7f51\u7edc\u8bf7\u6c42\u5931\u8d25" in error_msg
-        and "\u8d85\u65f6" in error_msg
+        "网络请求失败" in error_msg and "超时" in error_msg
     ):
         return "network_timeout"
-    if "proxyerror" in lower or "\u4ee3\u7406\u8fde\u63a5\u5931\u8d25" in error_msg:
+    if "proxyerror" in lower or "代理连接失败" in error_msg:
         return "network_proxy"
-    if "remoteprotocolerror" in lower or "\u534f\u8bae\u5f02\u5e38" in error_msg:
+    if "remoteprotocolerror" in lower or "协议异常" in error_msg:
         return "network_protocol"
     if (
         "connecterror" in lower
-        or "\u8fde\u63a5\u5931\u8d25" in error_msg
+        or "连接失败" in error_msg
         or "connection refused" in lower
     ):
         return "network_connect"
-    if "networkerror" in lower or "\u7f51\u7edc\u4f20\u8f93\u5f02\u5e38" in error_msg:
+    if "networkerror" in lower or "网络传输异常" in error_msg:
         return "network_connect"
 
     # HTML error page
-    if "html \u9519\u8bef\u9875" in error_msg or ("html" in lower and "error" in lower):
+    if "html 错误页" in error_msg or ("html" in lower and "error" in lower):
         return "html_error_page"
 
     # HTTP status code classification
@@ -231,10 +231,7 @@ def classify_failure_reason(error_msg: str) -> str:
             return "http_5xx"
 
     # API schema errors
-    if (
-        "api \u8fd4\u56de\u9519\u8bef" in error_msg
-        or "api \u8fd4\u56de\u7ed3\u6784\u5f02\u5e38" in error_msg
-    ):
+    if "api 返回错误" in lower or "api 返回结构异常" in lower:
         return "api_schema_error"
 
     # Provider compatibility
@@ -255,14 +252,30 @@ def classify_failure_reason(error_msg: str) -> str:
 
 
 def classify_http_status_code(error_msg: str) -> int | None:
-    """Extract HTTP status code from error message, if parseable."""
+    """从错误消息中提取可解析的 HTTP 状态码。"""
     if error_msg.startswith("HTTP "):
         parts = error_msg.split(maxsplit=2)
         try:
             return int(parts[1])
         except (IndexError, ValueError):
             pass
+    match = re.search(r"\bHTTP\s+(\d{3})\b", error_msg)
+    if match is not None:
+        return int(match.group(1))
     return None
+
+
+def diagnostic_http_status_code(error: "BaseException | None") -> int | None:
+    """从结构化 API 错误中读取 HTTP 状态码。"""
+    if error is None or type(error).__name__ != "ImageAPIError":
+        return None
+
+    # 避免模块顶层导入 ImageAPIError，防止 api/client 与 provider manager 循环依赖。
+    from ..api.client import ImageAPIError as _IAE
+
+    if not isinstance(error, _IAE) or error.diagnostics is None:
+        return None
+    return error.diagnostics.status_code
 
 
 def failure_reason_is_retryable(reason_key: str) -> bool:
@@ -277,14 +290,14 @@ def should_try_next_image_provider(error_msg: str) -> bool:
     if is_image_input_unsupported(error_msg):
         return True
     if (
-        "\u7f51\u7edc\u8bf7\u6c42\u5931\u8d25" in error_msg
+        "网络请求失败" in error_msg
         or "connecterror" in lower
         or "timeout" in lower
         or "timed out" in lower
         or "connection" in lower
-        or "api \u8fd4\u56de\u9519\u8bef" in error_msg
-        or "api \u8fd4\u56de\u7ed3\u6784\u5f02\u5e38" in error_msg
-        or "html \u9519\u8bef\u9875" in error_msg
+        or "api 返回错误" in lower
+        or "api 返回结构异常" in lower
+        or "html 错误页" in error_msg
         or "invalid endpoint for image generation models" in lower
     ):
         return True
@@ -424,9 +437,9 @@ def provider_error_summary(provider_errors: list[tuple[str, str]]) -> str:
     """Build a Markdown error summary for all failed providers."""
     if not provider_errors:
         return ""
-    lines = ["\n\n\u5df2\u5c1d\u8bd5\u7684 API \u7ad9\u70b9\uff1a"]
+    lines = ["\n\n已尝试的 API 站点："]
     for name, error in provider_errors:
-        lines.append(f"- **{name}**\uff1a{safe_markdown_preview(error, limit=160)}")
+        lines.append(f"- **{name}**：{safe_markdown_preview(error, limit=160)}")
     return "\n".join(lines)
 
 
@@ -435,11 +448,7 @@ def provider_user_label(
     global_mode: str = "",
 ) -> str:
     """Build a user-facing label for a provider."""
-    suffix = (
-        " / \u6743\u5a01\u5157\u5e95"
-        if provider.role == "authoritative_fallback"
-        else ""
-    )
+    suffix = " / 权威兜底" if provider.role == "authoritative_fallback" else ""
     mode_label = f" / {global_mode}" if global_mode else ""
     return f"{provider.name}{mode_label}{suffix}"
 
@@ -460,7 +469,7 @@ def prompt_rewrite_guard_default(api_mode: str) -> bool:
 
 def prompt_rewrite_guard_status(enabled: bool) -> str:
     """Return a human-readable status string for a guard setting."""
-    return "\u2705 \u5f00\u542f" if enabled else "\u5173\u95ed"
+    return "开启" if enabled else "关闭"
 
 
 def parse_bool_switch(value: object) -> bool | None:
@@ -474,9 +483,9 @@ def parse_bool_switch(value: object) -> bool | None:
         "on",
         "enable",
         "enabled",
-        "\u5f00\u542f",
-        "\u5f00",
-        "\u542f\u7528",
+        "开启",
+        "开",
+        "启用",
     }:
         return True
     if text in {
@@ -487,9 +496,9 @@ def parse_bool_switch(value: object) -> bool | None:
         "off",
         "disable",
         "disabled",
-        "\u5173\u95ed",
-        "\u5173",
-        "\u7981\u7528",
+        "关闭",
+        "关",
+        "禁用",
     }:
         return False
     return None
@@ -932,8 +941,8 @@ class ProviderManager:
 
         if not configs:
             raise ValueError(
-                "\u672a\u914d\u7f6e\u4efb\u4f55\u53ef\u7528\u7684\u751f\u56fe API Key\u3002\u8bf7\u914d\u7f6e api_key\uff0c"
-                "\u6216\u5728 fallback_api_providers \u4e2d\u914d\u7f6e api_key\u3002"
+                "未配置任何可用的生图 API Key。请配置 api_key，"
+                "或在 fallback_api_providers 中配置 api_key。"
             )
         return self.rank_image_api_provider_configs(configs)
 
@@ -1089,6 +1098,7 @@ class ProviderManager:
         *,
         success: bool,
         error_msg: str = "",
+        error: "BaseException | None" = None,
     ) -> None:
         if not self.adaptive_provider_priority_enabled():
             return
@@ -1145,6 +1155,8 @@ class ProviderManager:
 
             # v2: failure status code counts
             status_code = classify_http_status_code(error_msg)
+            if status_code is None:
+                status_code = diagnostic_http_status_code(error)
             if status_code is not None:
                 code_str = str(status_code)
                 codes = item.setdefault("failure_status_codes", {})
