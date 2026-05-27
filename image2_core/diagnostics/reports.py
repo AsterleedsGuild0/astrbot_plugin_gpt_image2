@@ -49,7 +49,7 @@ def _failure_reason_sort_key(item: tuple[str, int]) -> tuple[int, int, str]:
 def _failure_distribution_buckets(
     provider_item: dict, failure_count: int
 ) -> list[tuple[str, int]]:
-    """构建完整失败分布，包含 HTTP 状态码和无响应状态的失败原因。"""
+    """构建可量化失败分布，忽略早期缺少明细的历史缺口。"""
     failure_count = max(0, failure_count)
     if failure_count <= 0:
         return []
@@ -88,9 +88,16 @@ def _failure_distribution_buckets(
             buckets.append((reason, used))
             remaining -= used
 
-    if remaining > 0:
-        buckets.append(("无响应状态/未细分", remaining))
     return buckets
+
+
+def _known_unrecorded_http_status_count(provider_item: dict, failure_count: int) -> int:
+    """统计已有失败原因但未记录 HTTP 状态的可量化失败数。"""
+    return sum(
+        count
+        for label, count in _failure_distribution_buckets(provider_item, failure_count)
+        if not label.startswith("HTTP ")
+    )
 
 
 def _format_failure_distribution(
@@ -100,13 +107,13 @@ def _format_failure_distribution(
     failure_count: int,
     max_parts: int = 6,
 ) -> str:
-    """格式化 Provider 失败分布，确保无状态失败也计入百分比。"""
+    """格式化 Provider 失败分布，只展示可量化失败项。"""
     if total_count <= 0 or failure_count <= 0:
         return "-"
 
     buckets = _failure_distribution_buckets(provider_item, failure_count)
     if not buckets:
-        return f"其他 {failure_count / total_count * 100:.1f}%"
+        return "-"
 
     if len(buckets) > max_parts:
         head = buckets[: max_parts - 1]
@@ -191,6 +198,7 @@ def build_stats_summary_markdown(
     # 汇总当前展示范围内的 Provider 统计。
     total_success = 0
     total_failure = 0
+    known_no_status_total = 0
     all_reasons: dict[str, int] = {}
     all_codes: dict[str, int] = {}
 
@@ -198,7 +206,9 @@ def build_stats_summary_markdown(
         if not isinstance(item, dict):
             continue
         total_success += provider_stat_int(item, "success_count")
-        total_failure += provider_stat_int(item, "failure_count")
+        item_failure = provider_stat_int(item, "failure_count")
+        total_failure += item_failure
+        known_no_status_total += _known_unrecorded_http_status_count(item, item_failure)
 
         reasons = item.get("failure_reasons", {})
         if isinstance(reasons, dict):
@@ -233,14 +243,13 @@ def build_stats_summary_markdown(
                 lines.append(f"- `{reason}`：{count_val} 次\n")
         lines.append("\n")
 
-    # 主要 HTTP 失败状态码；超时/网络错误等无响应状态失败见上方失败原因。
-    if all_codes:
+    # 主要 HTTP 失败状态码；未记录 HTTP 状态只统计已有失败原因明细的部分。
+    if all_codes or known_no_status_total > 0:
         lines.append("### 主要 HTTP 失败状态码\n\n")
         for code, count_val in sorted(all_codes.items(), key=lambda x: -x[1]):
             lines.append(f"- HTTP `{code}`：{count_val} 次\n")
-        no_status_count = max(0, total_failure - sum(all_codes.values()))
-        if no_status_count > 0:
-            lines.append(f"- 无响应状态/未细分：{no_status_count} 次\n")
+        if known_no_status_total > 0:
+            lines.append(f"- 未记录 HTTP 状态：{known_no_status_total} 次\n")
         lines.append("\n")
 
     # 各 Provider 表格按成功率降序展示。
@@ -357,14 +366,21 @@ def build_diag_summary_markdown(stats_data: dict) -> str:
             lines.append("\n")
 
         code_items = _positive_count_items(summary.get("failure_status_codes", {}))
-        code_total = sum(count for _code, count in code_items)
-        no_status_total = max(0, s_failure - code_total)
-        if code_items or no_status_total > 0:
+        known_no_status_total = 0
+        if isinstance(providers, dict):
+            for item in providers.values():
+                if not isinstance(item, dict):
+                    continue
+                known_no_status_total += _known_unrecorded_http_status_count(
+                    item,
+                    provider_stat_int(item, "failure_count"),
+                )
+        if code_items or known_no_status_total > 0:
             lines.append("### HTTP 失败状态码分布\n\n")
             for code, count2 in sorted(code_items, key=lambda x: -x[1]):
                 lines.append(f"- HTTP {code}: {count2}\n")
-            if no_status_total > 0:
-                lines.append(f"- 无响应状态/未细分: {no_status_total}\n")
+            if known_no_status_total > 0:
+                lines.append(f"- 未记录 HTTP 状态: {known_no_status_total}\n")
             lines.append("\n")
 
     lines.append("## 各站点统计\n\n")

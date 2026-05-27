@@ -68,10 +68,10 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
             "network_timeout 12.0%, network_connect 8.0% |",
             markdown,
         )
-        self.assertIn("- 无响应状态/未细分：20 次", markdown)
+        self.assertIn("- 未记录 HTTP 状态：20 次", markdown)
 
     def test_failure_distribution_uses_generic_bucket_for_missing_reasons(self):
-        """旧统计缺少原因明细时，用未细分桶补齐失败占比。"""
+        """旧统计缺少原因明细时，不再展示不可量化历史缺口。"""
         stats_data = {
             "providers": {
                 "pid-a": {
@@ -87,7 +87,37 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
 
         markdown = build_stats_summary_markdown(stats_data, [_provider()])
 
-        self.assertIn("HTTP 429 25.0%, 无响应状态/未细分 50.0%", markdown)
+        self.assertIn("HTTP 429 25.0%", markdown)
+        self.assertNotIn("历史未记录/未细分", markdown)
+
+    def test_failure_distribution_labels_historical_unclassified_remainder(self):
+        """聚合统计缺少历史原因明细时，失败分布仅展示可量化部分。"""
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 162,
+                    "failure_count": 164,
+                    "failure_status_codes": {"400": 67, "502": 41},
+                    "failure_reasons": {
+                        "http_400": 67,
+                        "http_5xx": 41,
+                        "network_timeout": 17,
+                        "network_connect": 4,
+                    },
+                }
+            }
+        }
+
+        markdown = build_stats_summary_markdown(stats_data, [_provider()])
+
+        self.assertIn(
+            "HTTP 400 20.6%, HTTP 502 12.6%, "
+            "network_timeout 5.2%, network_connect 1.2%",
+            markdown,
+        )
+        self.assertNotIn("历史未记录/未细分", markdown)
 
 
 class TestStatusCodeClassification(unittest.TestCase):
