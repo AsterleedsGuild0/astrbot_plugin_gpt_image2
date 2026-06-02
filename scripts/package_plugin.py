@@ -26,6 +26,7 @@ PACKAGE_ROOT_FILES = [
     "pyproject.toml",
     "README.md",
     "LICENSE",
+    "logo.png",
 ]
 
 PACKAGE_DIRS = [
