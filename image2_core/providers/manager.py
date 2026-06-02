@@ -122,6 +122,9 @@ FAILURE_REASON_ORDER = [
     "unknown",
 ]
 
+PROVIDER_STATS_SCHEMA_VERSION = 3
+PROVIDER_STATS_SELECTIVE_CLEANUP_KEY = "selective_cleanup_v1"
+
 
 # ── Pure functions (no instance state) ───────────────────────────
 
@@ -263,6 +266,181 @@ def classify_http_status_code(error_msg: str) -> int | None:
     if match is not None:
         return int(match.group(1))
     return None
+
+
+def failure_reason_for_http_status(status_code: int) -> str:
+    """根据 HTTP 状态码推导失败原因桶。"""
+    if status_code == 400:
+        return "http_400"
+    if status_code == 401:
+        return "http_401"
+    if status_code == 403:
+        return "http_403"
+    if status_code == 404:
+        return "http_404"
+    if status_code == 413:
+        return "http_413"
+    if status_code == 422:
+        return "http_422"
+    if status_code == 429:
+        return "http_429"
+    if status_code == 524:
+        return "http_524"
+    if 500 <= status_code < 600:
+        return "http_5xx"
+    if 200 <= status_code < 300:
+        return "api_schema_error"
+    return "unknown"
+
+
+def _stat_count_items(raw_counts: object) -> dict[str, int]:
+    """从聚合统计字典中读取正整数计数。"""
+    if not isinstance(raw_counts, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, value in raw_counts.items():
+        try:
+            count = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            result[str(key)] = count
+    return result
+
+
+def migrate_provider_stats_selective_cleanup(
+    stats: dict,
+) -> tuple[bool, dict[str, int]]:
+    """选择性清理早期 Provider 聚合统计污染，保留可量化历史数据。
+
+    迁移策略：
+    - 保留 success_count 和可解释的失败原因/状态码。
+    - 用 HTTP 状态码补足明确可推导的失败原因。
+    - 将 HTTP 2xx 失败归为 api_schema_error。
+    - 删除无法解释的旧 unknown，并同步下调 failure_count。
+    """
+    if not isinstance(stats, dict):
+        return False, {}
+
+    migration = stats.setdefault("migration", {})
+    if not isinstance(migration, dict):
+        migration = {}
+        stats["migration"] = migration
+    if PROVIDER_STATS_SELECTIVE_CLEANUP_KEY in migration:
+        stats["version"] = PROVIDER_STATS_SCHEMA_VERSION
+        return False, {}
+
+    providers = stats.get("providers", {})
+    if not isinstance(providers, dict):
+        stats["version"] = PROVIDER_STATS_SCHEMA_VERSION
+        migration[PROVIDER_STATS_SELECTIVE_CLEANUP_KEY] = {
+            "applied_at": time(),
+            "providers_changed": 0,
+            "unknown_removed": 0,
+            "failure_removed": 0,
+        }
+        return True, {
+            "providers_changed": 0,
+            "unknown_removed": 0,
+            "failure_removed": 0,
+        }
+
+    providers_changed = 0
+    total_unknown_removed = 0
+    total_failure_removed = 0
+
+    for item in providers.values():
+        if not isinstance(item, dict):
+            continue
+
+        original_failure_count = provider_stat_int(item, "failure_count")
+        reasons = _stat_count_items(item.get("failure_reasons", {}))
+        codes = _stat_count_items(item.get("failure_status_codes", {}))
+        before_reasons = dict(reasons)
+
+        # 用状态码补足明确可量化的失败原因；优先从旧 unknown 中迁移计数。
+        for code_text, count in codes.items():
+            try:
+                status_code = int(code_text)
+            except (TypeError, ValueError):
+                continue
+            reason_key = failure_reason_for_http_status(status_code)
+            if reason_key == "unknown":
+                continue
+            current_count = reasons.get(reason_key, 0)
+            if current_count >= count:
+                continue
+            delta = count - current_count
+
+            moved = min(delta, reasons.get("unknown", 0))
+            if moved > 0:
+                reasons["unknown"] -= moved
+                if reasons["unknown"] <= 0:
+                    reasons.pop("unknown", None)
+                reasons[reason_key] = current_count + moved
+
+            # 如果没有足够 unknown 可迁移，只允许用 failure_count 的历史缺口补足，
+            # 避免单纯因为 status_code 和已有 reason 重叠而扩大历史失败总数。
+            remaining = delta - moved
+            if remaining > 0:
+                current_total = sum(reasons.values())
+                available_gap = max(0, original_failure_count - current_total)
+                added = min(remaining, available_gap)
+                if added > 0:
+                    reasons[reason_key] = reasons.get(reason_key, 0) + added
+
+        unknown_removed = reasons.pop("unknown", 0)
+        known_failure_count = sum(reasons.values())
+        new_failure_count = known_failure_count
+        failure_removed = max(0, original_failure_count - new_failure_count)
+
+        if reasons:
+            item["failure_reasons"] = dict(
+                sorted(reasons.items(), key=lambda entry: -entry[1])
+            )
+        else:
+            item.pop("failure_reasons", None)
+
+        if codes:
+            item["failure_status_codes"] = dict(
+                sorted(codes.items(), key=lambda entry: -entry[1])
+            )
+        else:
+            item.pop("failure_status_codes", None)
+
+        item["failure_count"] = new_failure_count
+        if new_failure_count <= 0:
+            item["consecutive_failures"] = 0
+            item["cooldown_until"] = 0
+            item.pop("last_failure_at", None)
+            item.pop("last_error", None)
+        else:
+            item["consecutive_failures"] = min(
+                provider_stat_int(item, "consecutive_failures"),
+                new_failure_count,
+            )
+
+        if (
+            reasons != before_reasons
+            or unknown_removed > 0
+            or failure_removed > 0
+            or new_failure_count != original_failure_count
+        ):
+            providers_changed += 1
+            total_unknown_removed += unknown_removed
+            total_failure_removed += failure_removed
+
+    migration_summary = {
+        "providers_changed": providers_changed,
+        "unknown_removed": total_unknown_removed,
+        "failure_removed": total_failure_removed,
+    }
+    migration[PROVIDER_STATS_SELECTIVE_CLEANUP_KEY] = {
+        "applied_at": time(),
+        **migration_summary,
+    }
+    stats["version"] = PROVIDER_STATS_SCHEMA_VERSION
+    return True, migration_summary
 
 
 def diagnostic_http_status_code(error: "BaseException | None") -> int | None:
@@ -1028,6 +1206,7 @@ class ProviderManager:
             data["providers"] = {}
         data.setdefault("version", 1)
         self._provider_stats_cache = data
+        self.migrate_provider_stats_if_needed()
         return data
 
     def save_provider_stats(self) -> None:
@@ -1045,6 +1224,49 @@ class ProviderManager:
                 "[GPTImage2] provider stats save failed "
                 f"path={path} error={type(e).__name__}: {e}"
             )
+
+    def backup_provider_stats_for_migration(self) -> None:
+        """迁移前备份 provider_stats.json；失败只记录日志，不阻塞启动。"""
+        path = self.provider_stats_path()
+        if not path.exists():
+            return
+        try:
+            timestamp = int(time())
+            backup_path = path.with_name(f"{path.stem}.bak.{timestamp}{path.suffix}")
+            backup_path.write_bytes(path.read_bytes())
+            logger.info(f"[GPTImage2] provider stats migration backup={backup_path}")
+        except Exception as e:
+            logger.warning(
+                "[GPTImage2] provider stats migration backup failed "
+                f"path={path} error={type(e).__name__}: {e}"
+            )
+
+    def migrate_provider_stats_if_needed(self) -> None:
+        """按当前 schema 对 provider_stats 做一次性选择性迁移。"""
+        if self._provider_stats_cache is None:
+            return
+        migration = self._provider_stats_cache.get("migration", {})
+        if (
+            isinstance(migration, dict)
+            and PROVIDER_STATS_SELECTIVE_CLEANUP_KEY in migration
+        ):
+            self._provider_stats_cache["version"] = PROVIDER_STATS_SCHEMA_VERSION
+            return
+
+        self.backup_provider_stats_for_migration()
+        migrated, summary = migrate_provider_stats_selective_cleanup(
+            self._provider_stats_cache
+        )
+        if not migrated:
+            return
+        self.update_provider_stats_summary()
+        self.save_provider_stats()
+        logger.info(
+            "[GPTImage2] provider stats selective cleanup migrated "
+            f"providers_changed={summary.get('providers_changed', 0)} "
+            f"unknown_removed={summary.get('unknown_removed', 0)} "
+            f"failure_removed={summary.get('failure_removed', 0)}"
+        )
 
     def update_provider_stats_summary(self) -> None:
         """Recalculate top-level aggregate summary from per-provider stats."""
@@ -1088,7 +1310,7 @@ class ProviderManager:
             "failure_status_codes": sorted_codes,
             "updated_at": time(),
         }
-        stats["version"] = 2
+        stats["version"] = PROVIDER_STATS_SCHEMA_VERSION
 
     # ── Record results ──────────────────────────────────────
 
