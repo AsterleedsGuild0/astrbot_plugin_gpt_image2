@@ -124,6 +124,21 @@ def _format_failure_distribution(
     return ", ".join(parts)
 
 
+def format_elapsed_ms(elapsed_ms: object) -> str:
+    """Format elapsed milliseconds for stats tables, preserving old-file compatibility."""
+    if not isinstance(elapsed_ms, (int, float, str)):
+        return "-"
+    try:
+        value = float(elapsed_ms)
+    except (TypeError, ValueError):
+        return "-"
+    if value < 0:
+        return "-"
+    if value < 1000:
+        return f"{int(round(value))}ms"
+    return f"{value / 1000:.1f}s"
+
+
 def build_stats_recent_markdown(records: list[dict]) -> str:
     """构建 ``/image2 stats recent [N]`` 的 Markdown 展示。"""
     if not records:
@@ -222,13 +237,18 @@ def build_stats_summary_markdown(
 
     total = total_success + total_failure
     sr_pct = f"{round(total_success / total * 100, 1)}%" if total > 0 else "-"
+    task_summary = stats_data.get("task_summary", {})
+    task_avg = "-"
+    if isinstance(task_summary, dict):
+        task_avg = format_elapsed_ms(task_summary.get("success_elapsed_ms_avg"))
 
     lines: list[str] = [
         "## 📊 Provider 生图统计\n\n",
         f"总请求：**{total}** 次 | "
         f"成功：**{total_success}** | "
         f"失败：**{total_failure}** | "
-        f"成功率：**{sr_pct}**\n\n",
+        f"成功率：**{sr_pct}** | "
+        f"平均任务完成耗时：**{task_avg}**\n\n",
         f"*{scope_tag}*\n\n",
     ]
 
@@ -256,8 +276,8 @@ def build_stats_summary_markdown(
     if displayed_providers:
         lines.append("### 各站点统计\n\n")
         lines.append(
-            "| 站点 | 成功 | 失败 | 成功率 | 模式 | 主要失败原因 | 最近错误 |\n"
-            "|------|------|------|--------|------|-------------|----------|\n"
+            "| 站点 | 成功 | 失败 | 成功率 | 平均成功耗时 | 平均失败耗时 | 模式 | 主要失败原因 | 最近错误 |\n"
+            "|------|------|------|--------|--------------|--------------|------|-------------|----------|\n"
         )
 
         table_rows: list[tuple[float, str]] = []
@@ -269,6 +289,8 @@ def build_stats_summary_markdown(
             p_failure = provider_stat_int(item, "failure_count")
             p_total = p_success + p_failure
             p_sr = f"{round(p_success / p_total * 100, 1)}%" if p_total > 0 else "-"
+            p_success_avg = format_elapsed_ms(item.get("success_elapsed_ms_avg"))
+            p_failure_avg = format_elapsed_ms(item.get("failure_elapsed_ms_avg"))
             p_mode = item.get("role", "-")
             p_reasons = item.get("failure_reasons", {})
             top_reason = (
@@ -283,6 +305,7 @@ def build_stats_summary_markdown(
             sort_key = p_success / p_total if p_total > 0 else -1.0
             row = (
                 f"| {p_name} | {p_success} | {p_failure} | {p_sr} "
+                f"| {p_success_avg} | {p_failure_avg} "
                 f"| {p_mode} | {top_reason} | {last_err} |\n"
             )
             table_rows.append((sort_key, row))
@@ -423,7 +446,7 @@ def build_diag_zip(
     config: dict,
     failures_path: Path,
     plugin_name: str = "astrbot_plugin_gpt_image2",
-    plugin_version: str = "0.4.5",
+    plugin_version: str = "0.4.6",
     generated_at: str | None = None,
 ) -> Path:
     """构建诊断 zip 包。

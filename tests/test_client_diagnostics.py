@@ -205,5 +205,39 @@ class TestRequestIdHeaders(unittest.TestCase):
         )
 
 
+class TestProviderRequestElapsedState(unittest.TestCase):
+    """Provider 请求耗时状态按上游请求组口径记录。"""
+
+    def test_request_group_elapsed_uses_first_upstream_request_start(self):
+        client = GPTImageClient(
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            model="gpt-image-2",
+            responses_model="gpt-5.5",
+        )
+        client._elapsed_ms = lambda _start: 1234  # type: ignore[method-assign]
+
+        client._begin_request_group(100.0)
+        client._begin_request_group(200.0)
+        client._record_request_elapsed_ms(50)
+
+        self.assertEqual(client.last_request_elapsed_ms, 1234)
+
+    def test_reset_clears_provider_request_elapsed_state(self):
+        client = GPTImageClient(
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            model="gpt-image-2",
+            responses_model="gpt-5.5",
+        )
+
+        client._begin_request_group(100.0)
+        client.last_request_elapsed_ms = 321
+        client._reset_last_request_elapsed_ms()
+
+        self.assertIsNone(client.last_request_elapsed_ms)
+        self.assertIsNone(client._request_group_started_at)
+
+
 if __name__ == "__main__":
     unittest.main()

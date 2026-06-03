@@ -182,7 +182,7 @@ class PlanSessionFilter(SessionFilter):
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.4.5",
+    "0.4.6",
 )
 class GPTImage2Plugin(Star):
     PLAN_WAITER_TIMEOUT_GRACE = 10
@@ -208,6 +208,34 @@ class GPTImage2Plugin(Star):
     @staticmethod
     def _elapsed_ms(start: float) -> int:
         return int((perf_counter() - start) * 1000)
+
+    async def _await_provider_api(
+        self,
+        client: GPTImageClient,
+        awaitable,
+    ) -> tuple[list[ImageResult], int]:
+        """Await one upstream provider API call and return its request round-trip time."""
+        started = perf_counter()
+        try:
+            results = await awaitable
+        except Exception as e:
+            elapsed = getattr(client, "last_request_elapsed_ms", None)
+            if not isinstance(elapsed, int) or elapsed < 0:
+                elapsed = self._elapsed_ms(started)
+            try:
+                setattr(e, "_gpt_image2_provider_elapsed_ms", elapsed)
+            except Exception:
+                pass
+            raise
+        elapsed = getattr(client, "last_request_elapsed_ms", None)
+        if not isinstance(elapsed, int) or elapsed < 0:
+            elapsed = self._elapsed_ms(started)
+        return results, elapsed
+
+    @staticmethod
+    def _provider_exception_elapsed_ms(error: BaseException) -> int | None:
+        value = getattr(error, "_gpt_image2_provider_elapsed_ms", None)
+        return value if isinstance(value, int) and value >= 0 else None
 
     @staticmethod
     def _file_size(path: str) -> int | None:
@@ -1562,8 +1590,8 @@ class GPTImage2Plugin(Star):
         reference_data_urls: list[str],
         reference_count: int,
         action: str,
-    ) -> list[ImageResult]:
-        """调用生图 API 并返回结果列表。
+    ) -> tuple[list[ImageResult], int]:
+        """调用生图 API 并返回结果列表和站点请求往返耗时。
 
         根据 api_mode 和参考图数量选择正确的 API 路径。
         """
@@ -1588,7 +1616,9 @@ class GPTImage2Plugin(Star):
                         f"action={action} index={idx} path={path} "
                         f"bytes={self._file_size(path)}"
                     )
-            return await client.edit_images_api(prompt, image_paths, params)
+            return await self._await_provider_api(
+                client, client.edit_images_api(prompt, image_paths, params)
+            )
 
         if reference_count:
             data_urls = list(reference_data_urls)
@@ -1600,11 +1630,17 @@ class GPTImage2Plugin(Star):
                         "[GPTImage2] reference image converted to data URL "
                         f"action={action} index={idx} chars={len(data_url)}"
                     )
-            return await client.edit_responses_api(prompt, data_urls, params)
+            return await self._await_provider_api(
+                client, client.edit_responses_api(prompt, data_urls, params)
+            )
 
         if api_mode == "images":
-            return await client.generate_images_api(prompt, params)
-        return await client.generate_responses_api(prompt, params)
+            return await self._await_provider_api(
+                client, client.generate_images_api(prompt, params)
+            )
+        return await self._await_provider_api(
+            client, client.generate_responses_api(prompt, params)
+        )
 
     async def _generate_draw_chain(
         self,
@@ -1614,6 +1650,7 @@ class GPTImage2Plugin(Star):
         reference_images: list | None = None,
         reference_data_urls: list[str] | None = None,
         send_ack: bool = True,
+        task_started: float | None = None,
     ) -> list:
         """生成图片并返回消息组件链。
 
@@ -1627,10 +1664,13 @@ class GPTImage2Plugin(Star):
             reference_images: 参考图 Image 组件，存在时走编辑/参考图生成路径
             reference_data_urls: 参考图 data URLs，Responses API 使用
             send_ack: 是否在 API 调用前主动发送处理中提示
+            task_started: 用户侧任务处理开始时间；用于统计整体任务耗时
 
         Returns:
             消息组件列表（可空），供 caller yield chain_result 或 event.send
         """
+        started = task_started if task_started is not None else perf_counter()
+
         try:
             provider_configs = self._provider_manager.get_image_api_provider_configs()
         except ValueError as e:
@@ -1678,7 +1718,6 @@ class GPTImage2Plugin(Star):
                 task_anchor=True,
             )
 
-        started = perf_counter()
         results: list[ImageResult] | None = None
         selected_provider: ImageAPIProviderConfig | None = None
         selected_attempt_index = 0
@@ -1687,7 +1726,6 @@ class GPTImage2Plugin(Star):
         for index, provider in enumerate(viable, start=1):
             client = self._build_image_api_client(provider)
             provider_action = f"{action}:{provider.name}" if len(viable) > 1 else action
-            attempt_start = perf_counter()
             logger.info(
                 "[GPTImage2] image provider attempt "
                 f"action={action} provider={provider.name} index={index}/"
@@ -1695,7 +1733,7 @@ class GPTImage2Plugin(Star):
                 f"role={provider.role} adaptive={provider.adaptive}"
             )
             try:
-                results = await self._call_draw_api(
+                results, provider_elapsed = await self._call_draw_api(
                     client=client,
                     prompt=prompt,
                     params=params,
@@ -1706,19 +1744,22 @@ class GPTImage2Plugin(Star):
                     action=provider_action,
                 )
                 self._provider_manager.record_image_provider_result(
-                    provider, success=True
+                    provider,
+                    success=True,
+                    elapsed_ms=provider_elapsed,
                 )
                 selected_provider = provider
                 selected_attempt_index = index
                 break
             except RuntimeError as e:
                 error_msg = str(e)
-                attempt_elapsed = self._elapsed_ms(attempt_start)
+                provider_elapsed = self._provider_exception_elapsed_ms(e)
                 self._provider_manager.record_image_provider_result(
                     provider,
                     success=False,
                     error_msg=error_msg,
                     error=e,
+                    elapsed_ms=provider_elapsed,
                 )
                 self._provider_manager.append_provider_failure_record(
                     provider,
@@ -1726,7 +1767,7 @@ class GPTImage2Plugin(Star):
                     action=action,
                     attempt_index=index,
                     attempt_total=len(viable),
-                    elapsed_ms=attempt_elapsed,
+                    elapsed_ms=provider_elapsed,
                     error=e,
                 )
                 provider_errors.append(
@@ -1736,7 +1777,7 @@ class GPTImage2Plugin(Star):
                     "[GPTImage2] image provider failed "
                     f"action={action} provider={provider.name} index={index}/"
                     f"{len(viable)} role={provider.role} "
-                    f"elapsed_ms={attempt_elapsed} error={e}"
+                    f"elapsed_ms={provider_elapsed} error={e}"
                 )
                 if index < len(viable) and should_try_next_image_provider(error_msg):
                     await self._send_provider_switch_notice(
@@ -1803,12 +1844,13 @@ class GPTImage2Plugin(Star):
             )
             return []
 
+        api_elapsed = self._elapsed_ms(started)
         logger.info(
             "[GPTImage2] image API success "
             f"action={action} provider={selected_provider.name} "
             f"mode={global_mode} role={selected_provider.role} "
             f"adaptive={selected_provider.adaptive} results={len(results)} "
-            f"elapsed_ms={self._elapsed_ms(started)}"
+            f"elapsed_ms={api_elapsed}"
         )
 
         if action in {"draw", "edit"}:
@@ -1817,6 +1859,7 @@ class GPTImage2Plugin(Star):
         tag = self._task_tag(event)
         chain = self._build_image_chain(results, params)
         if chain:
+            task_elapsed = self._elapsed_ms(started)
             chain.insert(
                 0,
                 self._provider_success_notice(
@@ -1824,7 +1867,7 @@ class GPTImage2Plugin(Star):
                     attempt_index=selected_attempt_index,
                     total=len(viable),
                     failed_count=len(provider_errors),
-                    elapsed_ms=self._elapsed_ms(started),
+                    elapsed_ms=task_elapsed,
                     global_mode=global_mode,
                     task_tag=tag,
                 ),
@@ -1832,6 +1875,11 @@ class GPTImage2Plugin(Star):
             reply = self._build_reply(event)
             if reply is not None:
                 chain.insert(0, reply)
+            self._provider_manager.record_image_task_result(
+                success=True,
+                provider=selected_provider,
+                elapsed_ms=task_elapsed,
+            )
         if not chain:
             await self._send_text(
                 event,
@@ -2327,7 +2375,7 @@ class GPTImage2Plugin(Star):
                 config=self.config,
                 failures_path=failures_path,
                 plugin_name=plugin_name,
-                plugin_version="0.4.5",
+                plugin_version="0.4.6",
                 generated_at=timestamp,
             )
         except Exception as e:
@@ -2650,6 +2698,7 @@ class GPTImage2Plugin(Star):
             controller: SessionController,
             next_event: AstrMessageEvent,
         ) -> None:
+            task_started = perf_counter()
             raw_text = next_event.message_str.strip()
             text_lower = raw_text.lower()
             plan_input_text = self._extract_plan_input(next_event)
@@ -2793,6 +2842,7 @@ class GPTImage2Plugin(Star):
                         reference_images=session.reference_images,
                         reference_data_urls=session.reference_data_urls,
                         send_ack=False,
+                        task_started=task_started,
                     )
                     if self._plan_sessions.get(session_id) is not session:
                         controller.stop()
@@ -3012,10 +3062,12 @@ class GPTImage2Plugin(Star):
     @image2.command("draw")
     async def draw(self, event: AstrMessageEvent):
         """统一绘图入口：无图文生图，有图图生图。"""
+        task_started = perf_counter()
         async for result in self._handle_draw(
             event,
             prompt=self._extract_prompt(event, "draw"),
             action="draw",
+            task_started=task_started,
         ):
             yield result
 
@@ -3025,9 +3077,10 @@ class GPTImage2Plugin(Star):
         *,
         prompt: str,
         action: str,
+        task_started: float | None = None,
     ):
         """统一 draw 实现：自动根据消息/引用中的图片决定是否图生图。"""
-        started = perf_counter()
+        started = task_started if task_started is not None else perf_counter()
         if not prompt or not prompt.strip():
             logger.info(
                 f"[GPTImage2] draw rejected empty prompt {self._event_context(event)}"
@@ -3058,6 +3111,7 @@ class GPTImage2Plugin(Star):
             prompt,
             action=action,
             reference_images=images,
+            task_started=started,
         )
         if chain:
             logger.info(
@@ -3075,14 +3129,18 @@ class GPTImage2Plugin(Star):
     @image2.command("edit")
     async def edit(self, event: AstrMessageEvent):
         """从当前消息或引用消息提取图片后编辑"""
+        task_started = perf_counter()
         async for result in self._handle_edit(
-            event, prompt=self._extract_prompt(event, "edit")
+            event,
+            prompt=self._extract_prompt(event, "edit"),
+            task_started=task_started,
         ):
             yield result
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def draw_alias(self, event: AstrMessageEvent):
         """通过配置的别名触发统一 `/image2 draw`。"""
+        task_started = perf_counter()
         matched = self._extract_draw_alias_prompt(event)
         if matched is None:
             return
@@ -3093,14 +3151,23 @@ class GPTImage2Plugin(Star):
             f"{self._event_context(event)} alias={alias!r} prompt_len={len(prompt)}"
         )
         async for result in self._handle_draw(
-            event, prompt=prompt, action="draw-alias"
+            event,
+            prompt=prompt,
+            action="draw-alias",
+            task_started=task_started,
         ):
             yield result
         event.stop_event()
 
-    async def _handle_edit(self, event: AstrMessageEvent, *, prompt: str):
+    async def _handle_edit(
+        self,
+        event: AstrMessageEvent,
+        *,
+        prompt: str,
+        task_started: float | None = None,
+    ):
         """显式 `/image2 edit` 实现：必须检测到输入图片。"""
-        started = perf_counter()
+        started = task_started if task_started is not None else perf_counter()
         if not prompt or not prompt.strip():
             logger.info(
                 f"[GPTImage2] edit rejected empty prompt {self._event_context(event)}"
@@ -3152,6 +3219,7 @@ class GPTImage2Plugin(Star):
             prompt,
             action="edit",
             reference_images=images,
+            task_started=started,
         )
         if chain:
             logger.info(

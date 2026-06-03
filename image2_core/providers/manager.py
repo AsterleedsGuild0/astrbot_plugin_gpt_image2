@@ -122,7 +122,7 @@ FAILURE_REASON_ORDER = [
     "unknown",
 ]
 
-PROVIDER_STATS_SCHEMA_VERSION = 3
+PROVIDER_STATS_SCHEMA_VERSION = 4
 PROVIDER_STATS_SELECTIVE_CLEANUP_KEY = "selective_cleanup_v1"
 
 
@@ -529,6 +529,34 @@ def provider_stat_float(item: dict, key: str) -> float:
         return float(item.get(key) or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _valid_elapsed_ms(elapsed_ms: int | float | None) -> int | None:
+    """Normalize elapsed milliseconds for stats accumulation."""
+    if elapsed_ms is None:
+        return None
+    try:
+        value = int(elapsed_ms)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _accumulate_elapsed_ms(
+    item: dict, prefix: str, elapsed_ms: int | float | None
+) -> None:
+    """Accumulate elapsed ms total/count/avg on a stats item."""
+    value = _valid_elapsed_ms(elapsed_ms)
+    if value is None:
+        return
+    total_key = f"{prefix}_elapsed_ms_total"
+    count_key = f"{prefix}_elapsed_ms_count"
+    avg_key = f"{prefix}_elapsed_ms_avg"
+    total = provider_stat_int(item, total_key) + value
+    count = provider_stat_int(item, count_key) + 1
+    item[total_key] = total
+    item[count_key] = count
+    item[avg_key] = round(total / count, 1) if count > 0 else 0.0
 
 
 def provider_health_score(item: dict, now: float) -> float:
@@ -1321,6 +1349,7 @@ class ProviderManager:
         success: bool,
         error_msg: str = "",
         error: "BaseException | None" = None,
+        elapsed_ms: int | None = None,
     ) -> None:
         if not self.adaptive_provider_priority_enabled():
             return
@@ -1354,12 +1383,14 @@ class ProviderManager:
 
         if success:
             item["success_count"] = provider_stat_int(item, "success_count") + 1
+            _accumulate_elapsed_ms(item, "success", elapsed_ms)
             item["consecutive_failures"] = 0
             item["last_success_at"] = now
             item["cooldown_until"] = 0
             item.pop("last_error", None)
         else:
             item["failure_count"] = provider_stat_int(item, "failure_count") + 1
+            _accumulate_elapsed_ms(item, "failure", elapsed_ms)
             item["consecutive_failures"] = (
                 provider_stat_int(item, "consecutive_failures") + 1
             )
@@ -1389,6 +1420,37 @@ class ProviderManager:
 
         # Update aggregate summary
         self.update_provider_stats_summary()
+        self.save_provider_stats()
+
+    def record_image_task_result(
+        self,
+        *,
+        success: bool,
+        provider: ImageAPIProviderConfig | None = None,
+        elapsed_ms: int | None = None,
+    ) -> None:
+        """Record top-level image task completion timing separately from provider attempts."""
+        if not self.adaptive_provider_priority_enabled():
+            return
+
+        stats = self.load_provider_stats()
+        task_summary = stats.setdefault("task_summary", {})
+        if not isinstance(task_summary, dict):
+            task_summary = {}
+            stats["task_summary"] = task_summary
+
+        now = time()
+        if success:
+            task_summary["success_count"] = (
+                provider_stat_int(task_summary, "success_count") + 1
+            )
+            _accumulate_elapsed_ms(task_summary, "success", elapsed_ms)
+            if provider is not None:
+                task_summary["last_success_provider_id"] = provider.provider_id
+                task_summary["last_success_provider_name"] = provider.name
+            task_summary["last_success_at"] = now
+        task_summary["updated_at"] = now
+        stats["version"] = PROVIDER_STATS_SCHEMA_VERSION
         self.save_provider_stats()
 
     # ── Failures JSONL ──────────────────────────────────────

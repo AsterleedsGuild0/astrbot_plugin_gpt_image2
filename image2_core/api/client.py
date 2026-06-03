@@ -100,6 +100,8 @@ class GPTImageClient:
         self.response_format_b64_json = response_format_b64_json
         self.images_prompt_rewrite_guard = images_prompt_rewrite_guard
         self.responses_prompt_rewrite_guard = responses_prompt_rewrite_guard
+        self.last_request_elapsed_ms: int | None = None
+        self._request_group_started_at: float | None = None
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -109,6 +111,22 @@ class GPTImageClient:
     @staticmethod
     def _elapsed_ms(start: float) -> int:
         return int((perf_counter() - start) * 1000)
+
+    def _reset_last_request_elapsed_ms(self) -> None:
+        self.last_request_elapsed_ms = None
+        self._request_group_started_at = None
+
+    def _begin_request_group(self, start: float) -> None:
+        if self._request_group_started_at is None:
+            self._request_group_started_at = start
+
+    def _record_request_elapsed_ms(self, elapsed_ms: int) -> None:
+        if self._request_group_started_at is not None:
+            self.last_request_elapsed_ms = self._elapsed_ms(
+                self._request_group_started_at
+            )
+        else:
+            self.last_request_elapsed_ms = elapsed_ms
 
     @staticmethod
     def _result_summary(results: list[ImageResult]) -> str:
@@ -415,6 +433,7 @@ class GPTImageClient:
         优先尝试上游原生 n；若上游不支持 n 或只返回部分结果，
         自动使用多次单图请求补足。
         """
+        self._reset_last_request_elapsed_ms()
         n = self._normalize_n(params.n)
         params = self._params_with_n(params, n)
         if n == 1:
@@ -480,6 +499,7 @@ class GPTImageClient:
             body["response_format"] = "b64_json"
 
         start = perf_counter()
+        self._begin_request_group(start)
         logger.info(
             "[GPTImage2] Images API generate request start "
             f"url={url} model={self.model} prompt_len={len(prompt)} "
@@ -496,6 +516,7 @@ class GPTImageClient:
                 )
         except httpx.HTTPError as e:
             elapsed = self._elapsed_ms(start)
+            self._record_request_elapsed_ms(elapsed)
             error_msg = self._build_network_error_msg(e, url=url, elapsed_ms=elapsed)
             logger.warning(
                 f"[GPTImage2] Images API generate request failed {error_msg}"
@@ -503,6 +524,7 @@ class GPTImageClient:
             raise RuntimeError(error_msg) from e
 
         elapsed = self._elapsed_ms(start)
+        self._record_request_elapsed_ms(elapsed)
         logger.debug(
             "[GPTImage2] Images API generate response received "
             f"status={resp.status_code} elapsed_ms={elapsed} "
@@ -604,6 +626,8 @@ class GPTImageClient:
             self._generate_images_api_once(prompt, single_params) for _ in range(n)
         ]
         settled = await asyncio.gather(*tasks, return_exceptions=True)
+        elapsed = self._elapsed_ms(start)
+        self._record_request_elapsed_ms(elapsed)
         results: list[ImageResult] = []
         first_error: Exception | None = None
         for item in settled:
@@ -617,13 +641,13 @@ class GPTImageClient:
         if results:
             logger.info(
                 "[GPTImage2] Images API batch generate success "
-                f"elapsed_ms={self._elapsed_ms(start)} {self._result_summary(results)}"
+                f"elapsed_ms={elapsed} {self._result_summary(results)}"
             )
             return results
         if first_error:
             logger.warning(
                 "[GPTImage2] Images API batch generate failed "
-                f"elapsed_ms={self._elapsed_ms(start)} error={first_error}"
+                f"elapsed_ms={elapsed} error={first_error}"
             )
             raise first_error
         raise RuntimeError("Images API 并发文生图请求均未返回图片")
@@ -639,6 +663,7 @@ class GPTImageClient:
         优先尝试上游原生 n；若上游不支持 n 或只返回部分结果，
         自动使用多次单图请求补足。
         """
+        self._reset_last_request_elapsed_ms()
         n = self._normalize_n(params.n)
         params = self._params_with_n(params, n)
         if n == 1:
@@ -727,6 +752,7 @@ class GPTImageClient:
             )
 
         start = perf_counter()
+        self._begin_request_group(start)
         logger.info(
             "[GPTImage2] Images API edit request start "
             f"url={url} model={self.model} prompt_len={len(prompt)} "
@@ -746,11 +772,13 @@ class GPTImageClient:
                 )
         except httpx.HTTPError as e:
             elapsed = self._elapsed_ms(start)
+            self._record_request_elapsed_ms(elapsed)
             error_msg = self._build_network_error_msg(e, url=url, elapsed_ms=elapsed)
             logger.warning(f"[GPTImage2] Images API edit request failed {error_msg}")
             raise RuntimeError(error_msg) from e
 
         elapsed = self._elapsed_ms(start)
+        self._record_request_elapsed_ms(elapsed)
         logger.debug(
             "[GPTImage2] Images API edit response received "
             f"status={resp.status_code} elapsed_ms={elapsed} "
@@ -857,6 +885,8 @@ class GPTImageClient:
             for _ in range(n)
         ]
         settled = await asyncio.gather(*tasks, return_exceptions=True)
+        elapsed = self._elapsed_ms(start)
+        self._record_request_elapsed_ms(elapsed)
         results: list[ImageResult] = []
         first_error: Exception | None = None
         for item in settled:
@@ -870,13 +900,13 @@ class GPTImageClient:
         if results:
             logger.info(
                 "[GPTImage2] Images API batch edit success "
-                f"elapsed_ms={self._elapsed_ms(start)} {self._result_summary(results)}"
+                f"elapsed_ms={elapsed} {self._result_summary(results)}"
             )
             return results
         if first_error:
             logger.warning(
                 "[GPTImage2] Images API batch edit failed "
-                f"elapsed_ms={self._elapsed_ms(start)} error={first_error}"
+                f"elapsed_ms={elapsed} error={first_error}"
             )
             raise first_error
         raise RuntimeError("Images API 并发图像编辑请求均未返回图片")
@@ -930,6 +960,7 @@ class GPTImageClient:
 
         POST {base_url}/responses
         """
+        self._reset_last_request_elapsed_ms()
         return await self._call_responses_api_with_n(
             prompt,
             [],
@@ -948,6 +979,7 @@ class GPTImageClient:
         POST {base_url}/responses
         输入图片使用 data URL
         """
+        self._reset_last_request_elapsed_ms()
         return await self._call_responses_api_with_n(
             prompt, image_data_urls, params, action="edit"
         )
@@ -976,6 +1008,8 @@ class GPTImageClient:
             for _ in range(n)
         ]
         settled = await asyncio.gather(*tasks, return_exceptions=True)
+        elapsed = self._elapsed_ms(start)
+        self._record_request_elapsed_ms(elapsed)
         results: list[ImageResult] = []
         first_error: Exception | None = None
         for item in settled:
@@ -989,13 +1023,13 @@ class GPTImageClient:
         if results:
             logger.info(
                 "[GPTImage2] Responses API batch request success "
-                f"elapsed_ms={self._elapsed_ms(start)} {self._result_summary(results)}"
+                f"elapsed_ms={elapsed} {self._result_summary(results)}"
             )
             return results
         if first_error:
             logger.warning(
                 "[GPTImage2] Responses API batch request failed "
-                f"elapsed_ms={self._elapsed_ms(start)} error={first_error}"
+                f"elapsed_ms={elapsed} error={first_error}"
             )
             raise first_error
         raise RuntimeError("Responses API 并发请求均未返回图片")
@@ -1044,6 +1078,7 @@ class GPTImageClient:
         }
 
         start = perf_counter()
+        self._begin_request_group(start)
         logger.info(
             "[GPTImage2] Responses API request start "
             f"url={url} model={self.responses_model} action={action} "
@@ -1061,6 +1096,7 @@ class GPTImageClient:
                 )
         except httpx.HTTPError as e:
             elapsed = self._elapsed_ms(start)
+            self._record_request_elapsed_ms(elapsed)
             error_msg = self._build_network_error_msg(e, url=url, elapsed_ms=elapsed)
             logger.warning(
                 f"[GPTImage2] Responses API request failed action={action} {error_msg}"
@@ -1068,6 +1104,7 @@ class GPTImageClient:
             raise RuntimeError(error_msg) from e
 
         elapsed = self._elapsed_ms(start)
+        self._record_request_elapsed_ms(elapsed)
         logger.debug(
             "[GPTImage2] Responses API response received "
             f"action={action} status={resp.status_code} elapsed_ms={elapsed} "

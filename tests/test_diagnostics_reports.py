@@ -13,7 +13,10 @@ sys.modules["astrbot"] = MagicMock()
 sys.modules["astrbot.api"] = astrbot_api
 
 from image2_core.api.client import HTTPDiagnostics, ImageAPIError  # noqa: E402
-from image2_core.diagnostics.reports import build_stats_summary_markdown  # noqa: E402
+from image2_core.diagnostics.reports import (  # noqa: E402
+    build_stats_summary_markdown,
+    format_elapsed_ms,
+)
 from image2_core.providers.manager import (  # noqa: E402
     ImageAPIProviderConfig,
     classify_failure_reason,
@@ -118,6 +121,56 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
             markdown,
         )
         self.assertNotIn("历史未记录/未细分", markdown)
+
+    def test_elapsed_fields_are_displayed(self):
+        """有耗时字段时，顶部和站点表展示平均耗时。"""
+        stats_data = {
+            "task_summary": {"success_count": 2, "success_elapsed_ms_avg": 1250},
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "normal",
+                    "success_count": 2,
+                    "failure_count": 1,
+                    "success_elapsed_ms_avg": 500,
+                    "failure_elapsed_ms_avg": 2200,
+                    "failure_reasons": {"network_timeout": 1},
+                    "last_error": "timeout",
+                }
+            },
+        }
+
+        markdown = build_stats_summary_markdown(stats_data, [_provider()])
+
+        self.assertIn("平均任务完成耗时：**1.2s**", markdown)
+        self.assertIn("平均成功耗时", markdown)
+        self.assertIn("平均失败耗时", markdown)
+        self.assertIn("| 站点A | 2 | 1 | 66.7% | 500ms | 2.2s |", markdown)
+
+    def test_missing_elapsed_fields_are_compatible(self):
+        """旧统计缺少耗时字段时展示 '-' 且不报错。"""
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "normal",
+                    "success_count": 1,
+                    "failure_count": 0,
+                }
+            }
+        }
+
+        markdown = build_stats_summary_markdown(stats_data, [_provider()])
+
+        self.assertIn("平均任务完成耗时：**-**", markdown)
+        self.assertIn("| 站点A | 1 | 0 | 100.0% | - | - |", markdown)
+
+    def test_format_elapsed_ms_units(self):
+        """毫秒和秒级耗时格式化符合展示约定。"""
+        self.assertEqual(format_elapsed_ms(0), "0ms")
+        self.assertEqual(format_elapsed_ms(999), "999ms")
+        self.assertEqual(format_elapsed_ms(1200), "1.2s")
+        self.assertEqual(format_elapsed_ms(None), "-")
 
 
 class TestStatusCodeClassification(unittest.TestCase):

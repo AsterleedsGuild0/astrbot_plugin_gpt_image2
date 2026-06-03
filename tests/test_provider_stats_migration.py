@@ -14,8 +14,10 @@ sys.modules["astrbot"] = MagicMock()
 sys.modules["astrbot.api"] = astrbot_api
 
 from image2_core.providers.manager import (  # noqa: E402
+    ImageAPIProviderConfig,
     PROVIDER_STATS_SCHEMA_VERSION,
     PROVIDER_STATS_SELECTIVE_CLEANUP_KEY,
+    ProviderManager,
     migrate_provider_stats_selective_cleanup,
 )
 
@@ -274,6 +276,64 @@ class TestMigrateProviderStatsSelectiveCleanup(unittest.TestCase):
         self.assertTrue(migrated)
         self.assertEqual(summary["providers_changed"], 0)
         self.assertIn(PROVIDER_STATS_SELECTIVE_CLEANUP_KEY, stats["migration"])
+
+
+class TestProviderElapsedStats(unittest.TestCase):
+    """验证 provider attempt 与全局任务耗时口径分离。"""
+
+    def test_fallback_task_elapsed_is_not_provider_attempt_elapsed(self):
+        """fallback 成功时，任务耗时不同于最终成功站点 attempt 耗时。"""
+        manager = ProviderManager({"adaptive_provider_priority": True}, "test-plugin")
+        manager._provider_stats_cache = {
+            "version": PROVIDER_STATS_SCHEMA_VERSION,
+            "providers": {},
+        }
+        manager.save_provider_stats = lambda: None  # type: ignore[method-assign]
+
+        primary = ImageAPIProviderConfig(
+            name="主站",
+            api_key="",
+            base_url="https://primary.example/v1",
+            model="gpt-image-2",
+            responses_model="gpt-5.5",
+            provider_id="primary",
+            configured_order=0,
+        )
+        fallback = ImageAPIProviderConfig(
+            name="备用站",
+            api_key="",
+            base_url="https://fallback.example/v1",
+            model="gpt-image-2",
+            responses_model="gpt-5.5",
+            provider_id="fallback",
+            configured_order=1,
+        )
+
+        manager.record_image_provider_result(
+            primary,
+            success=False,
+            error_msg="timeout",
+            elapsed_ms=400,
+        )
+        manager.record_image_provider_result(fallback, success=True, elapsed_ms=100)
+        manager.record_image_task_result(
+            success=True,
+            provider=fallback,
+            elapsed_ms=900,
+        )
+
+        stats = manager.load_provider_stats()
+        primary_item = stats["providers"]["primary"]
+        fallback_item = stats["providers"]["fallback"]
+        task_summary = stats["task_summary"]
+
+        self.assertEqual(primary_item["failure_elapsed_ms_avg"], 400.0)
+        self.assertEqual(fallback_item["success_elapsed_ms_avg"], 100.0)
+        self.assertEqual(task_summary["success_elapsed_ms_avg"], 900.0)
+        self.assertNotEqual(
+            task_summary["success_elapsed_ms_avg"],
+            fallback_item["success_elapsed_ms_avg"],
+        )
 
 
 if __name__ == "__main__":
