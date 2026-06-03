@@ -15,9 +15,13 @@ sys.modules["astrbot.api"] = astrbot_api
 
 from image2_core.providers.manager import (  # noqa: E402
     ImageAPIProviderConfig,
+    OLD_PRIMARY_PROVIDER_ID,
+    PROVIDER_STATS_PRIMARY_ID_CLEANUP_KEY,
     PROVIDER_STATS_SCHEMA_VERSION,
     PROVIDER_STATS_SELECTIVE_CLEANUP_KEY,
     ProviderManager,
+    build_primary_provider_id,
+    migrate_provider_stats_primary_identity_cleanup,
     migrate_provider_stats_selective_cleanup,
 )
 
@@ -333,6 +337,145 @@ class TestProviderElapsedStats(unittest.TestCase):
         self.assertNotEqual(
             task_summary["success_elapsed_ms_avg"],
             fallback_item["success_elapsed_ms_avg"],
+        )
+
+
+class TestMigrateProviderStatsPrimaryIdentityCleanup(unittest.TestCase):
+    """验证 v5 主站统计身份迁移会清理旧固定主站记录。"""
+
+    def test_removes_old_name_primary_record(self):
+        stats: dict = {
+            "version": 4,
+            "providers": {
+                OLD_PRIMARY_PROVIDER_ID: {
+                    "name": "primary",
+                    "base_url": "https://old.example/v1",
+                    "success_count": 10,
+                    "failure_count": 2,
+                },
+                "primary:new": {
+                    "name": "primary",
+                    "base_url": "https://new.example/v1",
+                    "success_count": 1,
+                    "failure_count": 0,
+                },
+            },
+        }
+
+        migrated, summary = migrate_provider_stats_primary_identity_cleanup(stats)
+
+        self.assertTrue(migrated)
+        self.assertEqual(summary["old_primary_removed"], 1)
+        self.assertNotIn(OLD_PRIMARY_PROVIDER_ID, stats["providers"])
+        self.assertIn("primary:new", stats["providers"])
+        self.assertEqual(stats["version"], PROVIDER_STATS_SCHEMA_VERSION)
+        self.assertIn(PROVIDER_STATS_PRIMARY_ID_CLEANUP_KEY, stats["migration"])
+
+    def test_idempotency_after_primary_cleanup(self):
+        stats: dict = {
+            "version": PROVIDER_STATS_SCHEMA_VERSION,
+            "migration": {
+                PROVIDER_STATS_PRIMARY_ID_CLEANUP_KEY: {
+                    "applied_at": 1234567890.0,
+                    "old_primary_removed": 1,
+                }
+            },
+            "providers": {},
+        }
+        before = copy.deepcopy(stats)
+
+        migrated, summary = migrate_provider_stats_primary_identity_cleanup(stats)
+
+        self.assertFalse(migrated)
+        self.assertEqual(summary, {})
+        self.assertEqual(stats, before)
+
+    def test_manager_runs_primary_cleanup_when_selective_cleanup_already_done(self):
+        manager = ProviderManager({}, "test-plugin")
+        manager._provider_stats_cache = {
+            "version": 4,
+            "migration": {
+                PROVIDER_STATS_SELECTIVE_CLEANUP_KEY: {
+                    "applied_at": 1234567890.0,
+                    "providers_changed": 0,
+                    "unknown_removed": 0,
+                    "failure_removed": 0,
+                }
+            },
+            "providers": {
+                OLD_PRIMARY_PROVIDER_ID: {
+                    "name": "primary",
+                    "base_url": "https://old.example/v1",
+                    "success_count": 10,
+                    "failure_count": 0,
+                }
+            },
+        }
+        saved = {"called": False}
+        manager.backup_provider_stats_for_migration = lambda: None  # type: ignore[method-assign]
+        manager.save_provider_stats = lambda: saved.update(called=True)  # type: ignore[method-assign]
+
+        manager.migrate_provider_stats_if_needed()
+
+        stats = manager.load_provider_stats()
+        self.assertTrue(saved["called"])
+        self.assertNotIn(OLD_PRIMARY_PROVIDER_ID, stats["providers"])
+        self.assertIn(PROVIDER_STATS_SELECTIVE_CLEANUP_KEY, stats["migration"])
+        self.assertIn(PROVIDER_STATS_PRIMARY_ID_CLEANUP_KEY, stats["migration"])
+        self.assertEqual(stats["version"], PROVIDER_STATS_SCHEMA_VERSION)
+
+
+class TestPrimaryProviderIdentity(unittest.TestCase):
+    """验证主站统计身份只绑定 base_url。"""
+
+    def _primary_provider_id(self, **overrides: object) -> str:
+        config: dict[str, object] = {
+            "api_key": "test-key",
+            "base_url": "https://primary.example/v1",
+            "model": "gpt-image-2",
+            "responses_model": "gpt-5.5",
+        }
+        config.update(overrides)
+        manager = ProviderManager(config, "test-plugin")
+        provider = manager.get_image_api_provider_configs()[0]
+        self.assertEqual(provider.role, "primary")
+        return provider.provider_id
+
+    def test_primary_provider_id_changes_when_base_url_changes(self):
+        """切换主站 base_url 后不应复用旧主站统计。"""
+        first_id = self._primary_provider_id(
+            base_url="https://primary-a.example/v1",
+        )
+        second_id = self._primary_provider_id(
+            base_url="https://primary-b.example/v1",
+        )
+
+        self.assertNotEqual(first_id, second_id)
+        self.assertNotEqual(first_id, "name:primary")
+        self.assertNotEqual(second_id, "name:primary")
+
+    def test_primary_provider_id_ignores_display_name_and_models(self):
+        """只改主站显示名或模型时，统计仍归属同一 base_url。"""
+        original_id = self._primary_provider_id(
+            base_url="https://primary.example/v1",
+            primary_provider_name="主站 A",
+            model="gpt-image-2",
+            responses_model="gpt-5.5",
+        )
+        renamed_or_remodeled_id = self._primary_provider_id(
+            base_url="https://primary.example/v1",
+            primary_provider_name="主站 B",
+            model="gpt-image-2-latest",
+            responses_model="gpt-5.6",
+        )
+
+        self.assertEqual(original_id, renamed_or_remodeled_id)
+
+    def test_primary_provider_id_normalizes_trailing_slash(self):
+        """base_url 尾部斜杠不同不应导致主站统计拆分。"""
+        self.assertEqual(
+            build_primary_provider_id("https://primary.example/v1"),
+            build_primary_provider_id("https://primary.example/v1/"),
         )
 
 

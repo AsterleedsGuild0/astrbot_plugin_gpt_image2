@@ -122,8 +122,10 @@ FAILURE_REASON_ORDER = [
     "unknown",
 ]
 
-PROVIDER_STATS_SCHEMA_VERSION = 4
+PROVIDER_STATS_SCHEMA_VERSION = 5
 PROVIDER_STATS_SELECTIVE_CLEANUP_KEY = "selective_cleanup_v1"
+PROVIDER_STATS_PRIMARY_ID_CLEANUP_KEY = "primary_base_url_identity_v1"
+OLD_PRIMARY_PROVIDER_ID = "name:primary"
 
 
 # ── Pure functions (no instance state) ───────────────────────────
@@ -179,6 +181,13 @@ def build_provider_id(
     )
     digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
     return f"config:{digest}"
+
+
+def build_primary_provider_id(base_url: str) -> str:
+    """Build primary provider id from site base URL only."""
+    normalized = (base_url.strip() or "https://api.openai.com/v1").rstrip("/")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"primary:{digest}"
 
 
 def classify_failure_reason(error_msg: str) -> str:
@@ -436,6 +445,36 @@ def migrate_provider_stats_selective_cleanup(
         "failure_removed": total_failure_removed,
     }
     migration[PROVIDER_STATS_SELECTIVE_CLEANUP_KEY] = {
+        "applied_at": time(),
+        **migration_summary,
+    }
+    stats["version"] = PROVIDER_STATS_SCHEMA_VERSION
+    return True, migration_summary
+
+
+def migrate_provider_stats_primary_identity_cleanup(
+    stats: dict,
+) -> tuple[bool, dict[str, int]]:
+    """清理旧主站固定 provider_id 统计，避免污染 base_url 绑定的新主站统计。"""
+    if not isinstance(stats, dict):
+        return False, {}
+
+    migration = stats.setdefault("migration", {})
+    if not isinstance(migration, dict):
+        migration = {}
+        stats["migration"] = migration
+    if PROVIDER_STATS_PRIMARY_ID_CLEANUP_KEY in migration:
+        stats["version"] = PROVIDER_STATS_SCHEMA_VERSION
+        return False, {}
+
+    providers = stats.get("providers", {})
+    removed = 0
+    if isinstance(providers, dict) and OLD_PRIMARY_PROVIDER_ID in providers:
+        providers.pop(OLD_PRIMARY_PROVIDER_ID, None)
+        removed = 1
+
+    migration_summary = {"old_primary_removed": removed}
+    migration[PROVIDER_STATS_PRIMARY_ID_CLEANUP_KEY] = {
         "applied_at": time(),
         **migration_summary,
     }
@@ -1038,6 +1077,7 @@ class ProviderManager:
         """Build ordered draw/edit provider list: primary + normal backups + authoritative."""
         configs: list[ImageAPIProviderConfig] = []
         base_url = str(self.config.get("base_url", "https://api.openai.com/v1") or "")
+        primary_base_url = base_url.strip() or "https://api.openai.com/v1"
         api_key = str(self.config.get("api_key", "") or "")
         model = str(self.config.get("model", "gpt-image-2") or "gpt-image-2")
         responses_model = str(
@@ -1052,10 +1092,10 @@ class ProviderManager:
                 ImageAPIProviderConfig(
                     name=primary_name,
                     api_key=api_key.strip(),
-                    base_url=base_url.strip() or "https://api.openai.com/v1",
+                    base_url=primary_base_url,
                     model=model.strip() or "gpt-image-2",
                     responses_model=responses_model.strip() or "gpt-5.5",
-                    provider_id="name:primary",
+                    provider_id=build_primary_provider_id(primary_base_url),
                     configured_order=0,
                     role="primary",
                     adaptive=False,
@@ -1274,27 +1314,41 @@ class ProviderManager:
         if self._provider_stats_cache is None:
             return
         migration = self._provider_stats_cache.get("migration", {})
-        if (
+        selective_done = (
             isinstance(migration, dict)
             and PROVIDER_STATS_SELECTIVE_CLEANUP_KEY in migration
-        ):
+        )
+        primary_cleanup_done = (
+            isinstance(migration, dict)
+            and PROVIDER_STATS_PRIMARY_ID_CLEANUP_KEY in migration
+        )
+        if selective_done and primary_cleanup_done:
             self._provider_stats_cache["version"] = PROVIDER_STATS_SCHEMA_VERSION
             return
 
         self.backup_provider_stats_for_migration()
-        migrated, summary = migrate_provider_stats_selective_cleanup(
-            self._provider_stats_cache
+        selective_migrated, selective_summary = (
+            migrate_provider_stats_selective_cleanup(self._provider_stats_cache)
         )
-        if not migrated:
+        primary_migrated, primary_summary = (
+            migrate_provider_stats_primary_identity_cleanup(self._provider_stats_cache)
+        )
+        if not selective_migrated and not primary_migrated:
             return
         self.update_provider_stats_summary()
         self.save_provider_stats()
-        logger.info(
-            "[GPTImage2] provider stats selective cleanup migrated "
-            f"providers_changed={summary.get('providers_changed', 0)} "
-            f"unknown_removed={summary.get('unknown_removed', 0)} "
-            f"failure_removed={summary.get('failure_removed', 0)}"
-        )
+        if selective_migrated:
+            logger.info(
+                "[GPTImage2] provider stats selective cleanup migrated "
+                f"providers_changed={selective_summary.get('providers_changed', 0)} "
+                f"unknown_removed={selective_summary.get('unknown_removed', 0)} "
+                f"failure_removed={selective_summary.get('failure_removed', 0)}"
+            )
+        if primary_migrated:
+            logger.info(
+                "[GPTImage2] provider stats primary identity cleanup migrated "
+                f"old_primary_removed={primary_summary.get('old_primary_removed', 0)}"
+            )
 
     def update_provider_stats_summary(self) -> None:
         """Recalculate top-level aggregate summary from per-provider stats."""

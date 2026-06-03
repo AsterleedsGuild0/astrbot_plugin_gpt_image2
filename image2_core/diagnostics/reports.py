@@ -446,7 +446,7 @@ def build_diag_zip(
     config: dict,
     failures_path: Path,
     plugin_name: str = "astrbot_plugin_gpt_image2",
-    plugin_version: str = "0.4.6",
+    plugin_version: str = "0.4.7",
     generated_at: str | None = None,
 ) -> Path:
     """构建诊断 zip 包。
