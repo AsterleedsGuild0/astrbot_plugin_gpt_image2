@@ -192,7 +192,7 @@ class PlanSessionFilter(SessionFilter):
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.4.8",
+    "0.4.9",
 )
 class GPTImage2Plugin(Star):
     PLAN_WAITER_TIMEOUT_GRACE = 10
@@ -2753,7 +2753,7 @@ class GPTImage2Plugin(Star):
                 config=self.config,
                 failures_path=failures_path,
                 plugin_name=plugin_name,
-                plugin_version="0.4.8",
+                plugin_version="0.4.9",
                 generated_at=timestamp,
             )
         except Exception as e:
