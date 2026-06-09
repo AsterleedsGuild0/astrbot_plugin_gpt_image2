@@ -6,6 +6,25 @@
 
 ---
 
+## v0.4.8 - 2026-06-04
+
+### v0.4.8 Added
+
+- 新增 Provider 绑定费用观测配置：主站使用 `primary_billing_json`，备用站可在 `fallback_api_providers` JSON 数组元素中内嵌 `billing`。
+- 新增 `balance`、`total_usage` 与 `fixed` 费用记录类型，支持余额单位 `scale` 和展示/统计币种 `cost_multiplier` 换算。
+- 新增 `/image2 costs`、`/image2 costs recent [N]`、`/image2 balance` 管理员命令。
+- `/image2 providers` 现在展示轻量计费状态与缓存余额/累计开销，不触发实时余额查询。
+- 新增 Provider 级 `force_single_image_requests`，可将 `n > 1` 拆成多次 `n=1` 请求，规避站点原生 `n` 扣费和返回数量不一致。
+
+### v0.4.8 Changed
+
+- 生图成功提示会在可观测时附带本次任务开销；费用记录保存在 `billing_stats.json` 和 `billing_events.jsonl`。
+- `fallback_api_providers` 破坏式改为 JSON 编辑器字段，必须填写 JSON 数组；不再支持只填 URL、key=value 字符串或 WebUI 字符串列表。
+- 固定参考 `success_cost` 现在表示单张成功成本，成功时按实际返回图片数相乘；`failure_cost` 表示单次失败成本。
+- 升级版本至 0.4.8。
+
+---
+
 ## v0.4.7 - 2026-06-03
 
 ### v0.4.7 Fixed

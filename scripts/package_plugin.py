@@ -33,6 +33,10 @@ PACKAGE_DIRS = [
     "image2_core",
 ]
 
+PACKAGE_DOC_DIRS = [
+    "docs",
+]
+
 
 def iter_package_files() -> list[str]:
     """返回发布包文件列表，递归包含内部 Python 包。"""
@@ -44,6 +48,15 @@ def iter_package_files() -> list[str]:
         files.extend(
             path.relative_to(ROOT).as_posix()
             for path in sorted(package_dir.rglob("*.py"))
+            if path.is_file()
+        )
+    for relative_dir in PACKAGE_DOC_DIRS:
+        doc_dir = ROOT / relative_dir
+        if not doc_dir.is_dir():
+            continue
+        files.extend(
+            path.relative_to(ROOT).as_posix()
+            for path in sorted(doc_dir.rglob("*.md"))
             if path.is_file()
         )
     return files
