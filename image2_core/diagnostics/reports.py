@@ -148,6 +148,69 @@ def _format_money(value: object, currency: str = "") -> str:
     return f"{text} {currency}".rstrip()
 
 
+def _aggregate_billing_period_costs(
+    events: list[dict] | None,
+    *,
+    now: float | None = None,
+) -> dict[str, dict[str, float]]:
+    if not events:
+        return {}
+
+    now_value = now if now is not None else _time_module.time()
+    local_now = _time_module.localtime(now_value)
+    today_start = _time_module.mktime(
+        (
+            local_now.tm_year,
+            local_now.tm_mon,
+            local_now.tm_mday,
+            0,
+            0,
+            0,
+            local_now.tm_wday,
+            local_now.tm_yday,
+            local_now.tm_isdst,
+        )
+    )
+    yesterday_start = today_start - 86400
+    week_start = now_value - 7 * 86400
+    month_start = now_value - 30 * 86400
+
+    result: dict[str, dict[str, float]] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        provider_id = str(event.get("provider_id") or "").strip()
+        if not provider_id:
+            continue
+        timestamp_raw = event.get("timestamp")
+        cost_raw = event.get("cost")
+        if not isinstance(timestamp_raw, (int, float, str)) or not isinstance(
+            cost_raw, (int, float, str)
+        ):
+            continue
+        try:
+            timestamp = float(timestamp_raw)
+            cost = float(cost_raw)
+        except (TypeError, ValueError):
+            continue
+        if cost < 0:
+            continue
+
+        item = result.setdefault(
+            provider_id,
+            {"today": 0.0, "yesterday": 0.0, "week": 0.0, "month": 0.0},
+        )
+        if timestamp >= today_start:
+            item["today"] += cost
+        if yesterday_start <= timestamp < today_start:
+            item["yesterday"] += cost
+        if timestamp >= week_start:
+            item["week"] += cost
+        if timestamp >= month_start:
+            item["month"] += cost
+    return result
+
+
 def build_stats_recent_markdown(records: list[dict]) -> str:
     """构建 ``/image2 stats recent [N]`` 的 Markdown 展示。"""
     if not records:
@@ -203,6 +266,8 @@ def build_stats_summary_markdown(
     *,
     show_all: bool = False,
     billing_stats: dict | None = None,
+    billing_events: list[dict] | None = None,
+    now: float | None = None,
 ) -> str:
     """构建 ``/image2 stats``（summary/all）的 Markdown 展示。"""
     providers_data = stats_data.get("providers", {})
@@ -225,6 +290,7 @@ def build_stats_summary_markdown(
         raw_billing_providers = billing_stats.get("providers", {})
         if isinstance(raw_billing_providers, dict):
             billing_providers = raw_billing_providers
+    billing_period_costs = _aggregate_billing_period_costs(billing_events, now=now)
 
     # 汇总当前展示范围内的 Provider 统计。
     total_success = 0
@@ -327,7 +393,24 @@ def build_stats_summary_markdown(
             if balance != "-" and converted != "-" and converted != balance:
                 balance = f"{balance}（约 {converted}）"
             total_cost = _format_money(billing_item.get("total_cost"), currency)
-            last_cost = _format_money(billing_item.get("last_cost"), currency)
+            period_costs = billing_period_costs.get(pid, {})
+            has_billing = bool(billing_item)
+            today_cost = _format_money(
+                period_costs.get("today", 0.0) if has_billing else None,
+                currency,
+            )
+            yesterday_cost = _format_money(
+                period_costs.get("yesterday", 0.0) if has_billing else None,
+                currency,
+            )
+            week_cost = _format_money(
+                period_costs.get("week", 0.0) if has_billing else None,
+                currency,
+            )
+            month_cost = _format_money(
+                period_costs.get("month", 0.0) if has_billing else None,
+                currency,
+            )
             provider_rows.append(
                 (
                     sort_key,
@@ -343,7 +426,10 @@ def build_stats_summary_markdown(
                         "last_error": last_err,
                         "balance": balance,
                         "total_cost": total_cost,
-                        "last_cost": last_cost,
+                        "today_cost": today_cost,
+                        "yesterday_cost": yesterday_cost,
+                        "week_cost": week_cost,
+                        "month_cost": month_cost,
                     },
                 )
             )
@@ -373,15 +459,22 @@ def build_stats_summary_markdown(
             )
         lines.append("\n")
 
-        lines.append("### 各站点费用与余额\n\n")
+        lines.append("### 各站点余额\n\n")
+        lines.append("| 站点 | 缓存余额 |\n|------|----------|\n")
+        for _, row in provider_rows:
+            lines.append(f"| {row['name']} | {row['balance']} |\n")
+        lines.append("\n")
+
+        lines.append("### 各站点费用周期\n\n")
         lines.append(
-            "| 站点 | 缓存余额 | 累计开销 | 最近开销 |\n"
-            "|------|----------|----------|----------|\n"
+            "| 站点 | 累计开销 | 今日 | 昨日 | 近7天 | 近30天 |\n"
+            "|------|----------|------|------|-------|--------|\n"
         )
         for _, row in provider_rows:
             lines.append(
-                f"| {row['name']} | {row['balance']} | "
-                f"{row['total_cost']} | {row['last_cost']} |\n"
+                f"| {row['name']} | {row['total_cost']} | "
+                f"{row['today_cost']} | {row['yesterday_cost']} | "
+                f"{row['week_cost']} | {row['month_cost']} |\n"
             )
         lines.append("\n")
 
@@ -526,7 +619,7 @@ def build_diag_zip(
     config: dict,
     failures_path: Path,
     plugin_name: str = "astrbot_plugin_gpt_image2",
-    plugin_version: str = "0.4.10",
+    plugin_version: str = "0.4.11",
     generated_at: str | None = None,
 ) -> Path:
     """构建诊断 zip 包。

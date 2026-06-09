@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time as time_module
 import unittest
 from unittest.mock import MagicMock
 
@@ -169,7 +170,7 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
         self.assertIn("| 站点A | - | - | - |", markdown)
 
     def test_billing_stats_are_displayed_in_stats_summary(self):
-        """stats 汇总展示缓存余额、累计开销和最近开销。"""
+        """stats 汇总展示缓存余额和周期费用。"""
         stats_data = {
             "providers": {
                 "pid-a": {
@@ -191,15 +192,41 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
                 }
             }
         }
+        now = 1_700_000_000.0
+        local_now = time_module.localtime(now)
+        today_start = time_module.mktime(
+            (
+                local_now.tm_year,
+                local_now.tm_mon,
+                local_now.tm_mday,
+                0,
+                0,
+                0,
+                local_now.tm_wday,
+                local_now.tm_yday,
+                local_now.tm_isdst,
+            )
+        )
+        billing_events = [
+            {"provider_id": "pid-a", "timestamp": now - 60, "cost": 0.1},
+            {"provider_id": "pid-a", "timestamp": today_start - 60, "cost": 0.2},
+            {"provider_id": "pid-a", "timestamp": now - 10 * 86400, "cost": 0.4},
+        ]
 
         markdown = build_stats_summary_markdown(
             stats_data,
             [_provider()],
             billing_stats=billing_stats,
+            billing_events=billing_events,
+            now=now,
         )
 
-        self.assertIn("### 各站点费用与余额", markdown)
-        self.assertIn("| 站点A | 39.9 CNY | 1.2 CNY | 0.1 CNY |", markdown)
+        self.assertIn("### 各站点余额", markdown)
+        self.assertIn("| 站点A | 39.9 CNY |", markdown)
+        self.assertIn("### 各站点费用周期", markdown)
+        self.assertIn(
+            "| 站点A | 1.2 CNY | 0.1 CNY | 0.2 CNY | 0.3 CNY | 0.7 CNY |", markdown
+        )
 
     def test_format_elapsed_ms_units(self):
         """毫秒和秒级耗时格式化符合展示约定。"""
