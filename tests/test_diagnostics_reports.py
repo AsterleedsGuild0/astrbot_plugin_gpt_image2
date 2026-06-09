@@ -145,7 +145,8 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
         self.assertIn("平均任务完成耗时：**1.2s**", markdown)
         self.assertIn("平均成功耗时", markdown)
         self.assertIn("平均失败耗时", markdown)
-        self.assertIn("| 站点A | 2 | 1 | 66.7% | 500ms | 2.2s |", markdown)
+        self.assertIn("| 站点A | 2 | 1 | 66.7% | normal |", markdown)
+        self.assertIn("| 站点A | 500ms | 2.2s |", markdown)
 
     def test_missing_elapsed_fields_are_compatible(self):
         """旧统计缺少耗时字段时展示 '-' 且不报错。"""
@@ -163,7 +164,42 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
         markdown = build_stats_summary_markdown(stats_data, [_provider()])
 
         self.assertIn("平均任务完成耗时：**-**", markdown)
-        self.assertIn("| 站点A | 1 | 0 | 100.0% | - | - |", markdown)
+        self.assertIn("| 站点A | 1 | 0 | 100.0% | normal |", markdown)
+        self.assertIn("| 站点A | - | - |", markdown)
+        self.assertIn("| 站点A | - | - | - |", markdown)
+
+    def test_billing_stats_are_displayed_in_stats_summary(self):
+        """stats 汇总展示缓存余额、累计开销和最近开销。"""
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                }
+            }
+        }
+        billing_stats = {
+            "providers": {
+                "pid-a": {
+                    "currency": "CNY",
+                    "balance_unit": "CNY",
+                    "last_balance_after": 39.9,
+                    "total_cost": 1.2,
+                    "last_cost": 0.1,
+                }
+            }
+        }
+
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [_provider()],
+            billing_stats=billing_stats,
+        )
+
+        self.assertIn("### 各站点费用与余额", markdown)
+        self.assertIn("| 站点A | 39.9 CNY | 1.2 CNY | 0.1 CNY |", markdown)
 
     def test_format_elapsed_ms_units(self):
         """毫秒和秒级耗时格式化符合展示约定。"""

@@ -139,6 +139,15 @@ def format_elapsed_ms(elapsed_ms: object) -> str:
     return f"{value / 1000:.1f}s"
 
 
+def _format_money(value: object, currency: str = "") -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    text = f"{number:.6f}".rstrip("0").rstrip(".")
+    return f"{text} {currency}".rstrip()
+
+
 def build_stats_recent_markdown(records: list[dict]) -> str:
     """构建 ``/image2 stats recent [N]`` 的 Markdown 展示。"""
     if not records:
@@ -193,6 +202,7 @@ def build_stats_summary_markdown(
     provider_configs: list[ImageAPIProviderConfig],
     *,
     show_all: bool = False,
+    billing_stats: dict | None = None,
 ) -> str:
     """构建 ``/image2 stats``（summary/all）的 Markdown 展示。"""
     providers_data = stats_data.get("providers", {})
@@ -209,6 +219,12 @@ def build_stats_summary_markdown(
             pid: item for pid, item in providers_data.items() if pid in configured_ids
         }
         scope_tag = "（当前配置的 Provider）"
+
+    billing_providers: dict = {}
+    if isinstance(billing_stats, dict):
+        raw_billing_providers = billing_stats.get("providers", {})
+        if isinstance(raw_billing_providers, dict):
+            billing_providers = raw_billing_providers
 
     # 汇总当前展示范围内的 Provider 统计。
     total_success = 0
@@ -272,15 +288,9 @@ def build_stats_summary_markdown(
             lines.append(f"- 未记录 HTTP 状态：{known_no_status_total} 次\n")
         lines.append("\n")
 
-    # 各 Provider 表格按成功率降序展示。
+    # 各 Provider 表格按成功率降序展示，拆成多张窄表，避免卡片横向过宽。
     if displayed_providers:
-        lines.append("### 各站点统计\n\n")
-        lines.append(
-            "| 站点 | 成功 | 失败 | 成功率 | 平均成功耗时 | 平均失败耗时 | 模式 | 主要失败原因 | 最近错误 |\n"
-            "|------|------|------|--------|--------------|--------------|------|-------------|----------|\n"
-        )
-
-        table_rows: list[tuple[float, str]] = []
+        provider_rows: list[tuple[float, dict]] = []
         for pid, item in displayed_providers.items():
             if not isinstance(item, dict):
                 continue
@@ -298,21 +308,91 @@ def build_stats_summary_markdown(
                 if isinstance(p_reasons, dict) and p_reasons
                 else "-"
             )
+            raw_last_error = str(item.get("last_error", "") or "")
             last_err = (
-                safe_text_preview(str(item.get("last_error", "") or ""), limit=60)
-                or "-"
+                safe_text_preview(raw_last_error, limit=60) if raw_last_error else "-"
             )
             sort_key = p_success / p_total if p_total > 0 else -1.0
-            row = (
-                f"| {p_name} | {p_success} | {p_failure} | {p_sr} "
-                f"| {p_success_avg} | {p_failure_avg} "
-                f"| {p_mode} | {top_reason} | {last_err} |\n"
+            billing_item = billing_providers.get(pid, {})
+            if not isinstance(billing_item, dict):
+                billing_item = {}
+            currency = str(billing_item.get("currency") or "")
+            balance_unit = str(billing_item.get("balance_unit") or "")
+            balance = _format_money(
+                billing_item.get("last_balance_after"), balance_unit
             )
-            table_rows.append((sort_key, row))
+            converted = _format_money(
+                billing_item.get("last_converted_balance"), currency
+            )
+            if balance != "-" and converted != "-" and converted != balance:
+                balance = f"{balance}（约 {converted}）"
+            total_cost = _format_money(billing_item.get("total_cost"), currency)
+            last_cost = _format_money(billing_item.get("last_cost"), currency)
+            provider_rows.append(
+                (
+                    sort_key,
+                    {
+                        "name": p_name,
+                        "success": p_success,
+                        "failure": p_failure,
+                        "success_rate": p_sr,
+                        "success_avg": p_success_avg,
+                        "failure_avg": p_failure_avg,
+                        "mode": p_mode,
+                        "top_reason": top_reason,
+                        "last_error": last_err,
+                        "balance": balance,
+                        "total_cost": total_cost,
+                        "last_cost": last_cost,
+                    },
+                )
+            )
 
-        table_rows.sort(key=lambda x: x[0], reverse=True)
-        for _, row in table_rows:
-            lines.append(row)
+        provider_rows.sort(key=lambda x: x[0], reverse=True)
+
+        lines.append("### 各站点概览\n\n")
+        lines.append(
+            "| 站点 | 成功 | 失败 | 成功率 | 模式 |\n"
+            "|------|------|------|--------|------|\n"
+        )
+        for _, row in provider_rows:
+            lines.append(
+                f"| {row['name']} | {row['success']} | {row['failure']} | "
+                f"{row['success_rate']} | {row['mode']} |\n"
+            )
+        lines.append("\n")
+
+        lines.append("### 各站点耗时\n\n")
+        lines.append(
+            "| 站点 | 平均成功耗时 | 平均失败耗时 |\n"
+            "|------|--------------|--------------|\n"
+        )
+        for _, row in provider_rows:
+            lines.append(
+                f"| {row['name']} | {row['success_avg']} | {row['failure_avg']} |\n"
+            )
+        lines.append("\n")
+
+        lines.append("### 各站点费用与余额\n\n")
+        lines.append(
+            "| 站点 | 缓存余额 | 累计开销 | 最近开销 |\n"
+            "|------|----------|----------|----------|\n"
+        )
+        for _, row in provider_rows:
+            lines.append(
+                f"| {row['name']} | {row['balance']} | "
+                f"{row['total_cost']} | {row['last_cost']} |\n"
+            )
+        lines.append("\n")
+
+        lines.append("### 各站点失败摘要\n\n")
+        lines.append(
+            "| 站点 | 主要失败原因 | 最近错误 |\n|------|--------------|----------|\n"
+        )
+        for _, row in provider_rows:
+            lines.append(
+                f"| {row['name']} | {row['top_reason']} | {row['last_error']} |\n"
+            )
         lines.append("\n")
 
         # 补充展示各 Provider 的响应/失败分布。

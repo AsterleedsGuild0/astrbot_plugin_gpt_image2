@@ -2533,7 +2533,12 @@ class GPTImage2Plugin(Star):
 
         yield await self._text_result(
             event,
-            build_stats_summary_markdown(stats_data, configs, show_all=show_all),
+            build_stats_summary_markdown(
+                stats_data,
+                configs,
+                show_all=show_all,
+                billing_stats=self._billing_records.load_billing_stats(),
+            ),
             action="stats",
         )
 
