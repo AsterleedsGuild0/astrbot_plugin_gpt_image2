@@ -22,6 +22,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import inspect
 from pathlib import Path
 import time as _time_module
 from time import perf_counter, time
@@ -90,6 +91,7 @@ from .image2_core.billing.messages import (
     build_costs_summary_markdown,
     format_money,
 )
+from .image2_core.billing.config import BillingConfig
 from .image2_core.billing.records import BillingRecords
 from .image2_core.billing.tracker import BillingObservation, BillingTracker
 from .image2_core.providers.messages import build_providers_status_markdown
@@ -693,6 +695,153 @@ class GPTImage2Plugin(Star):
             )
         except Exception:
             return None
+
+    @staticmethod
+    def _event_message_id(event: AstrMessageEvent) -> str:
+        msg_obj = getattr(event, "message_obj", None)
+        return str(getattr(msg_obj, "message_id", "") or "").strip()
+
+    @staticmethod
+    def _event_bot(event: AstrMessageEvent) -> object | None:
+        for obj in (event, getattr(event, "message_obj", None)):
+            if obj is None:
+                continue
+            for attr in ("bot", "client"):
+                value = getattr(obj, attr, None)
+                if value is not None:
+                    return value
+            getter = getattr(obj, "get_bot", None)
+            if callable(getter):
+                try:
+                    value = getter()
+                except Exception:
+                    value = None
+                if value is not None:
+                    return value
+        return None
+
+    async def _try_send_qq_emoji_feedback(
+        self,
+        event: AstrMessageEvent,
+        *,
+        action: str,
+    ) -> bool:
+        """Best-effort QQ/OneBot message emoji feedback for slow commands."""
+        platform = str(event.get_platform_name() or "").lower()
+        platform_id = str(event.get_platform_id() or "").lower()
+        if not any(
+            key in f"{platform} {platform_id}" for key in ("qq", "cq", "onebot")
+        ):
+            return False
+
+        message_id = self._event_message_id(event)
+        if not message_id:
+            return False
+        bot = self._event_bot(event)
+        if bot is None:
+            return False
+
+        async def _maybe_await(value: object) -> None:
+            if inspect.isawaitable(value):
+                await value
+
+        # QQ/NapCat/Lagrange 表情回应使用 emoji_id；不同实现的 ID 集合可能略有差异。
+        # 先尝试“偷看”，失败后再尝试一个更常见的轻量表情 ID。
+        emoji_ids = ("424", "66")
+        for emoji_id in emoji_ids:
+            try:
+                method = getattr(bot, "set_msg_emoji_like", None)
+                if callable(method):
+                    await _maybe_await(
+                        method(
+                            message_id=int(message_id),
+                            emoji_id=emoji_id,
+                            emoji_type="1",
+                            set=True,
+                        )
+                    )
+                    logger.debug(
+                        "[GPTImage2] QQ emoji feedback sent "
+                        f"action={action} emoji_id={emoji_id} "
+                        f"{self._event_context(event)}"
+                    )
+                    return True
+
+                call_action = getattr(bot, "call_action", None)
+                if callable(call_action):
+                    await _maybe_await(
+                        call_action(
+                            "set_msg_emoji_like",
+                            message_id=int(message_id),
+                            emoji_id=emoji_id,
+                            emoji_type="1",
+                            set=True,
+                        )
+                    )
+                    logger.debug(
+                        "[GPTImage2] QQ emoji feedback sent via call_action "
+                        f"action={action} emoji_id={emoji_id} "
+                        f"{self._event_context(event)}"
+                    )
+                    return True
+
+                call_api = getattr(bot, "call_api", None)
+                if callable(call_api):
+                    await _maybe_await(
+                        call_api(
+                            "set_msg_emoji_like",
+                            message_id=int(message_id),
+                            emoji_id=emoji_id,
+                            set=True,
+                        )
+                    )
+                    logger.debug(
+                        "[GPTImage2] QQ emoji feedback sent via call_api "
+                        f"action={action} emoji_id={emoji_id} "
+                        f"{self._event_context(event)}"
+                    )
+                    return True
+            except TypeError:
+                try:
+                    method = getattr(bot, "set_msg_emoji_like", None)
+                    if callable(method):
+                        await _maybe_await(method(int(message_id), emoji_id, True))
+                        logger.debug(
+                            "[GPTImage2] QQ emoji feedback sent positional "
+                            f"action={action} emoji_id={emoji_id} "
+                            f"{self._event_context(event)}"
+                        )
+                        return True
+                except Exception as e:
+                    logger.debug(
+                        "[GPTImage2] QQ emoji feedback positional failed "
+                        f"action={action} emoji_id={emoji_id} "
+                        f"error={type(e).__name__}: {e}"
+                    )
+            except Exception as e:
+                logger.debug(
+                    "[GPTImage2] QQ emoji feedback failed "
+                    f"action={action} emoji_id={emoji_id} "
+                    f"error={type(e).__name__}: {e}"
+                )
+        return False
+
+    async def _send_slow_command_ack(
+        self,
+        event: AstrMessageEvent,
+        *,
+        action: str,
+        text: str,
+    ) -> None:
+        if await self._try_send_qq_emoji_feedback(event, action=action):
+            return
+        await self._send_processing_ack(
+            event,
+            text,
+            action=f"{action}-ack",
+            prefer_image=False,
+            task_anchor=True,
+        )
 
     @staticmethod
     def _is_valid_image_file(path: str) -> bool:
@@ -2468,9 +2617,20 @@ class GPTImage2Plugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def balance(self, event: AstrMessageEvent):
         """实时查询已配置站点余额（管理员）"""
+        started = perf_counter()
+        logger.info(f"[GPTImage2] balance query start {self._event_context(event)}")
+        await self._send_slow_command_ack(
+            event,
+            action="balance",
+            text="⏳ 正在查询生图站点余额，请稍候…",
+        )
         try:
             configs = self._provider_manager.get_image_api_provider_configs()
         except ValueError as e:
+            logger.warning(
+                "[GPTImage2] balance query config error "
+                f"{self._event_context(event)} error={e}"
+            )
             yield await self._text_result(
                 event,
                 f"## ⚠️ 无法获取站点配置\n\n{str(e)}",
@@ -2478,14 +2638,46 @@ class GPTImage2Plugin(Star):
             )
             return
 
-        observations: list[BillingObservation] = []
-        for provider in configs:
-            billing = provider.billing
-            if billing is None or not billing.uses_balance:
-                continue
-            observations.append(
-                await self._billing_tracker.query_provider_balance(provider, billing)
+        query_targets = [
+            (provider, provider.billing)
+            for provider in configs
+            if provider.billing is not None and provider.billing.uses_balance
+        ]
+        logger.info(
+            "[GPTImage2] balance query targets "
+            f"{self._event_context(event)} count={len(query_targets)} "
+            f"providers={[provider.name for provider, _billing in query_targets]}"
+        )
+
+        async def _query_one(
+            provider: ImageAPIProviderConfig,
+            billing: BillingConfig,
+        ) -> BillingObservation:
+            provider_started = perf_counter()
+            logger.info(
+                "[GPTImage2] balance provider query start "
+                f"provider={provider.name} provider_id={provider.provider_id} "
+                f"{self._event_context(event)}"
             )
+            obs = await self._billing_tracker.query_provider_balance(provider, billing)
+            logger.info(
+                "[GPTImage2] balance provider query done "
+                f"provider={provider.name} provider_id={provider.provider_id} "
+                f"success={obs.success} elapsed_ms={self._elapsed_ms(provider_started)}"
+            )
+            return obs
+
+        observations = await asyncio.gather(
+            *(_query_one(provider, billing) for provider, billing in query_targets)
+        )
+
+        elapsed_ms = self._elapsed_ms(started)
+        success_count = sum(1 for obs in observations if obs.success)
+        logger.info(
+            "[GPTImage2] balance query done "
+            f"{self._event_context(event)} targets={len(query_targets)} "
+            f"success={success_count} elapsed_ms={elapsed_ms}"
+        )
 
         yield await self._text_result(
             event,
