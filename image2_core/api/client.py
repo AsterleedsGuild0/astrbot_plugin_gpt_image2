@@ -91,6 +91,7 @@ class GPTImageClient:
         response_format_b64_json: bool = True,
         images_prompt_rewrite_guard: bool = False,
         responses_prompt_rewrite_guard: bool = True,
+        force_single_image_requests: bool = False,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -100,6 +101,7 @@ class GPTImageClient:
         self.response_format_b64_json = response_format_b64_json
         self.images_prompt_rewrite_guard = images_prompt_rewrite_guard
         self.responses_prompt_rewrite_guard = responses_prompt_rewrite_guard
+        self.force_single_image_requests = force_single_image_requests
         self.last_request_elapsed_ms: int | None = None
         self._request_group_started_at: float | None = None
 
@@ -438,6 +440,11 @@ class GPTImageClient:
         params = self._params_with_n(params, n)
         if n == 1:
             return await self._generate_images_api_once(prompt, params)
+        if self.force_single_image_requests:
+            logger.info(
+                f"[GPTImage2] Images API force single-image generate requests n={n}"
+            )
+            return await self._generate_images_api_batch(prompt, params, n=n)
 
         try:
             results = await self._generate_images_api_once(prompt, params)
@@ -668,6 +675,12 @@ class GPTImageClient:
         params = self._params_with_n(params, n)
         if n == 1:
             return await self._edit_images_api_once(prompt, image_paths, params)
+        if self.force_single_image_requests:
+            logger.info(
+                "[GPTImage2] Images API force single-image edit requests "
+                f"n={n} input_images={len(image_paths)}"
+            )
+            return await self._edit_images_api_batch(prompt, image_paths, params, n=n)
 
         try:
             results = await self._edit_images_api_once(prompt, image_paths, params)

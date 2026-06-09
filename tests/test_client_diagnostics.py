@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 # 测试环境没有 AstrBot 运行时，导入 client 前先 mock astrbot。
 astrbot_api = MagicMock()
@@ -15,7 +15,7 @@ astrbot_api.logger = MagicMock()
 sys.modules["astrbot"] = MagicMock()
 sys.modules["astrbot.api"] = astrbot_api
 
-from image2_core.api.client import GPTImageClient, HTTPDiagnostics  # noqa: E402
+from image2_core.api.client import GPTImageClient, HTTPDiagnostics, ImageParams  # noqa: E402
 
 
 class TestResponseJsonSummary(unittest.TestCase):
@@ -237,6 +237,53 @@ class TestProviderRequestElapsedState(unittest.TestCase):
 
         self.assertIsNone(client.last_request_elapsed_ms)
         self.assertIsNone(client._request_group_started_at)
+
+
+class TestForceSingleImageRequests(unittest.IsolatedAsyncioTestCase):
+    """强制单图请求会跳过原生 n 调用。"""
+
+    def _client(self) -> GPTImageClient:
+        return GPTImageClient(
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            model="gpt-image-2",
+            responses_model="gpt-5.5",
+            force_single_image_requests=True,
+        )
+
+    async def test_generate_skips_native_n_and_uses_batch(self):
+        client = self._client()
+        client._generate_images_api_once = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("native n should be skipped")
+        )
+        client._generate_images_api_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=[]
+        )
+
+        params = ImageParams(n=2)
+        await client.generate_images_api("prompt", params)
+
+        client._generate_images_api_once.assert_not_awaited()
+        client._generate_images_api_batch.assert_awaited_once()
+        batch_kwargs = client._generate_images_api_batch.await_args.kwargs
+        self.assertEqual(batch_kwargs["n"], 2)
+
+    async def test_edit_skips_native_n_and_uses_batch(self):
+        client = self._client()
+        client._edit_images_api_once = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError("native n should be skipped")
+        )
+        client._edit_images_api_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=[]
+        )
+
+        params = ImageParams(n=2)
+        await client.edit_images_api("prompt", ["input.png"], params)
+
+        client._edit_images_api_once.assert_not_awaited()
+        client._edit_images_api_batch.assert_awaited_once()
+        batch_kwargs = client._edit_images_api_batch.await_args.kwargs
+        self.assertEqual(batch_kwargs["n"], 2)
 
 
 if __name__ == "__main__":

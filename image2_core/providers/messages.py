@@ -12,12 +12,22 @@ from __future__ import annotations
 from .manager import ImageAPIProviderConfig
 
 
+def _format_money(value: object, currency: str = "") -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    text = f"{number:.6f}".rstrip("0").rstrip(".")
+    return f"{text} {currency}".rstrip()
+
+
 def build_providers_status_markdown(
     configs: list[ImageAPIProviderConfig],
     stats: dict,
     *,
     global_mode: str,
     now: float,
+    billing_stats: dict | None = None,
 ) -> str:
     """构建 ``/image2 providers`` 命令的 Markdown 状态展示。"""
     primary = [c for c in configs if c.role == "primary"]
@@ -53,6 +63,46 @@ def build_providers_status_markdown(
             parts.append(f"responses=`{p.responses_model}`")
         return "，".join(parts)
 
+    def _request_policy_str(p: ImageAPIProviderConfig) -> str:
+        return "强制单图上游请求" if p.force_single_image_requests else "允许原生 n"
+
+    def _billing_str(p: ImageAPIProviderConfig) -> str:
+        if p.billing is None:
+            return "未配置"
+        billing_type = p.billing.type
+        stats_root = billing_stats if isinstance(billing_stats, dict) else {}
+        providers = (
+            stats_root.get("providers", {}) if isinstance(stats_root, dict) else {}
+        )
+        item = providers.get(p.provider_id, {}) if isinstance(providers, dict) else {}
+        item = item if isinstance(item, dict) else {}
+        if billing_type == "fixed":
+            return (
+                "fixed"
+                f"（成功单张 {_format_money(p.billing.success_cost, p.billing.currency)}"
+                f" / 失败单次 {_format_money(p.billing.failure_cost, p.billing.currency)}）"
+            )
+        if billing_type == "total_usage":
+            parts = ["total_usage"]
+        else:
+            parts = ["balance"]
+        if p.billing.has_fixed_fallback:
+            parts.append(
+                "固定参考 "
+                f"成功单张 {_format_money(p.billing.success_cost, p.billing.currency)}"
+                f" / 失败单次 {_format_money(p.billing.failure_cost, p.billing.currency)}"
+            )
+        balance = item.get("last_balance_after")
+        if balance is not None:
+            parts.append(_format_money(balance, p.billing.balance_unit))
+        converted = item.get("last_converted_balance")
+        if converted is not None:
+            parts.append(f"约 {_format_money(converted, p.billing.currency)}")
+        total_cost = item.get("total_cost")
+        if total_cost is not None:
+            parts.append(f"累计 {_format_money(total_cost, p.billing.currency)}")
+        return "，".join(parts)
+
     lines: list[str] = [
         "## 📡 生图站点状态\n\n",
         f"全局模式：`{global_mode}`\n\n",
@@ -65,7 +115,9 @@ def build_providers_status_markdown(
             lines.append(
                 f"**{p.name}** {_viable_marker(p)} {_mode_status(p)}\n\n"
                 f"- 模型：{_model_str(p)}\n"
+                f"- 请求策略：{_request_policy_str(p)}\n"
                 f"- URL：`{p.base_url}`\n"
+                f"- 计费：{_billing_str(p)}\n"
                 f"- 健康：{_health_str(p)}\n\n"
             )
     else:
@@ -87,7 +139,9 @@ def build_providers_status_markdown(
                 f"{idx}. **{p.name}** {_viable_marker(p)} "
                 f"{_mode_status(p)}{cooldown_str}\n\n"
                 f"   模型：{_model_str(p)}\n"
+                f"   请求策略：{_request_policy_str(p)}\n"
                 f"   URL：`{p.base_url}`\n"
+                f"   计费：{_billing_str(p)}\n"
                 f"   健康：{_health_str(p)}\n\n"
             )
     else:
@@ -99,7 +153,9 @@ def build_providers_status_markdown(
             lines.append(
                 f"**{p.name}** {_viable_marker(p)} {_mode_status(p)}\n\n"
                 f"- 模型：{_model_str(p)}\n"
+                f"- 请求策略：{_request_policy_str(p)}\n"
                 f"- URL：`{p.base_url}`\n"
+                f"- 计费：{_billing_str(p)}\n"
                 f"- 健康：{_health_str(p)}\n\n"
             )
     else:

@@ -27,6 +27,8 @@ from time import time
 
 from astrbot.api import logger
 
+from ..billing.config import BillingConfig, parse_billing_config
+
 
 # ── Utility formatting functions ─────────────────────────────────
 
@@ -76,6 +78,8 @@ class ImageAPIProviderConfig:
     configured_order: int
     role: str = "normal"  # "primary" | "normal" | "authoritative_fallback"
     adaptive: bool = True
+    billing: BillingConfig | None = None
+    force_single_image_requests: bool = False
 
     @property
     def images_supported(self) -> bool:
@@ -622,62 +626,6 @@ def provider_health_score(item: dict, now: float) -> float:
     return score
 
 
-def parse_fallback_api_provider_string(value: str) -> dict[str, str]:
-    """Parse a fallback provider string (JSON, URL-only, or key=value format)."""
-    text = value.strip()
-    if not text:
-        return {}
-
-    if text.startswith("{"):
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as e:
-            logger.warning(
-                f"[GPTImage2] fallback API provider JSON item parse failed error={e}"
-            )
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-
-    if "=" not in text:
-        return {"base_url": text}
-
-    data: dict[str, str] = {}
-    for chunk in text.replace(";", ",").split(","):
-        if "=" not in chunk:
-            continue
-        key, raw = chunk.split("=", 1)
-        key = key.strip().lower().replace("-", "_")
-        raw = raw.strip()
-        if key in {"url", "base", "baseurl", "base_url"}:
-            key = "base_url"
-        elif key in {"key", "apikey", "api_key"}:
-            key = "api_key"
-        elif key in {"responses", "responses_model", "response_model"}:
-            key = "responses_model"
-        elif key in {"api", "api_mode", "apimode"}:
-            key = "api_mode"
-        elif key in {"role", "provider_role"}:
-            key = "role"
-        elif key in {"adaptive", "adapt", "adaptive_priority"}:
-            key = "adaptive"
-        elif key in {"cap", "capabilities", "capability"}:
-            key = "capabilities"
-        elif key not in {
-            "name",
-            "base_url",
-            "api_key",
-            "api_mode",
-            "role",
-            "adaptive",
-            "model",
-            "responses_model",
-            "capabilities",
-        }:
-            continue
-        data[key] = raw
-    return data
-
-
 def provider_error_summary(provider_errors: list[tuple[str, str]]) -> str:
     """Build a Markdown error summary for all failed providers."""
     if not provider_errors:
@@ -747,6 +695,148 @@ def parse_bool_switch(value: object) -> bool | None:
     }:
         return False
     return None
+
+
+def parse_provider_billing_config(
+    value: object, *, provider_name: str
+) -> BillingConfig | None:
+    """Parse provider billing config and warn when a non-empty value is invalid."""
+    billing = parse_billing_config(value)
+    empty_value = value is None or (
+        isinstance(value, str) and value.strip() in {"", "{}"}
+    )
+    if billing is None and not empty_value:
+        logger.warning(
+            "[GPTImage2] provider billing config ignored invalid value "
+            f"provider={provider_name or '-'}"
+        )
+    return billing
+
+
+def _parse_legacy_fallback_provider_string(value: str) -> dict[str, object]:
+    """Best-effort migration for pre-JSON fallback provider strings."""
+    text = value.strip()
+    if not text:
+        return {}
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    if "=" not in text:
+        return {"base_url": text}
+
+    data: dict[str, object] = {}
+    for chunk in text.replace(";", ",").split(","):
+        if "=" not in chunk:
+            continue
+        key, raw = chunk.split("=", 1)
+        key = key.strip().lower().replace("-", "_")
+        raw = raw.strip()
+        if key in {"url", "base", "baseurl", "base_url"}:
+            key = "base_url"
+        elif key in {"key", "apikey", "api_key"}:
+            key = "api_key"
+        elif key in {"responses", "responses_model", "response_model"}:
+            key = "responses_model"
+        elif key in {"cap", "capabilities", "capability"}:
+            key = "capabilities"
+        elif key in {"adaptive", "adapt", "adaptive_priority"}:
+            key = "adaptive"
+        elif key in {"role", "provider_role"}:
+            key = "role"
+        elif key not in {
+            "name",
+            "base_url",
+            "api_key",
+            "role",
+            "adaptive",
+            "model",
+            "responses_model",
+            "capabilities",
+        }:
+            continue
+        data[key] = raw
+    return data
+
+
+def _fallback_provider_json_items(value: object) -> list[dict]:
+    """Normalize JSON fallback provider config into object items."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        value = parsed
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def migrate_fallback_api_providers_json_text(config: dict) -> bool:
+    """Migrate fallback_api_providers to JSON text for the WebUI JSON editor.
+
+    Returns True when the config dict was changed. This keeps existing pre-JSON
+    list values renderable in AstrBot's text/json editor after the schema change.
+    """
+    value = config.get("fallback_api_providers", [])
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            config["fallback_api_providers"] = "[]"
+            return True
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = _parse_legacy_fallback_provider_string(text)
+            items = [parsed] if parsed else []
+            config["fallback_api_providers"] = json.dumps(
+                items, ensure_ascii=False, indent=2
+            )
+            return True
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+            return False
+        items = _fallback_provider_json_items(parsed)
+        config["fallback_api_providers"] = json.dumps(
+            items, ensure_ascii=False, indent=2
+        )
+        return True
+
+    if isinstance(value, dict):
+        items = [dict(value)]
+        config["fallback_api_providers"] = json.dumps(
+            items, ensure_ascii=False, indent=2
+        )
+        return True
+    elif isinstance(value, list):
+        items = []
+        changed = False
+        for item in value:
+            if isinstance(item, dict):
+                items.append(dict(item))
+            elif isinstance(item, str):
+                parsed = _parse_legacy_fallback_provider_string(item)
+                if parsed:
+                    items.append(parsed)
+                changed = True
+            else:
+                changed = True
+        config["fallback_api_providers"] = json.dumps(
+            items, ensure_ascii=False, indent=2
+        )
+        return changed or True
+    config["fallback_api_providers"] = "[]"
+    return True
 
 
 def trim_jsonl(path: Path, max_lines: int = 5000) -> None:
@@ -832,6 +922,10 @@ class ProviderManager:
     """
 
     def __init__(self, config: dict, plugin_name: str | Callable[[], str]) -> None:
+        if migrate_fallback_api_providers_json_text(config):
+            logger.info(
+                "[GPTImage2] migrated fallback_api_providers to JSON text config"
+            )
         self.config = config
         self._plugin_name = plugin_name
         self._provider_stats_cache: dict | None = None
@@ -938,12 +1032,10 @@ class ProviderManager:
 
     # ── Provider config building ─────────────────────────────
 
-    def get_fallback_api_provider_items(self) -> list:
+    def get_fallback_api_provider_items(self) -> list[dict]:
         value = self.config.get("fallback_api_providers", [])
         if value is None or value == "":
             return []
-        if isinstance(value, list):
-            return value
         if isinstance(value, str):
             try:
                 parsed = json.loads(value)
@@ -952,7 +1044,20 @@ class ProviderManager:
                     f"[GPTImage2] fallback_api_providers JSON parse failed error={e}"
                 )
                 return []
-            return parsed if isinstance(parsed, list) else []
+            value = parsed
+        if isinstance(value, dict):
+            value = [value]
+        if isinstance(value, list):
+            result: list[dict] = []
+            for index, item in enumerate(value, start=1):
+                if isinstance(item, dict):
+                    result.append(dict(item))
+                else:
+                    logger.warning(
+                        "[GPTImage2] skip invalid fallback API provider JSON item "
+                        f"index={index} type={type(item).__name__}"
+                    )
+            return result
         logger.warning(
             "[GPTImage2] fallback_api_providers ignored invalid type "
             f"type={type(value).__name__}"
@@ -997,11 +1102,9 @@ class ProviderManager:
         default_model: str,
         default_responses_model: str,
     ) -> ImageAPIProviderConfig | None:
-        """Parse one fallback provider from WebUI list string or legacy dict."""
+        """Parse one fallback provider from a JSON object."""
         if isinstance(item, dict):
             data = dict(item)
-        elif isinstance(item, str):
-            data = parse_fallback_api_provider_string(item)
         else:
             logger.warning(
                 "[GPTImage2] skip invalid fallback API provider "
@@ -1071,6 +1174,12 @@ class ProviderManager:
             configured_order=index,
             role=provider_role,
             adaptive=provider_adaptive,
+            billing=parse_provider_billing_config(
+                data.get("billing"), provider_name=provider_name
+            ),
+            force_single_image_requests=normalize_bool(
+                data.get("force_single_image_requests"), default=False
+            ),
         )
 
     def get_image_api_provider_configs(self) -> list[ImageAPIProviderConfig]:
@@ -1099,6 +1208,14 @@ class ProviderManager:
                     configured_order=0,
                     role="primary",
                     adaptive=False,
+                    billing=parse_provider_billing_config(
+                        self.config.get("primary_billing_json"),
+                        provider_name=primary_name,
+                    ),
+                    force_single_image_requests=normalize_bool(
+                        self.config.get("primary_force_single_image_requests"),
+                        default=False,
+                    ),
                 )
             )
 
@@ -1151,6 +1268,16 @@ class ProviderManager:
                         configured_order=9999,
                         role="authoritative_fallback",
                         adaptive=False,
+                        billing=parse_provider_billing_config(
+                            self.config.get("authoritative_fallback_billing_json"),
+                            provider_name=auth_name,
+                        ),
+                        force_single_image_requests=normalize_bool(
+                            self.config.get(
+                                "authoritative_fallback_force_single_image_requests"
+                            ),
+                            default=False,
+                        ),
                     )
             else:
                 logger.warning(

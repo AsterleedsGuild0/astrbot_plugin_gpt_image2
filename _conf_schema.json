@@ -34,6 +34,21 @@
     "default": "primary",
     "hint": "日志、切换通知与 /image2 providers 中的主站点名称"
   },
+  "primary_billing_json": {
+    "description": "主站点费用观测 JSON",
+    "type": "text",
+    "editor_mode": true,
+    "editor_language": "json",
+    "editor_theme": "vs-dark",
+    "default": "{}",
+    "hint": "可选。绑定主站点 api_key/base_url 的费用观测配置。balance_url 严格表示直接余额接口；total_url + usage_url 表示总额减已用量接口组，最终余额 = total_value*scale - usage_value*usage_scale。success_cost 是固定参考单张成功成本，成功时按实际返回图片数相乘；failure_cost 是固定参考单次失败成本，不乘以图片数。二者也可作为余额查询失败时的兜底，并会在 /image2 providers 中展示。MICU（https://www.micuapi.ai）实测示例：{\"total_url\":\"https://www.micuapi.ai/dashboard/billing/subscription\",\"total_json_path\":\"soft_limit_usd\",\"usage_url\":\"https://www.micuapi.ai/dashboard/billing/usage\",\"usage_json_path\":\"total_usage\",\"usage_scale\":0.01,\"balance_unit\":\"CNY\",\"currency\":\"CNY\",\"scale\":1,\"cost_multiplier\":1,\"success_cost\":0.2,\"failure_cost\":0}。其它 NewAPI 系站点需要逐站验证字段和单位；没有可用余额/总额接口时可只填固定成本。"
+  },
+  "primary_force_single_image_requests": {
+    "description": "主站命中时强制单图上游请求",
+    "type": "bool",
+    "default": false,
+    "hint": "n 是全局生成数量，不区分站点。开启后，当本次任务 n>1 且实际命中主站 Provider 时，不向该 Provider 发送原生 n 参数，而是拆成多次 n=1 上游请求；因此全局 n=2 时仍可能产生两张图，只是来自两次单图请求。适合 MICU 等可能按原生 n 扣费但只返回 1 张图的站点。"
+  },
   "images_prompt_rewrite_guard": {
     "description": "Images API 禁止重写提示词",
     "type": "bool",
@@ -48,15 +63,12 @@
   },
   "fallback_api_providers": {
     "description": "备用生图 API 站点",
-    "type": "list",
-    "default": [],
-    "hint": "用于 draw/edit 一次性生图，以及 /plan confirm 最后的实际生图；Plan 对话整理阶段不使用该列表。WebUI 的列表项是字符串：点击 + 添加一条备用站点字符串。最简单写法只填 URL，例如 https://api-backup.example.com/v1，会继承主 api_key/model/responses_model。若要指定独立 Key、能力或模型，使用 key=value 写法：name=backup-1, base_url=https://api-backup.example.com/v1, api_key=sk-xxx, capabilities=images, model=gpt-image-2, responses_model=gpt-5.5。capabilities 可选 images/responses/all/both，默认 all。旧版 api_mode 仍可自动推断 capabilities。权威兜底请使用独立配置项 authoritative_fallback_*，不再推荐写在列表中（旧版 role=authoritative_fallback 仍兼容）。",
-    "items": {
-      "description": "备用站点字符串",
-      "type": "string",
-      "default": "",
-      "hint": "推荐写法 1：只填 URL，例如 https://api-backup.example.com/v1（继承主 API Key 和模型）。推荐写法 2：key=value，例如 name=backup-1, base_url=https://api-backup.example.com/v1, api_key=sk-xxx, capabilities=images, model=gpt-image-2。旧式写法：api_mode=responses（会被自动推断为 capabilities=responses）。权威兜底建议使用独立的 authoritative_fallback_* 配置节。"
-    }
+    "type": "text",
+    "editor_mode": true,
+    "editor_language": "json",
+    "editor_theme": "vs-dark",
+    "default": "[]",
+    "hint": "破坏式更新：这里必须填写 JSON 数组，不再支持只填 URL 或 key=value 字符串。每个元素是一个备用站点对象。示例：[{\"name\":\"backup-1\",\"base_url\":\"https://api-backup.example.com/v1\",\"api_key\":\"sk-xxx\",\"capabilities\":\"images\",\"model\":\"gpt-image-2\",\"force_single_image_requests\":true,\"billing\":{\"success_cost\":0.03,\"currency\":\"USD\"}}]。api_key/model/responses_model 可省略并继承主站；capabilities 可选 images/responses/all/both，默认 all。force_single_image_requests 开启后，当本次任务全局 n>1 且命中该 Provider 时，会拆成多次 n=1 上游请求；全局 n=2 时仍可能返回 2 张图，只是不发送原生 n=2。权威兜底请使用独立配置项 authoritative_fallback_*。"
   },
   "authoritative_fallback_enabled": {
     "description": "启用权威兜底站点",
@@ -89,6 +101,21 @@
     "type": "string",
     "default": "",
     "hint": "例如 gpt-5.5；该站点仅在 responses 全局模式下参与尝试"
+  },
+  "authoritative_fallback_billing_json": {
+    "description": "权威兜底站点费用观测 JSON",
+    "type": "text",
+    "editor_mode": true,
+    "editor_language": "json",
+    "editor_theme": "vs-dark",
+    "default": "{}",
+    "hint": "可选。格式同 primary_billing_json，绑定权威兜底站点。"
+  },
+  "authoritative_fallback_force_single_image_requests": {
+    "description": "权威兜底强制单图上游请求",
+    "type": "bool",
+    "default": false,
+    "hint": "n 是全局生成数量，不区分站点。开启后，当本次任务 n>1 且实际命中权威兜底 Provider 时，会拆成多次 n=1 上游请求；全局 n=2 时仍可能返回 2 张图，只是不发送原生 n=2。"
   },
   "adaptive_provider_priority": {
     "description": "自适应调整生图站点优先级",

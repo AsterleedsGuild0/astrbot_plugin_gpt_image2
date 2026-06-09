@@ -84,6 +84,14 @@ from .image2_core.diagnostics.reports import (
     build_stats_summary_markdown,
     build_diag_zip,
 )
+from .image2_core.billing.messages import (
+    build_balance_markdown,
+    build_costs_recent_markdown,
+    build_costs_summary_markdown,
+    format_money,
+)
+from .image2_core.billing.records import BillingRecords
+from .image2_core.billing.tracker import BillingObservation, BillingTracker
 from .image2_core.providers.messages import build_providers_status_markdown
 from .image2_core.providers.manager import (
     ImageAPIProviderConfig,
@@ -182,7 +190,7 @@ class PlanSessionFilter(SessionFilter):
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.4.7",
+    "0.4.8",
 )
 class GPTImage2Plugin(Star):
     PLAN_WAITER_TIMEOUT_GRACE = 10
@@ -198,6 +206,10 @@ class GPTImage2Plugin(Star):
             config,
             lambda: str(getattr(self, "name", self.plugin_name)),
         )
+        self._billing_records = BillingRecords(
+            lambda: str(getattr(self, "name", self.plugin_name))
+        )
+        self._billing_tracker = BillingTracker(self._billing_records)
         # Retry notice throttling state (shared ref; also accessible via manager)
         self._provider_retry_notice_state = (
             self._provider_manager._provider_retry_notice_state
@@ -806,6 +818,7 @@ class GPTImage2Plugin(Star):
             responses_prompt_rewrite_guard=self._provider_manager.prompt_rewrite_guard_enabled(
                 "responses"
             ),
+            force_single_image_requests=provider.force_single_image_requests,
         )
 
     def _send_copyable_prompt_after_success_enabled(self) -> bool:
@@ -1571,14 +1584,63 @@ class GPTImage2Plugin(Star):
         elapsed_ms: int,
         global_mode: str = "",
         task_tag: str = "",
+        billing_observations: list[BillingObservation] | None = None,
     ) -> Plain:
         retry_text = f"，已跳过 {failed_count} 个失败站点" if failed_count else ""
         tag_prefix = f"[任务 #{task_tag}]\n\n" if task_tag else ""
+        cost_text = self._task_cost_notice(billing_observations or [])
         return Plain(
             tag_prefix + "✅ 生图成功："
             f"{provider_user_label(provider, global_mode)}"
-            f"（第 {attempt_index}/{total} 个站点{retry_text}，耗时 {elapsed_ms}ms）\n"
+            f"（第 {attempt_index}/{total} 个站点{retry_text}，耗时 {elapsed_ms}ms{cost_text}）\n"
         )
+
+    @staticmethod
+    def _billing_observation_from_error(
+        error: BaseException,
+    ) -> BillingObservation | None:
+        value = getattr(error, "_gpt_image2_billing_observation", None)
+        return value if isinstance(value, BillingObservation) else None
+
+    @staticmethod
+    def _task_cost_notice(observations: list[BillingObservation]) -> str:
+        if len(observations) == 1:
+            obs = observations[0]
+            if obs.cost is None:
+                return "，开销 未知"
+            details: list[str] = []
+            if obs.success and obs.cost_units > 1:
+                details.append(f"{obs.cost_units} 张")
+            if obs.cost_source:
+                details.append(obs.cost_source)
+            suffix = f"（{'，'.join(details)}）" if details else ""
+            return f"，开销 {format_money(obs.cost, obs.currency)}{suffix}"
+
+        known: dict[str, float] = {}
+        unknown = 0
+        units = 0
+        for obs in observations:
+            if obs.cost is None:
+                unknown += 1
+                continue
+            known[obs.currency] = known.get(obs.currency, 0.0) + float(obs.cost)
+            if obs.success:
+                units += max(0, int(obs.cost_units or 0))
+        parts = [
+            format_money(value, currency) for currency, value in sorted(known.items())
+        ]
+        if units > 1:
+            parts.append(f"计费 {units} 张")
+        if unknown:
+            parts.append(f"{unknown} 次未知")
+        return f"，开销 {' / '.join(parts)}" if parts else ""
+
+    @classmethod
+    def _task_cost_markdown(cls, observations: list[BillingObservation]) -> str:
+        notice = cls._task_cost_notice(observations)
+        if not notice:
+            return ""
+        return "\n\n费用观测：" + notice.removeprefix("，开销 ")
 
     async def _call_draw_api(
         self,
@@ -1722,6 +1784,7 @@ class GPTImage2Plugin(Star):
         selected_provider: ImageAPIProviderConfig | None = None
         selected_attempt_index = 0
         provider_errors: list[tuple[str, str]] = []
+        billing_observations: list[BillingObservation] = []
 
         for index, provider in enumerate(viable, start=1):
             client = self._build_image_api_client(provider)
@@ -1733,16 +1796,29 @@ class GPTImage2Plugin(Star):
                 f"role={provider.role} adaptive={provider.adaptive}"
             )
             try:
-                results, provider_elapsed = await self._call_draw_api(
-                    client=client,
-                    prompt=prompt,
-                    params=params,
+                (
+                    (results, provider_elapsed),
+                    billing_obs,
+                ) = await self._billing_tracker.observe_call(
+                    provider,
+                    provider.billing,
+                    action=action,
                     api_mode=global_mode,
-                    reference_images=reference_images,
-                    reference_data_urls=reference_data_urls,
-                    reference_count=reference_count,
-                    action=provider_action,
+                    cost_units=params.n,
+                    result_cost_units=lambda result: len(result[0]),
+                    call=lambda: self._call_draw_api(
+                        client=client,
+                        prompt=prompt,
+                        params=params,
+                        api_mode=global_mode,
+                        reference_images=reference_images,
+                        reference_data_urls=reference_data_urls,
+                        reference_count=reference_count,
+                        action=provider_action,
+                    ),
                 )
+                if billing_obs is not None:
+                    billing_observations.append(billing_obs)
                 self._provider_manager.record_image_provider_result(
                     provider,
                     success=True,
@@ -1753,6 +1829,9 @@ class GPTImage2Plugin(Star):
                 break
             except RuntimeError as e:
                 error_msg = str(e)
+                billing_obs = self._billing_observation_from_error(e)
+                if billing_obs is not None:
+                    billing_observations.append(billing_obs)
                 provider_elapsed = self._provider_exception_elapsed_ms(e)
                 self._provider_manager.record_image_provider_result(
                     provider,
@@ -1793,6 +1872,7 @@ class GPTImage2Plugin(Star):
                     continue
 
                 provider_summary = provider_error_summary(provider_errors)
+                cost_summary = self._task_cost_markdown(billing_observations)
                 if reference_count and is_image_input_unsupported(error_msg):
                     await self._send_text(
                         event,
@@ -1802,6 +1882,7 @@ class GPTImage2Plugin(Star):
                         f"- 参考图数量：`{reference_count}`\n"
                         f"- 生图模型：`{provider.model}`\n"
                         f"- Responses 模型：`{provider.responses_model}`"
+                        f"{cost_summary}"
                         f"{provider_summary}\n\n"
                         "这通常表示上游服务实际路由到的模型不支持图片输入，"
                         "或服务商对当前 endpoint/model 的图像输入兼容性有问题。"
@@ -1814,12 +1895,16 @@ class GPTImage2Plugin(Star):
                     event,
                     "## ⚠️ GPT Image2 调用失败\n\n"
                     f"最后错误：{self._safe_markdown_preview(error_msg, limit=320)}"
+                    f"{cost_summary}"
                     f"{provider_summary}",
                     action=f"{action}-api-error",
                     task_anchor=True,
                 )
                 return []
             except Exception as e:
+                billing_obs = self._billing_observation_from_error(e)
+                if billing_obs is not None:
+                    billing_observations.append(billing_obs)
                 logger.error(
                     "[GPTImage2] draw unexpected error "
                     f"action={action} provider={provider.name} "
@@ -1838,6 +1923,7 @@ class GPTImage2Plugin(Star):
             await self._send_text(
                 event,
                 "## ⚠️ GPT Image2 调用失败\n\n所有 API 站点均未返回结果。"
+                f"{self._task_cost_notice(billing_observations)}"
                 f"{provider_error_summary(provider_errors)}",
                 action=f"{action}-provider-empty",
                 task_anchor=True,
@@ -1847,7 +1933,8 @@ class GPTImage2Plugin(Star):
         api_elapsed = self._elapsed_ms(started)
         logger.info(
             "[GPTImage2] image API success "
-            f"action={action} provider={selected_provider.name} "
+            f"action={action} task={self._task_tag(event)} "
+            f"{self._event_context(event)} provider={selected_provider.name} "
             f"mode={global_mode} role={selected_provider.role} "
             f"adaptive={selected_provider.adaptive} results={len(results)} "
             f"elapsed_ms={api_elapsed}"
@@ -1858,6 +1945,19 @@ class GPTImage2Plugin(Star):
 
         tag = self._task_tag(event)
         chain = self._build_image_chain(results, params)
+        chain_image_items = sum(1 for item in chain if isinstance(item, CompImage))
+        logger.info(
+            "[GPTImage2] image reply chain ready "
+            f"action={action} task={tag} {self._event_context(event)} "
+            f"results={len(results)} chain_items={len(chain)} "
+            f"chain_image_items={chain_image_items}"
+        )
+        if chain_image_items < len(results):
+            logger.warning(
+                "[GPTImage2] image reply chain has fewer image components than results "
+                f"action={action} task={tag} results={len(results)} "
+                f"chain_image_items={chain_image_items}"
+            )
         if chain:
             task_elapsed = self._elapsed_ms(started)
             chain.insert(
@@ -1870,6 +1970,7 @@ class GPTImage2Plugin(Star):
                     elapsed_ms=task_elapsed,
                     global_mode=global_mode,
                     task_tag=tag,
+                    billing_observations=billing_observations,
                 ),
             )
             reply = self._build_reply(event)
@@ -1959,6 +2060,9 @@ class GPTImage2Plugin(Star):
             "- `/image2 retry [global|here|interval] ...` — "
             "查看/切换备用站点重试提示（管理员）\n"
             "- `/image2 providers` — 查看生图站点状态与当前模式可用性（管理员）\n"
+            "- `/image2 costs` — 查看费用统计（管理员）\n"
+            "- `/image2 costs recent [N]` — 查看最近 N 条费用事件（管理员）\n"
+            "- `/image2 balance` — 实时查询已配置站点余额（管理员）\n"
             "- `/image2 stats` — 查看 Provider 统计、失败原因、成功率（管理员）\n"
             "- `/image2 stats recent [N]` — 查看最近 N 条失败记录（管理员）\n"
             "- `/image2 diag` — 生成诊断包（管理员）\n"
@@ -2302,14 +2406,82 @@ class GPTImage2Plugin(Star):
             return
 
         stats = self._provider_manager.load_provider_stats().get("providers", {})
+        billing_stats = self._billing_records.load_billing_stats()
         now = time()
 
         yield await self._text_result(
             event,
             build_providers_status_markdown(
-                configs, stats, global_mode=global_mode, now=now
+                configs,
+                stats,
+                global_mode=global_mode,
+                now=now,
+                billing_stats=billing_stats,
             ),
             action="providers",
+        )
+
+    @image2.command("costs")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def costs(
+        self,
+        event: AstrMessageEvent,
+        sub: str | None = None,
+        count_arg: str | None = None,
+    ):
+        """显示生图费用统计（管理员）"""
+        sub_str = (sub or "").strip().lower()
+        if sub_str == "recent" or sub_str.startswith("recent "):
+            count = 10
+            parts = sub_str.split(maxsplit=1)
+            raw_count = count_arg or (parts[1] if len(parts) > 1 else "")
+            if raw_count:
+                try:
+                    count = max(1, min(50, int(str(raw_count).strip())))
+                except (TypeError, ValueError):
+                    count = 10
+            records = self._billing_records.read_recent_events(count)
+            yield await self._text_result(
+                event,
+                build_costs_recent_markdown(records),
+                action="costs-recent" if records else "costs-recent-empty",
+            )
+            return
+
+        stats = self._billing_records.load_billing_stats()
+        yield await self._text_result(
+            event,
+            build_costs_summary_markdown(stats),
+            action="costs",
+        )
+
+    @image2.command("balance")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def balance(self, event: AstrMessageEvent):
+        """实时查询已配置站点余额（管理员）"""
+        try:
+            configs = self._provider_manager.get_image_api_provider_configs()
+        except ValueError as e:
+            yield await self._text_result(
+                event,
+                f"## ⚠️ 无法获取站点配置\n\n{str(e)}",
+                action="balance-config-error",
+            )
+            return
+
+        observations: list[BillingObservation] = []
+        for provider in configs:
+            billing = provider.billing
+            if billing is None or not billing.uses_balance:
+                continue
+            observations.append(
+                await self._billing_tracker.query_provider_balance(provider, billing)
+            )
+
+        yield await self._text_result(
+            event,
+            build_balance_markdown(observations),
+            action="balance" if observations else "balance-empty",
         )
 
     # ── Telemetry diagnostics commands ──────────────────────────
@@ -2375,7 +2547,7 @@ class GPTImage2Plugin(Star):
                 config=self.config,
                 failures_path=failures_path,
                 plugin_name=plugin_name,
-                plugin_version="0.4.7",
+                plugin_version="0.4.8",
                 generated_at=timestamp,
             )
         except Exception as e:

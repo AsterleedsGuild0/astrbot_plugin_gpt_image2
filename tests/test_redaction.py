@@ -271,16 +271,24 @@ class TestRedactConfigValue(unittest.TestCase):
             "base_url": "https://api.openai.com/v1",
             "model": "gpt-image-2",
             "responses_model": "gpt-5.5",
-            "fallback_api_providers": [
-                {
-                    "name": "backup-1",
-                    "api_key": "sk-backup-1",
-                    "base_url": "https://backup1.example.com/v1",
-                    "model": "gpt-image-2",
-                    "capabilities": "all",
-                },
-                "name=backup-2, base_url=https://backup2.example.com/v1, api_key=sk-backup-2, capabilities=images",
-            ],
+            "fallback_api_providers": json.dumps(
+                [
+                    {
+                        "name": "backup-1",
+                        "api_key": "sk-backup-1",
+                        "base_url": "https://backup1.example.com/v1",
+                        "model": "gpt-image-2",
+                        "capabilities": "all",
+                    },
+                    {
+                        "name": "backup-2",
+                        "api_key": "sk-backup-2",
+                        "base_url": "https://backup2.example.com/v1",
+                        "capabilities": "images",
+                    },
+                ],
+                ensure_ascii=False,
+            ),
             "authoritative_fallback_enabled": True,
             "authoritative_fallback_api_key": "sk-auth-fallback",
             "authoritative_fallback_base_url": "https://auth.example.com/v1",
@@ -305,18 +313,18 @@ class TestRedactConfigValue(unittest.TestCase):
         assert result["size"] == "1024x1024"
         assert result["n"] == 1
 
-        # Fallback list: dict item
-        dict_item = result["fallback_api_providers"][0]
+        # Fallback JSON text: every provider API key is redacted.
+        fallback_items = json.loads(result["fallback_api_providers"])
+        dict_item = fallback_items[0]
         assert isinstance(dict_item, dict)
         assert dict_item["api_key"] == "***REDACTED***"
         assert dict_item["name"] == "backup-1"
         assert dict_item["base_url"] == "https://backup1.example.com/v1"
 
-        # Fallback list: string item
-        str_item = result["fallback_api_providers"][1]
-        assert isinstance(str_item, str)
-        assert "***REDACTED***" in str_item
-        assert "sk-backup-2" not in str_item
+        dict_item_2 = fallback_items[1]
+        assert isinstance(dict_item_2, dict)
+        assert dict_item_2["api_key"] == "***REDACTED***"
+        assert dict_item_2["name"] == "backup-2"
 
 
 if __name__ == "__main__":
