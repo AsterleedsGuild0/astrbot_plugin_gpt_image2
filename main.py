@@ -1603,7 +1603,16 @@ class GPTImage2Plugin(Star):
         return value if isinstance(value, BillingObservation) else None
 
     @staticmethod
-    def _task_cost_notice(observations: list[BillingObservation]) -> str:
+    def _billing_cost_source_label(cost_source: str) -> str:
+        labels = {
+            "balance_delta": "按余额差计算",
+            "fixed": "按固定参考计算",
+            "fixed_fallback": "按固定参考兜底",
+        }
+        return labels.get(cost_source, cost_source)
+
+    @classmethod
+    def _task_cost_notice(cls, observations: list[BillingObservation]) -> str:
         if len(observations) == 1:
             obs = observations[0]
             if obs.cost is None:
@@ -1612,7 +1621,7 @@ class GPTImage2Plugin(Star):
             if obs.success and obs.cost_units > 1:
                 details.append(f"{obs.cost_units} 张")
             if obs.cost_source:
-                details.append(obs.cost_source)
+                details.append(cls._billing_cost_source_label(obs.cost_source))
             suffix = f"（{'，'.join(details)}）" if details else ""
             return f"，开销 {format_money(obs.cost, obs.currency)}{suffix}"
 
