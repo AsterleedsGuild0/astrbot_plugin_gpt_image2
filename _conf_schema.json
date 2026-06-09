@@ -68,7 +68,7 @@
     "editor_language": "json",
     "editor_theme": "vs-dark",
     "default": "[]",
-    "hint": "破坏式更新：这里必须填写 JSON 数组，不再支持只填 URL 或 key=value 字符串。每个元素是一个备用站点对象。示例：[{\"name\":\"backup-1\",\"base_url\":\"https://api-backup.example.com/v1\",\"api_key\":\"sk-xxx\",\"capabilities\":\"images\",\"model\":\"gpt-image-2\",\"force_single_image_requests\":true,\"billing\":{\"success_cost\":0.03,\"currency\":\"USD\"}}]。api_key/model/responses_model 可省略并继承主站；capabilities 可选 images/responses/all/both，默认 all。force_single_image_requests 开启后，当本次任务全局 n>1 且命中该 Provider 时，会拆成多次 n=1 上游请求；全局 n=2 时仍可能返回 2 张图，只是不发送原生 n=2。权威兜底请使用独立配置项 authoritative_fallback_*。"
+    "hint": "破坏式更新：这里必须填写 JSON 数组，不再支持只填 URL 或 key=value 字符串。每个元素是一个备用站点对象。示例：[{\"name\":\"backup-1\",\"base_url\":\"https://api-backup.example.com/v1\",\"api_key\":\"sk-xxx\",\"capabilities\":\"images\",\"model\":\"gpt-image-2\",\"force_single_image_requests\":true,\"billing\":{\"success_cost\":0.2,\"currency\":\"CNY\"}}]。api_key/model/responses_model 可省略并继承主站；capabilities 可选 images/responses/all/both，默认 all。force_single_image_requests 开启后，当本次任务全局 n>1 且命中该 Provider 时，会拆成多次 n=1 上游请求；全局 n=2 时仍可能返回 2 张图，只是不发送原生 n=2。权威兜底请使用独立配置项 authoritative_fallback_*。"
   },
   "authoritative_fallback_enabled": {
     "description": "启用权威兜底站点",

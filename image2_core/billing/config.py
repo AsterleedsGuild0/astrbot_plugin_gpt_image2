@@ -28,8 +28,8 @@ class BillingConfig:
     balance_json_path: str = "balance"
     total_json_path: str = "total"
     usage_json_path: str = "total_usage"
-    balance_unit: str = "USD"
-    currency: str = "USD"
+    balance_unit: str = "CNY"
+    currency: str = "CNY"
     scale: float = 1.0
     usage_scale: float = 1.0
     cost_multiplier: float = 1.0
@@ -103,8 +103,8 @@ def parse_billing_config(value: Any) -> BillingConfig | None:
     if usage_method not in {"GET", "POST"}:
         usage_method = method
 
-    balance_unit = str(data.get("balance_unit") or data.get("unit") or "USD").strip()
-    currency = str(data.get("currency") or balance_unit or "USD").strip()
+    balance_unit = str(data.get("balance_unit") or data.get("unit") or "CNY").strip()
+    currency = str(data.get("currency") or balance_unit or "CNY").strip()
     balance_url = str(data.get("balance_url") or "").strip()
     total_url = str(data.get("total_url") or "").strip()
     usage_url = str(data.get("usage_url") or "").strip()
@@ -156,8 +156,8 @@ def parse_billing_config(value: Any) -> BillingConfig | None:
         usage_json_path=str(
             data.get("usage_json_path") or data.get("usage_path") or "total_usage"
         ).strip(),
-        balance_unit=balance_unit or "USD",
-        currency=currency or "USD",
+        balance_unit=balance_unit or "CNY",
+        currency=currency or "CNY",
         scale=_as_float(data.get("scale"), 1.0),
         usage_scale=_as_float(data.get("usage_scale"), 1.0),
         cost_multiplier=_as_float(data.get("cost_multiplier"), 1.0),

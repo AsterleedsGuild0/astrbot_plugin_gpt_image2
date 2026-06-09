@@ -76,12 +76,32 @@
     "model": "gpt-image-2",
     "force_single_image_requests": true,
     "billing": {
-      "currency": "USD",
-      "success_cost": 0.03,
+      "total_url": "https://www.micuapi.ai/dashboard/billing/subscription",
+      "total_json_path": "soft_limit_usd",
+      "usage_url": "https://www.micuapi.ai/dashboard/billing/usage",
+      "usage_json_path": "total_usage",
+      "usage_scale": 0.01,
+      "balance_unit": "CNY",
+      "currency": "CNY",
+      "scale": 1,
+      "cost_multiplier": 1,
+      "success_cost": 0.2,
       "failure_cost": 0
     }
   }
 ]
+```
+
+上面的 `billing` 展示的是完整余额/用量查询配置；插件已实现 `/image2 balance` 实时余额查询，以及生图前后余额差成本观测。若站点没有可用余额接口，也可以只填写固定参考成本：
+
+```json
+{
+  "billing": {
+    "currency": "CNY",
+    "success_cost": 0.2,
+    "failure_cost": 0
+  }
+}
 ```
 
 支持字段：
@@ -96,6 +116,7 @@
 | `responses_model` | Responses API 模型 |
 | `adaptive` | 是否参与自适应排序，默认参与 |
 | `force_single_image_requests` | 本次任务全局 `n > 1` 且命中该 Provider 时，是否强制拆成多次 `n=1` 上游请求 |
+| `billing` | 该 Provider 的费用观测配置；支持直接余额、总额减用量和固定参考成本，详见 [费用观测配置](./billing.md) |
 
 `n` 是全局生成数量，不区分主站、备用站或权威兜底站。`force_single_image_requests` 只控制“命中某个 Provider 后，是否把该 Provider 的一次原生 `n` 请求拆成多次 `n=1` 上游请求”。它不会把整次任务的出图数量限制为 1；例如全局 `n=2` 时，开启后仍可能向同一 Provider 发两次 `n=1`，最终返回 2 张图。如果站点会按原生 `n` 扣费但实际只返回 1 张图，建议对该 Provider 开启 `force_single_image_requests`，避免原生 `n=2` 被站点扣两张但插件只收到一张。
 

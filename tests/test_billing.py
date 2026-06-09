@@ -230,6 +230,13 @@ class TestBillingConfig(unittest.TestCase):
         self.assertEqual(billing.type, "fixed")
         self.assertTrue(billing.has_fixed_fallback)
 
+    def test_parse_billing_config_defaults_to_cny(self):
+        billing = parse_billing_config({"success_cost": 0.2})
+
+        self.assertIsNotNone(billing)
+        self.assertEqual(billing.currency, "CNY")
+        self.assertEqual(billing.balance_unit, "CNY")
+
     def test_balance_config_supports_nested_fixed_fallback(self):
         billing = parse_billing_config(
             {

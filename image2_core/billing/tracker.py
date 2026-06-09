@@ -28,8 +28,8 @@ class BillingObservation:
     success: bool
     cost: float | None = None
     cost_units: int = 1
-    currency: str = "USD"
-    balance_unit: str = "USD"
+    currency: str = "CNY"
+    balance_unit: str = "CNY"
     raw_balance_before: float | None = None
     raw_balance_after: float | None = None
     balance_before: float | None = None

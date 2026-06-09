@@ -31,8 +31,8 @@
 
 ```json
 {
-  "currency": "USD",
-  "success_cost": 0.03,
+  "currency": "CNY",
+  "success_cost": 0.2,
   "failure_cost": 0
 }
 ```
@@ -47,8 +47,8 @@
     "api_key": "sk-xxx",
     "capabilities": "images",
     "billing": {
-      "currency": "USD",
-      "success_cost": 0.03,
+      "currency": "CNY",
+      "success_cost": 0.2,
       "failure_cost": 0
     }
   }
@@ -204,7 +204,7 @@ MICU 示例返回：
 | `usage_method` | 同 `method` | `usage_url` 请求方法 |
 | `usage_json_path` | `total_usage` | 从已用量接口 JSON 中取数的点路径 |
 | `usage_scale` | `1` | 已用量换算倍率 |
-| `balance_unit` | `USD` | 站点余额单位 |
+| `balance_unit` | `CNY` | 站点余额单位 |
 | `currency` | 同 `balance_unit` | 最终展示/统计货币 |
 | `scale` | `1` | 余额或总额原始值换算倍率 |
 | `cost_multiplier` | `1` | 站点余额单位到展示货币的换算倍率 |
