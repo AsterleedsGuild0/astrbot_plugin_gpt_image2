@@ -192,7 +192,7 @@ class PlanSessionFilter(SessionFilter):
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.4.9",
+    "0.4.10",
 )
 class GPTImage2Plugin(Star):
     PLAN_WAITER_TIMEOUT_GRACE = 10
@@ -832,6 +832,7 @@ class GPTImage2Plugin(Star):
         *,
         action: str,
         text: str,
+        task_anchor: bool = True,
     ) -> None:
         if await self._try_send_qq_emoji_feedback(event, action=action):
             return
@@ -840,7 +841,7 @@ class GPTImage2Plugin(Star):
             text,
             action=f"{action}-ack",
             prefer_image=False,
-            task_anchor=True,
+            task_anchor=task_anchor,
         )
 
     @staticmethod
@@ -1931,10 +1932,10 @@ class GPTImage2Plugin(Star):
             else:
                 ack_text = f"✅ 正在使用 {global_mode} 模式生成图片，请稍候…"
 
-            await self._send_processing_ack(
+            await self._send_slow_command_ack(
                 event,
-                ack_text,
                 action=action,
+                text=ack_text,
                 task_anchor=True,
             )
 
@@ -2753,7 +2754,7 @@ class GPTImage2Plugin(Star):
                 config=self.config,
                 failures_path=failures_path,
                 plugin_name=plugin_name,
-                plugin_version="0.4.9",
+                plugin_version="0.4.10",
                 generated_at=timestamp,
             )
         except Exception as e:
@@ -3154,11 +3155,11 @@ class GPTImage2Plugin(Star):
                     next_event.unified_msg_origin,
                     processing_timeout,
                 )
-                await self._send_processing_ack(
+                await self._send_slow_command_ack(
                     next_event,
-                    "✅ 正在重试上一条 Plan 输入，请稍候…",
                     action="plan-retry-ack",
-                    prefer_image=False,
+                    text="✅ 正在重试上一条 Plan 输入，请稍候…",
+                    task_anchor=False,
                 )
                 await self._run_plan_model_round(
                     next_event,
@@ -3208,10 +3209,11 @@ class GPTImage2Plugin(Star):
                             f"正在使用 {api_mode} 模式生成图片，请稍候…"
                         )
                     await self._send_plan_final_prompt_forward(next_event, session)
-                    await self._send_processing_ack(
+                    await self._send_slow_command_ack(
                         next_event,
-                        confirm_ack,
                         action="plan-confirm",
+                        text=confirm_ack,
+                        task_anchor=False,
                     )
                     chain = await self._generate_draw_chain(
                         next_event,
@@ -3369,11 +3371,11 @@ class GPTImage2Plugin(Star):
                 )
             else:
                 ack_text = "✅ 已收到 Plan 输入，正在请求模型整理，请稍候…"
-            await self._send_processing_ack(
+            await self._send_slow_command_ack(
                 next_event,
-                ack_text,
                 action="plan-input-ack",
-                prefer_image=False,
+                text=ack_text,
+                task_anchor=False,
             )
 
             image_urls_for_message = new_reference_urls
