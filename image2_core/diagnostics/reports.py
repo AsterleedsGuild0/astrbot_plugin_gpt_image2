@@ -105,7 +105,7 @@ def _format_failure_distribution(
     *,
     total_count: int,
     failure_count: int,
-    max_parts: int = 6,
+    max_parts: int = 8,
 ) -> str:
     """格式化 Provider 失败分布，只展示可量化失败项。"""
     if total_count <= 0 or failure_count <= 0:
@@ -114,11 +114,13 @@ def _format_failure_distribution(
     buckets = _failure_distribution_buckets(provider_item, failure_count)
     if not buckets:
         return "-"
+    buckets.sort(key=lambda item: (-item[1], item[0]))
 
     if len(buckets) > max_parts:
         head = buckets[: max_parts - 1]
-        rest_count = sum(count for _label, count in buckets[max_parts - 1 :])
-        buckets = head + [("其他", rest_count)]
+        rest_buckets = buckets[max_parts - 1 :]
+        rest_count = sum(count for _label, count in rest_buckets)
+        buckets = head + [(f"其余 {len(rest_buckets)} 项", rest_count)]
 
     parts = [f"{label} {count / total_count * 100:.1f}%" for label, count in buckets]
     return ", ".join(parts)

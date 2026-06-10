@@ -68,8 +68,8 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
         self.assertIn("### 各站点响应分布", markdown)
         self.assertIn(
             "| 站点A | 20.0% | "
-            "HTTP 200 55.0%, HTTP 400 5.0%, "
-            "network_timeout 12.0%, network_connect 8.0% |",
+            "HTTP 200 55.0%, network_timeout 12.0%, "
+            "network_connect 8.0%, HTTP 400 5.0% |",
             markdown,
         )
         self.assertIn("- 未记录 HTTP 状态：20 次", markdown)
@@ -122,6 +122,58 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
             markdown,
         )
         self.assertNotIn("历史未记录/未细分", markdown)
+
+    def test_failure_distribution_labels_collapsed_tail_count(self):
+        """失败分类过多时展示被折叠的剩余分类数量。"""
+        status_counts = {str(code): 1 for code in range(400, 409)}
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 0,
+                    "failure_count": 9,
+                    "failure_status_codes": status_counts,
+                    "failure_reasons": {f"http_{code}": 1 for code in range(400, 409)},
+                }
+            }
+        }
+
+        markdown = build_stats_summary_markdown(stats_data, [_provider()])
+
+        self.assertIn("其余 2 项 22.2%", markdown)
+        self.assertNotIn("其他", markdown)
+
+    def test_failure_distribution_sorts_large_network_reason_before_tail(self):
+        """大占比网络原因不会因 HTTP 优先展示而被折叠进尾部。"""
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 178,
+                    "failure_count": 738,
+                    "failure_status_codes": {
+                        "500": 265,
+                        "403": 25,
+                        "502": 16,
+                        "503": 1,
+                    },
+                    "failure_reasons": {
+                        "http_5xx": 282,
+                        "http_403": 25,
+                        "network_timeout": 70,
+                        "network_connect": 360,
+                        "network_protocol": 1,
+                    },
+                }
+            }
+        }
+
+        markdown = build_stats_summary_markdown(stats_data, [_provider()])
+
+        self.assertIn("network_connect 39.3%", markdown)
+        self.assertNotIn("其余 2 项 39.4%", markdown)
 
     def test_elapsed_fields_are_displayed(self):
         """有耗时字段时，顶部和站点表展示平均耗时。"""
