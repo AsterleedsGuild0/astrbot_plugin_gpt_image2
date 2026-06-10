@@ -385,15 +385,17 @@ def build_stats_summary_markdown(
             if not isinstance(billing_item, dict):
                 billing_item = {}
             currency = str(billing_item.get("currency") or "")
-            balance_unit = str(billing_item.get("balance_unit") or "")
             balance = _format_money(
-                billing_item.get("last_balance_after"), balance_unit
-            )
-            converted = _format_money(
                 billing_item.get("last_converted_balance"), currency
             )
-            if balance != "-" and converted != "-" and converted != balance:
-                balance = f"{balance}（约 {converted}）"
+            raw_balance = _format_money(billing_item.get("last_balance_after"), "")
+            if balance == "-" and raw_balance != "-":
+                balance = f"余额数值 {raw_balance}"
+            if (
+                balance != "-"
+                and billing_item.get("balance_source") == "manual_anchor_estimate"
+            ):
+                balance = f"{balance}（手动锚点估算）"
             total_cost = _format_money(billing_item.get("total_cost"), currency)
             period_costs = billing_period_costs.get(pid, {})
             has_billing = bool(billing_item)
@@ -621,7 +623,7 @@ def build_diag_zip(
     config: dict,
     failures_path: Path,
     plugin_name: str = "astrbot_plugin_gpt_image2",
-    plugin_version: str = "0.4.11",
+    plugin_version: str = "0.5.0",
     generated_at: str | None = None,
 ) -> Path:
     """构建诊断 zip 包。

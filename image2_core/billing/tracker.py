@@ -29,7 +29,6 @@ class BillingObservation:
     cost: float | None = None
     cost_units: int = 1
     currency: str = "CNY"
-    balance_unit: str = "CNY"
     raw_balance_before: float | None = None
     raw_balance_after: float | None = None
     balance_before: float | None = None
@@ -99,7 +98,9 @@ class BillingTracker:
             raw = await self._fetch_balance(provider, billing)
             normalized = raw * billing.scale if raw is not None else None
             converted = (
-                normalized * billing.cost_multiplier if normalized is not None else None
+                normalized * billing.balance_multiplier
+                if normalized is not None
+                else None
             )
             obs = BillingObservation(
                 provider_id=str(provider.provider_id),
@@ -108,7 +109,6 @@ class BillingTracker:
                 success=raw is not None,
                 cost=None,
                 currency=billing.currency,
-                balance_unit=billing.balance_unit,
                 raw_balance_after=raw,
                 balance_after=normalized,
                 converted_balance_after=converted,
@@ -216,12 +216,12 @@ class BillingTracker:
         balance_before = raw_before * billing.scale if raw_before is not None else None
         balance_after = raw_after * billing.scale if raw_after is not None else None
         converted_before = (
-            balance_before * billing.cost_multiplier
+            balance_before * billing.balance_multiplier
             if balance_before is not None
             else None
         )
         converted_after = (
-            balance_after * billing.cost_multiplier
+            balance_after * billing.balance_multiplier
             if balance_after is not None
             else None
         )
@@ -230,7 +230,7 @@ class BillingTracker:
         if balance_before is not None and balance_after is not None:
             delta = balance_before - balance_after
             if delta >= 0:
-                cost = delta * billing.cost_multiplier
+                cost = delta * billing.balance_multiplier
                 cost_source = "balance_delta"
         if cost is None and billing.has_fixed_fallback:
             cost = self._fixed_cost(billing, success=success, cost_units=cost_units)
@@ -243,7 +243,6 @@ class BillingTracker:
             cost=cost,
             cost_units=max(1, int(cost_units or 1)) if success else 1,
             currency=billing.currency,
-            balance_unit=billing.balance_unit,
             raw_balance_before=raw_before,
             raw_balance_after=raw_after,
             balance_before=balance_before,
@@ -271,7 +270,6 @@ class BillingTracker:
             cost=self._fixed_cost(billing, success=success, cost_units=cost_units),
             cost_units=max(1, int(cost_units or 1)) if success else 1,
             currency=billing.currency,
-            balance_unit=billing.currency,
             cost_source="fixed",
             error=error,
         )
@@ -424,7 +422,6 @@ class BillingTracker:
                 "role": str(provider.role),
                 "billing_type": billing.type,
                 "currency": billing.currency,
-                "balance_unit": billing.balance_unit,
                 "last_raw_balance_after": raw,
                 "last_balance_after": normalized,
                 "last_converted_balance": converted,
@@ -460,7 +457,6 @@ class BillingTracker:
                 "cost": obs.cost,
                 "cost_units": obs.cost_units,
                 "currency": obs.currency,
-                "balance_unit": obs.balance_unit,
                 "raw_balance_before": obs.raw_balance_before,
                 "raw_balance_after": obs.raw_balance_after,
                 "balance_before": obs.balance_before,

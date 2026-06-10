@@ -6,6 +6,21 @@
 
 ---
 
+## v0.5.0 - 2026-06-10
+
+### v0.5.0 Added
+
+- 新增手动余额锚点估算：无法实时查询余额的站点可通过 `/image2 balance set <Provider> <amount>` 校准估算余额，单位、展示货币和换算倍率默认读取 Provider 的 `billing` 配置。
+- `/image2 balance`、`/image2 providers`、`/image2 stats` 对手动锚点余额明确标注“手动锚点估算”。
+- 固定参考成本事件会推动手动锚点余额递减，适用于 API key 无法访问控制台余额的站点。
+
+### v0.5.0 Changed
+
+- `/image2 stats` 的失败分布按数量降序展示，并将压缩尾部从“其他”改为“其余 N 项”。
+- 升级版本至 0.5.0。
+
+---
+
 ## v0.4.11 - 2026-06-09
 
 ### v0.4.11 Changed
@@ -46,7 +61,7 @@
 ### v0.4.8 Added
 
 - 新增 Provider 绑定费用观测配置：主站使用 `primary_billing_json`，备用站可在 `fallback_api_providers` JSON 数组元素中内嵌 `billing`。
-- 新增 `balance`、`total_usage` 与 `fixed` 费用记录类型，支持余额单位 `scale` 和展示/统计币种 `cost_multiplier` 换算。
+- 新增 `balance`、`total_usage` 与 `fixed` 费用记录类型，支持余额数值 `scale` 和展示/统计币种 `balance_multiplier` 换算。
 - 新增 `/image2 costs`、`/image2 costs recent [N]`、`/image2 balance` 管理员命令。
 - `/image2 providers` 现在展示轻量计费状态与缓存余额/累计开销，不触发实时余额查询。
 - 新增 Provider 级 `force_single_image_requests`，可将 `n > 1` 拆成多次 `n=1` 请求，规避站点原生 `n` 扣费和返回数量不一致。

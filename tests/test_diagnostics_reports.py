@@ -237,8 +237,8 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
             "providers": {
                 "pid-a": {
                     "currency": "CNY",
-                    "balance_unit": "CNY",
                     "last_balance_after": 39.9,
+                    "last_converted_balance": 39.9,
                     "total_cost": 1.2,
                     "last_cost": 0.1,
                 }

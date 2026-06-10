@@ -53,12 +53,16 @@ def build_costs_summary_markdown(stats: dict) -> str:
             continue
         name = item.get("provider_name") or item.get("name") or "-"
         currency = str(item.get("currency") or "")
-        balance_unit = str(item.get("balance_unit") or "")
         balance = item.get("last_balance_after")
         converted = item.get("last_converted_balance")
-        balance_text = format_money(balance, balance_unit)
         if converted is not None:
-            balance_text += f"（约 {format_money(converted, currency)}）"
+            balance_text = f"约 {format_money(converted, currency)}"
+        elif balance is not None:
+            balance_text = f"余额数值 {format_money(balance)}"
+        else:
+            balance_text = "-"
+        if item.get("balance_source") == "manual_anchor_estimate":
+            balance_text += "（手动锚点估算）"
         lines.append(
             f"| {name} | {item.get('billing_type', '-')} | "
             f"{format_money(item.get('total_cost'), currency)} | "
@@ -107,8 +111,16 @@ def build_balance_markdown(observations: list[BillingObservation]) -> str:
             raw_text = format_money(obs.raw_balance_after, "raw")
         else:
             raw_text = "-"
+        source_text = (
+            "，手动锚点估算" if obs.cost_source == "manual_anchor_estimate" else ""
+        )
+        balance_text = (
+            f"约 {format_money(converted, obs.currency)}"
+            if converted is not None
+            else "-"
+        )
         lines.append(
-            f"- **{obs.provider_name}**：{format_money(obs.balance_after, obs.balance_unit)}"
-            f"（约 {format_money(converted, obs.currency)}，原始值 {raw_text}）\n"
+            f"- **{obs.provider_name}**：{balance_text}"
+            f"（余额数值 {format_money(obs.balance_after)}，原始值 {raw_text}{source_text}）\n"
         )
     return "".join(lines)

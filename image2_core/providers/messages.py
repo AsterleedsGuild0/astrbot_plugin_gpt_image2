@@ -67,21 +67,35 @@ def build_providers_status_markdown(
         return "强制单图上游请求" if p.force_single_image_requests else "允许原生 n"
 
     def _billing_str(p: ImageAPIProviderConfig) -> str:
-        if p.billing is None:
-            return "未配置"
-        billing_type = p.billing.type
         stats_root = billing_stats if isinstance(billing_stats, dict) else {}
         providers = (
             stats_root.get("providers", {}) if isinstance(stats_root, dict) else {}
         )
         item = providers.get(p.provider_id, {}) if isinstance(providers, dict) else {}
         item = item if isinstance(item, dict) else {}
+        manual_balance_text = ""
+        if item.get("balance_source") == "manual_anchor_estimate":
+            currency = str(item.get("currency") or "")
+            converted = item.get("last_converted_balance")
+            if converted is not None:
+                manual_balance_text = f"约 {_format_money(converted, currency)}"
+            else:
+                manual_balance_text = (
+                    f"余额数值 {_format_money(item.get('last_balance_after'))}"
+                )
+            manual_balance_text += "（手动锚点估算）"
+        if p.billing is None:
+            if manual_balance_text:
+                return manual_balance_text
+            return "未配置"
+        billing_type = p.billing.type
         if billing_type == "fixed":
-            return (
+            text = (
                 "fixed"
                 f"（成功单张 {_format_money(p.billing.success_cost, p.billing.currency)}"
                 f" / 失败单次 {_format_money(p.billing.failure_cost, p.billing.currency)}）"
             )
+            return f"{text}，{manual_balance_text}" if manual_balance_text else text
         if billing_type == "total_usage":
             parts = ["total_usage"]
         else:
@@ -94,7 +108,10 @@ def build_providers_status_markdown(
             )
         balance = item.get("last_balance_after")
         if balance is not None:
-            parts.append(_format_money(balance, p.billing.balance_unit))
+            balance_text = f"余额数值 {_format_money(balance)}"
+            if item.get("balance_source") == "manual_anchor_estimate":
+                balance_text += "（手动锚点估算）"
+            parts.append(balance_text)
         converted = item.get("last_converted_balance")
         if converted is not None:
             parts.append(f"约 {_format_money(converted, p.billing.currency)}")

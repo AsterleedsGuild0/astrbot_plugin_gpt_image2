@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock
 
@@ -19,6 +21,7 @@ from image2_core.billing.messages import (  # noqa: E402
     build_balance_markdown,
     build_costs_summary_markdown,
 )
+from image2_core.billing.records import BillingRecords  # noqa: E402
 from image2_core.billing.tracker import BillingObservation, BillingTracker  # noqa: E402
 from image2_core.providers.manager import (  # noqa: E402
     ProviderManager,
@@ -37,8 +40,8 @@ class TestBillingConfig(unittest.TestCase):
                 "base_url": "https://primary.example/v1",
                 "primary_billing_json": (
                     '{"balance_url":"https://primary.example/balance",'
-                    '"balance_json_path":"data.balance","balance_unit":"USD",'
-                    '"currency":"CNY","scale":0.01,"cost_multiplier":7.2,'
+                    '"balance_json_path":"data.balance",'
+                    '"currency":"CNY","scale":0.01,"balance_multiplier":7.2,'
                     '"success_cost":0.03,"failure_cost":0.001}'
                 ),
             },
@@ -52,7 +55,7 @@ class TestBillingConfig(unittest.TestCase):
         self.assertEqual(provider.billing.type, "balance")
         self.assertEqual(provider.billing.balance_json_path, "data.balance")
         self.assertEqual(provider.billing.scale, 0.01)
-        self.assertEqual(provider.billing.cost_multiplier, 7.2)
+        self.assertEqual(provider.billing.balance_multiplier, 7.2)
         self.assertTrue(provider.billing.has_fixed_fallback)
         self.assertEqual(provider.billing.success_cost, 0.03)
 
@@ -235,7 +238,7 @@ class TestBillingConfig(unittest.TestCase):
 
         self.assertIsNotNone(billing)
         self.assertEqual(billing.currency, "CNY")
-        self.assertEqual(billing.balance_unit, "CNY")
+        self.assertEqual(billing.balance_multiplier, 1.0)
 
     def test_balance_config_supports_nested_fixed_fallback(self):
         billing = parse_billing_config(
@@ -426,6 +429,52 @@ class TestBillingTracker(unittest.TestCase):
         self.assertEqual(billing.balance_url, "https://example.com/api/balance")
 
 
+class TestBillingRecordsManualAnchor(unittest.TestCase):
+    """验证手动余额锚点估算。"""
+
+    def test_manual_anchor_updates_estimated_balance_after_fixed_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            records = BillingRecords("test-plugin")
+            stats_path = Path(tmp) / "billing_stats.json"
+            records.billing_stats_path = lambda: stats_path  # type: ignore[method-assign]
+            records.billing_events_jsonl_path = lambda: (
+                Path(  # type: ignore[method-assign]
+                    tmp
+                )
+                / "billing_events.jsonl"
+            )
+
+            records.set_balance_anchor(
+                provider_id="pid",
+                provider_name="LTCraftAI",
+                base_url="https://ai.ltcraft.cn/v1",
+                role="normal",
+                amount=78.09,
+                currency="CNY",
+                balance_multiplier=1,
+            )
+            records.record_event(
+                {
+                    "provider_id": "pid",
+                    "provider_name": "LTCraftAI",
+                    "base_url": "https://ai.ltcraft.cn/v1",
+                    "role": "normal",
+                    "billing_type": "fixed",
+                    "success": True,
+                    "cost": 0.73,
+                    "cost_units": 1,
+                    "currency": "CNY",
+                    "cost_source": "fixed",
+                }
+            )
+
+            item = records.load_billing_stats()["providers"]["pid"]
+            self.assertTrue(item["manual_balance_anchor"])
+            self.assertEqual(item["balance_source"], "manual_anchor_estimate")
+            self.assertAlmostEqual(item["last_balance_after"], 77.36)
+            self.assertAlmostEqual(item["last_converted_balance"], 77.36)
+
+
 class TestBillingMessages(unittest.TestCase):
     """验证费用与余额展示。"""
 
@@ -442,7 +491,6 @@ class TestBillingMessages(unittest.TestCase):
                         "provider_name": "backup",
                         "billing_type": "balance",
                         "currency": "USD",
-                        "balance_unit": "POINT",
                         "total_cost": 0.06,
                         "event_count": 3,
                         "last_balance_after": 9.94,
@@ -453,7 +501,6 @@ class TestBillingMessages(unittest.TestCase):
         )
 
         self.assertIn("0.06 USD", markdown)
-        self.assertIn("9.94 POINT", markdown)
         self.assertIn("约 0.994 USD", markdown)
 
     def test_balance_markdown_shows_station_and_converted_balance(self):
@@ -465,7 +512,6 @@ class TestBillingMessages(unittest.TestCase):
                     billing_type="balance",
                     success=True,
                     currency="CNY",
-                    balance_unit="USD",
                     raw_balance_after=1200,
                     balance_after=12,
                     converted_balance_after=86.4,
@@ -473,9 +519,28 @@ class TestBillingMessages(unittest.TestCase):
             ]
         )
 
-        self.assertIn("12 USD", markdown)
         self.assertIn("约 86.4 CNY", markdown)
+        self.assertIn("余额数值 12", markdown)
         self.assertIn("原始值 1200 raw", markdown)
+
+    def test_balance_markdown_marks_manual_anchor_estimate(self):
+        markdown = build_balance_markdown(
+            [
+                BillingObservation(
+                    provider_id="pid",
+                    provider_name="LTCraftAI",
+                    billing_type="manual_anchor",
+                    success=True,
+                    currency="CNY",
+                    balance_after=78.09,
+                    converted_balance_after=78.09,
+                    cost_source="manual_anchor_estimate",
+                )
+            ]
+        )
+
+        self.assertIn("78.09 CNY", markdown)
+        self.assertIn("手动锚点估算", markdown)
 
     def test_providers_status_includes_lightweight_billing(self):
         manager = ProviderManager(
@@ -521,6 +586,36 @@ class TestBillingMessages(unittest.TestCase):
 
         self.assertIn("计费：balance", markdown)
         self.assertIn("固定参考 成功单张 0.03 USD / 失败单次 0.001 USD", markdown)
+
+    def test_providers_status_marks_manual_anchor_estimate(self):
+        manager = ProviderManager(
+            {
+                "api_key": "sk-test",
+                "primary_billing_json": '{"success_cost":0.03,"currency":"USD"}',
+            },
+            "test-plugin",
+        )
+        provider = manager.get_image_api_provider_configs()[0]
+
+        markdown = build_providers_status_markdown(
+            [provider],
+            {},
+            global_mode="images",
+            now=0,
+            billing_stats={
+                "providers": {
+                    provider.provider_id: {
+                        "balance_source": "manual_anchor_estimate",
+                        "last_balance_after": 78.09,
+                        "last_converted_balance": 78.09,
+                        "currency": "CNY",
+                    }
+                }
+            },
+        )
+
+        self.assertIn("78.09 CNY", markdown)
+        self.assertIn("手动锚点估算", markdown)
 
 
 if __name__ == "__main__":

@@ -81,10 +81,9 @@
       "usage_url": "https://www.micuapi.ai/dashboard/billing/usage",
       "usage_json_path": "total_usage",
       "usage_scale": 0.01,
-      "balance_unit": "CNY",
       "currency": "CNY",
       "scale": 1,
-      "cost_multiplier": 1,
+      "balance_multiplier": 1,
       "success_cost": 0.2,
       "failure_cost": 0
     }
@@ -103,6 +102,8 @@
   }
 }
 ```
+
+固定参考成本可以配合手动余额锚点使用，例如 `/image2 balance set LTCraftAI 78.09`。这类余额会标注为“手动锚点估算”，不是站点实时余额；展示单位和余额换算倍率从对应 Provider 的 `billing` 配置读取。`balance_multiplier` 表示 1 个站点余额数值折算成多少展示单位，不一定是真实世界汇率，也可能是站长自定义充值倍率。
 
 支持字段：
 

@@ -192,7 +192,7 @@ class PlanSessionFilter(SessionFilter):
     "gpt_image2",
     "233",
     "通过 OpenAI 兼容 API 调用 GPT Image2 完成图片生成与编辑",
-    "0.4.11",
+    "0.5.0",
 )
 class GPTImage2Plugin(Star):
     PLAN_WAITER_TIMEOUT_GRACE = 10
@@ -2616,8 +2616,103 @@ class GPTImage2Plugin(Star):
 
     @image2.command("balance")
     @filter.permission_type(filter.PermissionType.ADMIN)
-    async def balance(self, event: AstrMessageEvent):
+    async def balance(
+        self,
+        event: AstrMessageEvent,
+        sub: str | None = None,
+        provider_arg: str | None = None,
+        amount_arg: str | None = None,
+        unit_arg: str | None = None,
+        currency_arg: str | None = None,
+        multiplier_arg: str | None = None,
+    ):
         """实时查询已配置站点余额（管理员）"""
+        sub_str = (sub or "").strip().lower()
+        if sub_str == "set":
+            try:
+                configs = self._provider_manager.get_image_api_provider_configs()
+            except ValueError as e:
+                yield await self._text_result(
+                    event,
+                    f"## ⚠️ 无法获取站点配置\n\n{str(e)}",
+                    action="balance-set-config-error",
+                )
+                return
+            provider_key = str(provider_arg or "").strip()
+            if not provider_key or amount_arg is None:
+                yield await self._text_result(
+                    event,
+                    "## ⚠️ 参数不足\n\n"
+                    "用法：`/image2 balance set <Provider> <amount>`\n\n"
+                    "示例：`/image2 balance set LTCraftAI 78.09`\n\n"
+                    "单位、展示货币和换算倍率默认读取该站点的 `billing` 配置。",
+                    action="balance-set-usage",
+                )
+                return
+            provider = next(
+                (
+                    p
+                    for p in configs
+                    if provider_key.lower()
+                    in {p.name.lower(), p.provider_id.lower(), p.role.lower()}
+                ),
+                None,
+            )
+            if provider is None:
+                names = "、".join(p.name for p in configs) or "-"
+                yield await self._text_result(
+                    event,
+                    f"## ⚠️ 未找到站点\n\n未找到 `{provider_key}`。可用站点：{names}",
+                    action="balance-set-provider-not-found",
+                )
+                return
+            try:
+                amount = float(str(amount_arg).strip())
+            except (TypeError, ValueError):
+                yield await self._text_result(
+                    event,
+                    f"## ⚠️ 余额数值无效\n\n`{amount_arg}` 不是有效数字。",
+                    action="balance-set-invalid-amount",
+                )
+                return
+            billing = provider.billing
+            currency = str(
+                currency_arg or (billing.currency if billing else "CNY") or "CNY"
+            ).strip()
+            default_multiplier = billing.balance_multiplier if billing else 1.0
+            try:
+                multiplier = (
+                    float(str(multiplier_arg).strip())
+                    if multiplier_arg is not None
+                    else float(default_multiplier or 1.0)
+                )
+            except (TypeError, ValueError):
+                multiplier = float(default_multiplier or 1.0)
+            item = self._billing_records.set_balance_anchor(
+                provider_id=provider.provider_id,
+                provider_name=provider.name,
+                base_url=provider.base_url,
+                role=provider.role,
+                amount=amount,
+                currency=currency,
+                balance_multiplier=multiplier,
+            )
+            converted = item.get("last_converted_balance")
+            converted_text = (
+                format_money(converted, currency) if converted is not None else "-"
+            )
+            yield await self._text_result(
+                event,
+                "## ✅ 已设置手动余额锚点\n\n"
+                f"- 站点：**{provider.name}**\n"
+                f"- 站点余额数值：**{format_money(amount)}**\n"
+                f"- 估算余额：**约 {converted_text}**\n"
+                "- 来源：手动锚点估算\n\n"
+                "后续估算余额会按锚点之后记录的固定成本递减。",
+                action="balance-set-success",
+            )
+            return
+
         started = perf_counter()
         logger.info(f"[GPTImage2] balance query start {self._event_context(event)}")
         await self._send_slow_command_ack(
@@ -2644,6 +2739,34 @@ class GPTImage2Plugin(Star):
             for provider in configs
             if provider.billing is not None and provider.billing.uses_balance
         ]
+        query_target_ids = {
+            provider.provider_id for provider, _billing in query_targets
+        }
+        billing_stats = self._billing_records.load_billing_stats()
+        billing_provider_stats = billing_stats.get("providers", {})
+        if not isinstance(billing_provider_stats, dict):
+            billing_provider_stats = {}
+        manual_observations: list[BillingObservation] = []
+        for provider in configs:
+            if provider.provider_id in query_target_ids:
+                continue
+            item = billing_provider_stats.get(provider.provider_id, {})
+            if not isinstance(item, dict):
+                continue
+            if item.get("balance_source") != "manual_anchor_estimate":
+                continue
+            manual_observations.append(
+                BillingObservation(
+                    provider_id=provider.provider_id,
+                    provider_name=provider.name,
+                    billing_type=str(item.get("billing_type") or "manual_anchor"),
+                    success=True,
+                    currency=str(item.get("currency") or "CNY"),
+                    balance_after=item.get("last_balance_after"),
+                    converted_balance_after=item.get("last_converted_balance"),
+                    cost_source="manual_anchor_estimate",
+                )
+            )
         logger.info(
             "[GPTImage2] balance query targets "
             f"{self._event_context(event)} count={len(query_targets)} "
@@ -2668,9 +2791,10 @@ class GPTImage2Plugin(Star):
             )
             return obs
 
-        observations = await asyncio.gather(
+        realtime_observations = await asyncio.gather(
             *(_query_one(provider, billing) for provider, billing in query_targets)
         )
+        observations = [*realtime_observations, *manual_observations]
 
         elapsed_ms = self._elapsed_ms(started)
         success_count = sum(1 for obs in observations if obs.success)
@@ -2755,7 +2879,7 @@ class GPTImage2Plugin(Star):
                 config=self.config,
                 failures_path=failures_path,
                 plugin_name=plugin_name,
-                plugin_version="0.4.11",
+                plugin_version="0.5.0",
                 generated_at=timestamp,
             )
         except Exception as e:

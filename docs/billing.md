@@ -25,9 +25,19 @@
 
 ---
 
-## 配置放在哪里
+## 配置作用域
 
-主站写在 `primary_billing_json`：
+费用配置按生图站点分别生效。主站、备用站和权威兜底站点的配置位置不同，但 `billing` 内部字段含义一致。
+
+| 站点类型 | 配置位置 | 说明 |
+| --- | --- | --- |
+| 主站 | `primary_billing_json` | 对主站生图请求生效 |
+| 备用站 | `fallback_api_providers` 数组元素的 `billing` 字段 | 每个备用站单独配置，按对应 Provider 生效 |
+| 权威兜底站点 | `authoritative_fallback_billing_json` | 对权威兜底站点生效 |
+
+### 主站配置
+
+主站只填写 `billing` 对象本身，不需要再包一层 `billing`：
 
 ```json
 {
@@ -37,7 +47,9 @@
 }
 ```
 
-备用站写在 `fallback_api_providers` JSON 数组元素的 `billing` 字段里：
+### 备用站配置
+
+备用站必须写在对应 `fallback_api_providers` 元素的 `billing` 字段里。不要把备用站费用配置写到 `primary_billing_json`，否则只会影响主站。
 
 ```json
 [
@@ -55,7 +67,30 @@
 ]
 ```
 
-权威兜底站点写在 `authoritative_fallback_billing_json`。
+### 权威兜底站点配置
+
+权威兜底站点同样只填写 `billing` 对象本身：
+
+```json
+{
+  "currency": "CNY",
+  "success_cost": 0.2,
+  "failure_cost": 0
+}
+```
+
+---
+
+## 已验证站点场景
+
+目前文档中的两类推荐配置都有真实站点数据支撑：
+
+| 站点 | 已验证结论 | 推荐配置 |
+| --- | --- | --- |
+| MICU | `/dashboard/billing/subscription` 返回总额度，`/dashboard/billing/usage` 返回已用量，需要用“总额 - 用量 = 余额” | `total_url` + `usage_url`，并可配固定参考成本兜底 |
+| LTCraft | `sk-` API key 可访问 OpenAI 兼容接口，但不能访问控制台余额接口；控制台虽然显示 USD，但余额数值当前可按 CNY 1:1 估算 | 固定参考成本 + `/image2 balance set` 手动余额锚点估算 |
+
+这些结论只代表已实测站点。其它 NewAPI、One API 或二次封装站点可能改过接口、字段和单位，需要按本文的 REST Client 模板逐站验证。
 
 ---
 
@@ -77,6 +112,72 @@
 - 生图成功按 `success_cost × 实际返回图片数` 记录费用。
 - 如果无法取得实际返回图片数，则退回配置里的 `n`。
 - 失败尝试按 `failure_cost` 记录费用，不乘以 `n`。
+
+---
+
+## LTCraft 固定费用余额估算
+
+LTCraft（`https://ai.ltcraft.cn`）当前实测情况：
+
+- 首页是 NewAPI 风格前端。
+- `sk-` API key 可访问 OpenAI 兼容接口，例如 `/v1/models`。
+- `sk-` API key 不能访问 `/api/user/self`、`/api/user/amount`、`/api/user/topup/self`、`/api/user/topup/info`、`/api/token/` 等控制台接口，这些接口返回未授权。
+- `/dashboard/billing/subscription` 和 `/dashboard/billing/usage` 的 OpenAI 兼容账单口径与控制台真实余额不一致，不能当作 LTCraft 真实余额。
+- LTCraft 控制台界面可能显示 `USD`，但实测余额数值与人民币按 1:1 对应；很多中转站也会出现“界面显示一种单位，实际充值/扣费按站长自定义倍率换算”的情况。
+
+因此 LTCraft 推荐使用“固定参考成本 + 手动余额锚点”。不建议为了实时余额在插件中长期保存 Web 登录 Cookie/JWT。
+
+先配置固定参考成本，例如：
+
+```json
+{
+  "currency": "CNY",
+  "balance_multiplier": 1,
+  "success_cost": 0.2,
+  "failure_cost": 0
+}
+```
+
+然后由管理员手动设置余额锚点：
+
+```text
+/image2 balance set LTCraftAI <控制台余额>
+```
+
+展示货币和换算倍率会从 LTCraft 的 `billing` 配置读取。即使控制台把余额标成 `USD`，也不要机械按美元汇率换算；当前 LTCraft 实测可以把 1 个余额数值按 1 CNY 估算，所以示例使用 `currency: CNY` 和 `balance_multiplier: 1`。
+
+后续估算余额按以下方式更新：
+
+```text
+估算余额 = 手动锚点余额 - 锚点之后插件记录的固定成本
+```
+
+展示中会明确标注“手动锚点估算”。该数值不是站点实时余额；充值、站外消耗或后台调整后，应再次执行 `balance set` 校准。
+
+如果 LTCraft 配在备用站，在对应 `fallback_api_providers` 元素中写：
+
+```json
+{
+  "name": "LTCraftAI",
+  "base_url": "https://ai.ltcraft.cn/v1",
+  "api_key": "sk-xxx",
+  "capabilities": "images",
+  "billing": {
+    "currency": "CNY",
+    "balance_multiplier": 1,
+    "success_cost": 0.2,
+    "failure_cost": 0
+  }
+}
+```
+
+部署后先执行一次手动校准：
+
+```text
+/image2 balance set LTCraftAI <控制台余额>
+```
+
+后续每次固定参考成本事件都会从该锚点余额中扣减。
 
 ---
 
@@ -102,10 +203,9 @@
   "method": "GET",
   "auth": "bearer",
   "balance_json_path": "data.balance",
-  "balance_unit": "USD",
   "currency": "USD",
   "scale": 0.01,
-  "cost_multiplier": 1,
+  "balance_multiplier": 1,
   "success_cost": 0.03,
   "failure_cost": 0
 }
@@ -128,7 +228,7 @@ MICU（`https://www.micuapi.ai`）当前实测情况：
 - 可用余额需要用“总额度 - 已用量”计算。
 - 实测存在原生 `n=2` 只返回 1 张但按站点余额差扣 2 张费用的情况；使用 MICU 且需要多图时，建议给该 Provider 开启 `force_single_image_requests`。该开关只表示“每次上游请求使用 `n=1`”，不会把整次任务限制为 1 张；全局 `n=2` 时仍可能通过两次 `n=1` 请求得到 2 张图。
 
-不要直接把这个模板套到所有 NewAPI 系站点。不同站点可能改过面板接口、字段名或单位，必须先用下面的 REST Client 模板逐站验证返回值语义。
+不要直接把这个模板套到所有 NewAPI 系站点。LTCraft 的实测结果就与 MICU 不同：虽然部分 OpenAI 兼容账单接口可返回数据，但口径与控制台真实余额不一致。不同站点可能改过面板接口、字段名或单位，必须先用下面的 REST Client 模板逐站验证返回值语义。
 
 MICU 示例返回：
 
@@ -159,12 +259,35 @@ MICU 示例返回：
   "usage_url": "https://www.micuapi.ai/dashboard/billing/usage",
   "usage_json_path": "total_usage",
   "usage_scale": 0.01,
-  "balance_unit": "CNY",
   "currency": "CNY",
   "scale": 1,
-  "cost_multiplier": 1,
+  "balance_multiplier": 1,
   "success_cost": 0.2,
   "failure_cost": 0
+}
+```
+
+如果 MICU 配在备用站，在对应 `fallback_api_providers` 元素中写：
+
+```json
+{
+  "name": "Micu",
+  "base_url": "https://api-slb.micuapi.ai/v1",
+  "api_key": "sk-xxx",
+  "capabilities": "images",
+  "force_single_image_requests": true,
+  "billing": {
+    "total_url": "https://www.micuapi.ai/dashboard/billing/subscription",
+    "total_json_path": "soft_limit_usd",
+    "usage_url": "https://www.micuapi.ai/dashboard/billing/usage",
+    "usage_json_path": "total_usage",
+    "usage_scale": 0.01,
+    "currency": "CNY",
+    "scale": 1,
+    "balance_multiplier": 1,
+    "success_cost": 0.2,
+    "failure_cost": 0
+  }
 }
 ```
 
@@ -176,41 +299,72 @@ MICU 示例返回：
 }
 ```
 
-如果 MICU 配在备用站，在对应 `fallback_api_providers` 元素中写：
-
-```json
-{
-  "name": "Micu",
-  "base_url": "https://api-slb.micuapi.ai/v1",
-  "force_single_image_requests": true
-}
-```
+如果 MICU 配在备用站，则在对应 `fallback_api_providers` 元素中开启 `force_single_image_requests`，上面的备用站示例已包含该字段。
 
 ---
 
 ## 字段说明
 
+这一节按“用户要表达什么”来解释字段。英文键名只是配置文件里的名字，实际含义以中文说明为准。
+
+### 基础字段
+
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `balance_url` | - | 直接余额接口 URL，只能表示剩余余额 |
-| `method` | `GET` | `balance_url` 请求方法：`GET` 或 `POST` |
-| `auth` | `bearer` | 鉴权方式：`bearer` 或 `x-api-key` |
-| `api_key` | - | 可选；余额接口使用独立 Key 时填写，省略时复用 Provider API Key |
-| `balance_json_path` | `balance` | 从余额接口 JSON 中取数的点路径 |
-| `total_url` | - | 总额度、总充值额或订阅上限接口 URL |
-| `total_method` | 同 `method` | `total_url` 请求方法 |
-| `total_json_path` | `total` | 从总额接口 JSON 中取数的点路径 |
-| `usage_url` | - | 已用量接口 URL |
-| `usage_method` | 同 `method` | `usage_url` 请求方法 |
-| `usage_json_path` | `total_usage` | 从已用量接口 JSON 中取数的点路径 |
-| `usage_scale` | `1` | 已用量换算倍率 |
-| `balance_unit` | `CNY` | 站点余额单位 |
-| `currency` | 同 `balance_unit` | 最终展示/统计货币 |
-| `scale` | `1` | 余额或总额原始值换算倍率 |
-| `cost_multiplier` | `1` | 站点余额单位到展示货币的换算倍率 |
-| `timeout` | `8` | 余额接口超时时间，单位秒 |
-| `success_cost` | `0` | 固定参考单张成功成本；成功时按实际返回图片数相乘 |
-| `failure_cost` | `0` | 固定参考单次失败成本；失败时不乘以图片数 |
+| `currency` | `CNY` | 插件最终展示、汇总和统计费用时使用的目标单位。通常为了看成本会填 `CNY`。 |
+| `balance_multiplier` | `1` | 1 个站点余额数值折算成多少 `currency`。它不是固定汇率字段，也可以表示站长自定义充值比例。例如 1 个余额数值约等于 0.5 CNY，就填 `0.5`；LTCraft 当前按 1:1 估算，所以填 `1`。 |
+| `success_cost` | `0` | 固定参考单张成功成本。成功时按实际返回图片数相乘，例如 `0.2` 表示每张成功图按 0.2 CNY 记账。 |
+| `failure_cost` | `0` | 固定参考单次失败成本。失败时不乘以图片数，通常可填 `0`。 |
+| `timeout` | `8` | 查询余额接口的超时时间，单位秒。 |
+
+### 直接余额接口字段
+
+如果接口直接返回“剩余余额”，使用这一组。
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `balance_url` | - | 直接余额接口 URL。只能填真正返回“剩余余额”的接口，不要填总充值额、订阅上限或套餐额度接口。 |
+| `method` | `GET` | 请求 `balance_url` 使用的方法，通常是 `GET`。 |
+| `auth` | `bearer` | 鉴权方式。`bearer` 表示请求头使用 `Authorization: Bearer <key>`；`x-api-key` 表示请求头使用 `x-api-key: <key>`。 |
+| `api_key` | - | 可选。余额接口需要和生图接口不同的 Key 时填写；不填时复用该 Provider 的生图 API Key。 |
+| `balance_json_path` | `balance` | 从接口返回 JSON 里取余额数字的位置，例如 `data.balance`。 |
+| `scale` | `1` | 余额原始数字的缩放倍率。如果接口返回 `1234` 代表 `12.34`，填 `0.01`。 |
+
+### 总额减用量字段
+
+如果站点没有直接余额接口，但有“总额度”和“已用量”两个接口，使用这一组。余额计算公式是：
+
+```text
+余额 = 总额度 × scale - 已用量 × usage_scale
+```
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `total_url` | - | 总额度、总充值额或订阅上限接口 URL。MICU 实测使用这个接口。 |
+| `total_method` | 同 `method` | 请求 `total_url` 使用的方法，通常不需要单独填写。 |
+| `total_json_path` | `total` | 从总额接口返回 JSON 里取总额数字的位置。MICU 是 `soft_limit_usd`。 |
+| `usage_url` | - | 已用量接口 URL。MICU 实测使用这个接口。 |
+| `usage_method` | 同 `method` | 请求 `usage_url` 使用的方法，通常不需要单独填写。 |
+| `usage_json_path` | `total_usage` | 从用量接口返回 JSON 里取已用量数字的位置。MICU 是 `total_usage`。 |
+| `usage_scale` | `1` | 已用量原始数字的缩放倍率。MICU 的 `total_usage` 需要乘 `0.01`。 |
+| `scale` | `1` | 总额原始数字的缩放倍率。MICU 的 `soft_limit_usd` 当前按 `1` 处理。 |
+
+### 容易混淆的字段
+
+| 配置目标 | 应该改哪个字段 | 例子 |
+| --- | --- | --- |
+| 插件最终用什么货币展示 | `currency` | 想全部按人民币汇总，填 `CNY` |
+| 站点余额数值到展示单位怎么换算 | `balance_multiplier` | 1 个余额数值约等于 0.5 CNY，就填 `0.5`；1:1 就填 `1` |
+| 接口返回整数但实际有小数 | `scale` 或 `usage_scale` | 接口返回 `1234` 表示 `12.34`，填 `0.01` |
+| 没有余额接口，只想估算每张图成本 | `success_cost` / `failure_cost` | LTCraft 可配置成功单张 `0.2`、失败单次 `0` |
+
+常见组合：
+
+- MICU：使用 `total_url` + `usage_url`，按“总额度 - 已用量”算余额。
+- LTCraft：使用 `success_cost` / `failure_cost` + `/image2 balance set <Provider> <amount>`，按固定成本和手动锚点估算余额。
+- 真实美元余额站点：`currency` 填 `CNY`，`balance_multiplier` 填你希望使用的美元到人民币换算倍率。
+- 显示 USD 但余额数值按人民币 1:1 扣减的中转站：`currency` 填 `CNY`，`balance_multiplier` 填 `1`。
+- 站长自定义点数站点：`currency` 填 `CNY`，`balance_multiplier` 填“1 个余额数值约等于多少 CNY”。
 
 数组路径用点号加下标，例如：
 
@@ -223,7 +377,9 @@ balance_infos.0.total_balance
 
 ## REST Client 测试模板
 
-可以在 VSCode 新建 `tmp/billing-test.http`：
+可以在 VSCode 新建 `tmp/billing-test.http`。下面模板用于验证接口口径，不能只看接口是否返回 200，还要和控制台余额对比语义是否一致。
+
+### MICU
 
 ```http
 @api_key = sk-替换成你的-key
@@ -254,6 +410,45 @@ Authorization: Bearer {{api_key}}
 Accept: application/json
 ```
 
+### LTCraft
+
+LTCraft 的关键验证点是：`sk-` API key 能访问 OpenAI 兼容接口，但不能访问控制台余额接口；OpenAI 兼容账单接口返回值也不能当作控制台真实余额。
+
+```http
+@api_key = sk-替换成你的-key
+@site_url = https://ai.ltcraft.cn
+@base_url = {{site_url}}/v1
+
+### 1. OpenAI compatible models should work
+GET {{base_url}}/models
+Authorization: Bearer {{api_key}}
+Accept: application/json
+
+
+### 2. Console user self should not be available with sk key
+GET {{site_url}}/api/user/self
+Authorization: Bearer {{api_key}}
+Accept: application/json
+
+
+### 3. Console user amount should not be available with sk key
+GET {{site_url}}/api/user/amount
+Authorization: Bearer {{api_key}}
+Accept: application/json
+
+
+### 4. OpenAI compatible subscription is not the console balance
+GET {{site_url}}/dashboard/billing/subscription
+Authorization: Bearer {{api_key}}
+Accept: application/json
+
+
+### 5. OpenAI compatible usage is not the console balance
+GET {{site_url}}/dashboard/billing/usage
+Authorization: Bearer {{api_key}}
+Accept: application/json
+```
+
 ---
 
 ## 配置后验证
@@ -268,10 +463,17 @@ Accept: application/json
 /image2 costs recent 5
 ```
 
+如果站点使用 LTCraft 这类手动锚点估算，再执行一次：
+
+```text
+/image2 balance set LTCraftAI <控制台余额>
+```
+
 期望结果：
 
 - `/image2 providers` 能看到固定参考成本。
 - `/image2 balance` 能显示站点余额。
+- 手动锚点站点会显示“手动锚点估算”。
 - `/image2 costs recent 5` 能看到最近费用事件。
 
 ---
@@ -289,6 +491,8 @@ MICU 实测该接口返回总额度。请同时测试 `/dashboard/billing/usage`
 ### `/api/user/self` 能看到正确余额，但插件不建议用
 
 `/api/user/self` 通常需要 Web 登录 Cookie，不适合机器人长期自动查询。优先使用 API Key 可访问的接口。
+
+如果只有网页登录态能看到余额，可以改用固定参考成本，并通过 `/image2 balance set <Provider> <amount>` 手动校准估算余额。单位、展示货币和换算倍率会从该 Provider 的 `billing` 配置读取。
 
 ### `/image2 balance` 查询失败，但生图正常
 

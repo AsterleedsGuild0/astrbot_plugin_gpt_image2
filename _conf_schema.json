@@ -41,7 +41,7 @@
     "editor_language": "json",
     "editor_theme": "vs-dark",
     "default": "{}",
-    "hint": "可选。绑定主站点 api_key/base_url 的费用观测配置。balance_url 严格表示直接余额接口；total_url + usage_url 表示总额减已用量接口组，最终余额 = total_value*scale - usage_value*usage_scale。success_cost 是固定参考单张成功成本，成功时按实际返回图片数相乘；failure_cost 是固定参考单次失败成本，不乘以图片数。二者也可作为余额查询失败时的兜底，并会在 /image2 providers 中展示。MICU（https://www.micuapi.ai）实测示例：{\"total_url\":\"https://www.micuapi.ai/dashboard/billing/subscription\",\"total_json_path\":\"soft_limit_usd\",\"usage_url\":\"https://www.micuapi.ai/dashboard/billing/usage\",\"usage_json_path\":\"total_usage\",\"usage_scale\":0.01,\"balance_unit\":\"CNY\",\"currency\":\"CNY\",\"scale\":1,\"cost_multiplier\":1,\"success_cost\":0.2,\"failure_cost\":0}。其它 NewAPI 系站点需要逐站验证字段和单位；没有可用余额/总额接口时可只填固定成本。"
+    "hint": "可选。绑定主站点 api_key/base_url 的费用观测配置。balance_url 严格表示直接余额接口；total_url + usage_url 表示总额减已用量接口组，最终余额 = total_value*scale - usage_value*usage_scale。balance_multiplier 表示 1 个站点余额数值折算成多少 currency。success_cost 是固定参考单张成功成本，成功时按实际返回图片数相乘；failure_cost 是固定参考单次失败成本，不乘以图片数。二者也可作为余额查询失败时的兜底，并会在 /image2 providers 中展示。MICU（https://www.micuapi.ai）实测示例：{\"total_url\":\"https://www.micuapi.ai/dashboard/billing/subscription\",\"total_json_path\":\"soft_limit_usd\",\"usage_url\":\"https://www.micuapi.ai/dashboard/billing/usage\",\"usage_json_path\":\"total_usage\",\"usage_scale\":0.01,\"currency\":\"CNY\",\"scale\":1,\"balance_multiplier\":1,\"success_cost\":0.2,\"failure_cost\":0}。其它 NewAPI 系站点需要逐站验证字段和换算关系；没有可用余额/总额接口时可只填固定成本。"
   },
   "primary_force_single_image_requests": {
     "description": "主站命中时强制单图上游请求",

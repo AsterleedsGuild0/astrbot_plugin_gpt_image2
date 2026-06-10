@@ -101,6 +101,78 @@ class BillingRecords:
             )
 
     @staticmethod
+    def _as_float(value: object, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _refresh_manual_balance_estimate(cls, item: dict) -> None:
+        if item.get("manual_balance_anchor") is not True:
+            return
+        anchor_balance = cls._as_float(item.get("manual_anchor_balance"))
+        anchor_total_cost = cls._as_float(item.get("manual_anchor_total_cost"))
+        total_cost = cls._as_float(item.get("total_cost"))
+        balance_multiplier = cls._as_float(
+            item.get("manual_anchor_balance_multiplier"), 1.0
+        )
+        if balance_multiplier == 0:
+            balance_multiplier = 1.0
+        spent_since_anchor = (total_cost - anchor_total_cost) / balance_multiplier
+        estimated_balance = anchor_balance - spent_since_anchor
+        item["balance_source"] = "manual_anchor_estimate"
+        item["last_balance_after"] = estimated_balance
+        item["last_converted_balance"] = estimated_balance * balance_multiplier
+        item["last_balance_query_at"] = time()
+
+    def set_balance_anchor(
+        self,
+        *,
+        provider_id: str,
+        provider_name: str,
+        base_url: str,
+        role: str,
+        amount: float,
+        currency: str,
+        balance_multiplier: float = 1.0,
+    ) -> dict:
+        """Set a manual balance anchor for providers without realtime balance APIs."""
+
+        stats = self.load_billing_stats()
+        providers = stats.setdefault("providers", {})
+        if not isinstance(providers, dict):
+            providers = {}
+            stats["providers"] = providers
+        item = providers.get(provider_id)
+        if not isinstance(item, dict):
+            item = {}
+            providers[provider_id] = item
+        now = time()
+        current_total_cost = self._as_float(item.get("total_cost"))
+        if balance_multiplier == 0:
+            balance_multiplier = 1.0
+        item.update(
+            {
+                "provider_name": provider_name,
+                "base_url": base_url,
+                "role": role,
+                "manual_balance_anchor": True,
+                "manual_anchor_balance": float(amount),
+                "manual_anchor_currency": currency,
+                "manual_anchor_balance_multiplier": float(balance_multiplier),
+                "manual_anchor_total_cost": current_total_cost,
+                "manual_anchor_at": now,
+                "currency": currency,
+                "updated_at": now,
+            }
+        )
+        self._refresh_manual_balance_estimate(item)
+        self._update_summary(stats)
+        self.save_billing_stats()
+        return item
+
+    @staticmethod
     def _inc(item: dict, key: str, amount: int = 1) -> None:
         try:
             current = int(item.get(key, 0) or 0)
@@ -140,7 +212,6 @@ class BillingRecords:
             "role",
             "billing_type",
             "currency",
-            "balance_unit",
         ):
             if record.get(key) not in {None, ""}:
                 item[key] = record[key]
@@ -170,6 +241,8 @@ class BillingRecords:
         for key in ("balance_before", "balance_after", "raw_balance_after"):
             if record.get(key) is not None:
                 item[f"last_{key}"] = record[key]
+
+        self._refresh_manual_balance_estimate(item)
 
         self._update_summary(stats)
         self.save_billing_stats()
