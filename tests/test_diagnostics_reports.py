@@ -279,7 +279,7 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
         )
 
         self.assertIn("### 各站点余额", markdown)
-        self.assertIn("| 站点A | 39.9 CNY | 自动更新 |", markdown)
+        self.assertIn("| 站点A | 39.9 CNY | - | 自动更新 |", markdown)
         self.assertIn("### 各站点费用周期", markdown)
         self.assertIn(
             "| 站点A | 1.2 CNY | 0.1 CNY | 0.2 CNY | 0.3 CNY | 0.7 CNY |", markdown
@@ -317,7 +317,7 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
 
         self.assertIn("### 各站点余额", markdown)
         # 余额列只显示金额，不再拼接"（手动锚点估算）"
-        self.assertIn("| 站点A | 77.06 CNY | 手动更新 |", markdown)
+        self.assertIn("| 站点A | 77.06 CNY | - | 手动更新 |", markdown)
 
     def test_billing_update_method_uses_config_balance_when_no_cache(self):
         """balance/total_usage billing 配置，无缓存余额时仍显示自动更新。"""
@@ -340,7 +340,7 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
             [_provider(billing=billing_config)],
             billing_stats={},
         )
-        self.assertIn("| 站点A | - | 自动更新 |", markdown)
+        self.assertIn("| 站点A | - | - | 自动更新 |", markdown)
 
     def test_billing_update_method_uses_config_total_usage_when_no_cache(self):
         """total_usage billing 配置，无缓存余额时仍显示自动更新。"""
@@ -364,7 +364,7 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
             [_provider(billing=billing_config)],
             billing_stats={},
         )
-        self.assertIn("| 站点A | - | 自动更新 |", markdown)
+        self.assertIn("| 站点A | - | - | 自动更新 |", markdown)
 
     def test_billing_update_method_uses_config_fixed_when_no_cache(self):
         """fixed billing 配置，无缓存余额时仍显示手动更新。"""
@@ -388,7 +388,7 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
             [_provider(billing=billing_config)],
             billing_stats={},
         )
-        self.assertIn("| 站点A | - | 手动更新 |", markdown)
+        self.assertIn("| 站点A | - | 0.1 CNY | 手动更新 |", markdown)
 
     def test_billing_update_method_manual_anchor_still_manual(self):
         """history-only provider（无配置）的 manual_anchor_estimate 缓存仍显示手动更新。"""
@@ -430,7 +430,125 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
             billing_stats=billing_stats,
             show_all=True,
         )
-        self.assertIn("| 历史站点 | 50 CNY | 手动更新 |", markdown)
+        self.assertIn("| 历史站点 | 50 CNY | - | 手动更新 |", markdown)
+
+    def test_balance_uses_config_currency_when_no_converted_balance(self):
+        """没有 last_converted_balance 时用配置 currency/multiplier 显示 CNY。"""
+        billing_config = BillingConfig(
+            type="balance",
+            balance_url="https://api.example.com/balance",
+            currency="CNY",
+            balance_multiplier=1,
+        )
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "XingChenAI",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                }
+            }
+        }
+        billing_stats = {
+            "providers": {
+                "pid-a": {
+                    "last_balance_after": 1.92,
+                    "total_cost": 0.5,
+                }
+            }
+        }
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [_provider(billing=billing_config)],
+            billing_stats=billing_stats,
+        )
+        self.assertIn("### 各站点余额", markdown)
+        # 应该用配置的 CNY 显示，而不是"余额数值"
+        self.assertIn("| XingChenAI | 1.92 CNY |", markdown)
+        self.assertNotIn("余额数值", markdown)
+
+    def test_balance_table_shows_success_cost_column(self):
+        """余额表新增"单张开销"列，显示配置中的 success_cost。"""
+        billing_config = BillingConfig(
+            type="fixed",
+            success_cost=0.08,
+            failure_cost=0.0,
+            currency="JPY",
+        )
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                }
+            }
+        }
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [_provider(billing=billing_config)],
+        )
+        # 表头包含单张开销
+        self.assertIn("单张开销", markdown)
+        # 行数据包含 success_cost
+        self.assertIn("| 站点A | - | 0.08 JPY | 手动更新 |", markdown)
+
+    def test_balance_table_sorted_by_success_cost_descending(self):
+        """余额表按单张开销降序排列，无单张开销的排最后。"""
+        billing_high = BillingConfig(
+            type="fixed",
+            success_cost=0.5,
+            failure_cost=0.0,
+        )
+        billing_low = BillingConfig(
+            type="fixed",
+            success_cost=0.05,
+            failure_cost=0.0,
+        )
+        stats_data = {
+            "providers": {
+                "pid-high": {
+                    "name": "高开销站点",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                },
+                "pid-low": {
+                    "name": "低开销站点",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                },
+                "pid-none": {
+                    "name": "无开销站点",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                },
+            }
+        }
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [
+                _provider(provider_id="pid-high", billing=billing_high),
+                _provider(provider_id="pid-low", billing=billing_low),
+                _provider(provider_id="pid-none", billing=None),
+            ],
+        )
+        # 提取余额表部分（从 "### 各站点余额" 到下一个 "###" 之前）
+        balance_section = markdown.split("### 各站点余额\n\n")[1]
+        balance_table_text = balance_section.split("\n\n### ")[0]
+        # 验证排序：高开销 > 低开销 > 无开销
+        self.assertLess(
+            balance_table_text.index("高开销站点"),
+            balance_table_text.index("低开销站点"),
+        )
+        self.assertLess(
+            balance_table_text.index("低开销站点"),
+            balance_table_text.index("无开销站点"),
+        )
 
     def test_format_elapsed_ms_units(self):
         """毫秒和秒级耗时格式化符合展示约定。"""

@@ -390,15 +390,43 @@ def build_stats_summary_markdown(
             billing_item = billing_providers.get(pid, {})
             if not isinstance(billing_item, dict):
                 billing_item = {}
-            currency = str(billing_item.get("currency") or "")
-            balance = _format_money(
-                billing_item.get("last_converted_balance"), currency
-            )
-            raw_balance = _format_money(billing_item.get("last_balance_after"), "")
-            if balance == "-" and raw_balance != "-":
-                balance = f"余额数值 {raw_balance}"
-            # 单独展示余额更新方式，优先从配置文件的 billing 配置判断。
+
+            # 优先从配置文件的 billing 配置判断更新方式和单张开销。
             config_billing = config_billing_map.get(pid)
+
+            # 余额展示：优先用 last_converted_balance；否则用配置计算 last_balance_after。
+            converted = billing_item.get("last_converted_balance")
+            if converted is not None:
+                currency = str(billing_item.get("currency") or "")
+                balance = _format_money(converted, currency)
+            else:
+                raw_balance_val = billing_item.get("last_balance_after")
+                if raw_balance_val is not None and config_billing is not None:
+                    try:
+                        computed = (
+                            float(raw_balance_val) * config_billing.balance_multiplier
+                        )
+                    except (TypeError, ValueError):
+                        computed = None
+                    balance = _format_money(computed, config_billing.currency)
+                else:
+                    raw_formatted = _format_money(raw_balance_val, "")
+                    if raw_formatted != "-":
+                        balance = f"余额数值 {raw_formatted}"
+                    else:
+                        balance = "-"
+
+            # 单张开销（从配置中取 success_cost）
+            if config_billing is not None and config_billing.success_cost > 0:
+                success_cost_per_image = _format_money(
+                    config_billing.success_cost, config_billing.currency
+                )
+                success_cost_raw = config_billing.success_cost
+            else:
+                success_cost_per_image = "-"
+                success_cost_raw = -1.0
+
+            # 余额更新方式
             if config_billing is not None:
                 if config_billing.uses_balance:
                     balance_update_method = "自动更新"
@@ -412,6 +440,8 @@ def build_stats_summary_markdown(
                 balance_update_method = "自动更新"
             else:
                 balance_update_method = "-"
+
+            currency = str(billing_item.get("currency") or "")
             total_cost = _format_money(billing_item.get("total_cost"), currency)
             period_costs = billing_period_costs.get(pid, {})
             has_billing = bool(billing_item)
@@ -446,6 +476,8 @@ def build_stats_summary_markdown(
                         "last_error": last_err,
                         "balance": balance,
                         "balance_update_method": balance_update_method,
+                        "success_cost_per_image": success_cost_per_image,
+                        "success_cost_raw": success_cost_raw,
                         "total_cost": total_cost,
                         "today_cost": today_cost,
                         "yesterday_cost": yesterday_cost,
@@ -481,10 +513,20 @@ def build_stats_summary_markdown(
         lines.append("\n")
 
         lines.append("### 各站点余额\n\n")
-        lines.append("| 站点 | 缓存余额 | 更新方式 |\n|------|----------|----------|\n")
-        for _, row in provider_rows:
+        lines.append(
+            "| 站点 | 缓存余额 | 单张开销 | 更新方式 |\n"
+            "|------|----------|----------|----------|\n"
+        )
+        # 按单张开销降序排序，无单张开销的排最后。
+        balance_rows = sorted(
+            provider_rows,
+            key=lambda x: (x[1].get("success_cost_raw", -1.0),),
+            reverse=True,
+        )
+        for _, row in balance_rows:
             lines.append(
-                f"| {row['name']} | {row['balance']} | {row['balance_update_method']} |\n"
+                f"| {row['name']} | {row['balance']} | "
+                f"{row['success_cost_per_image']} | {row['balance_update_method']} |\n"
             )
         lines.append("\n")
 
