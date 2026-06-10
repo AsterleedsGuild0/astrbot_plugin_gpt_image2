@@ -15,6 +15,7 @@ import zipfile
 from pathlib import Path
 
 from .redact import redact_config_value
+from ..billing.config import BillingConfig
 from ..providers.manager import (
     ImageAPIProviderConfig,
     FAILURE_REASON_ORDER,
@@ -287,6 +288,11 @@ def build_stats_summary_markdown(
         }
         scope_tag = "（当前配置的 Provider）"
 
+    # 提前建立 provider_id 到 billing 配置的映射，用于判断余额更新方式。
+    config_billing_map: dict[str, BillingConfig | None] = {}
+    for c in provider_configs:
+        config_billing_map[c.provider_id] = c.billing
+
     billing_providers: dict = {}
     if isinstance(billing_stats, dict):
         raw_billing_providers = billing_stats.get("providers", {})
@@ -391,8 +397,16 @@ def build_stats_summary_markdown(
             raw_balance = _format_money(billing_item.get("last_balance_after"), "")
             if balance == "-" and raw_balance != "-":
                 balance = f"余额数值 {raw_balance}"
-            # 单独展示余额更新方式，避免和余额数值混在一起。
-            if billing_item.get("balance_source") == "manual_anchor_estimate":
+            # 单独展示余额更新方式，优先从配置文件的 billing 配置判断。
+            config_billing = config_billing_map.get(pid)
+            if config_billing is not None:
+                if config_billing.uses_balance:
+                    balance_update_method = "自动更新"
+                elif config_billing.uses_fixed:
+                    balance_update_method = "手动更新"
+                else:
+                    balance_update_method = "-"
+            elif billing_item.get("balance_source") == "manual_anchor_estimate":
                 balance_update_method = "手动更新"
             elif balance != "-":
                 balance_update_method = "自动更新"

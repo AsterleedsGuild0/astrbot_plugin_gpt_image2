@@ -14,6 +14,7 @@ sys.modules["astrbot"] = MagicMock()
 sys.modules["astrbot.api"] = astrbot_api
 
 from image2_core.api.client import HTTPDiagnostics, ImageAPIError  # noqa: E402
+from image2_core.billing.config import BillingConfig  # noqa: E402
 from image2_core.diagnostics.reports import (  # noqa: E402
     build_stats_summary_markdown,
     format_elapsed_ms,
@@ -26,7 +27,10 @@ from image2_core.providers.manager import (  # noqa: E402
 )
 
 
-def _provider(provider_id: str = "pid-a") -> ImageAPIProviderConfig:
+def _provider(
+    provider_id: str = "pid-a",
+    billing: BillingConfig | None = None,
+) -> ImageAPIProviderConfig:
     """构造报表测试用 Provider 配置。"""
     return ImageAPIProviderConfig(
         name="站点A",
@@ -36,6 +40,7 @@ def _provider(provider_id: str = "pid-a") -> ImageAPIProviderConfig:
         responses_model="gpt-5.5",
         provider_id=provider_id,
         configured_order=0,
+        billing=billing,
     )
 
 
@@ -313,6 +318,119 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
         self.assertIn("### 各站点余额", markdown)
         # 余额列只显示金额，不再拼接"（手动锚点估算）"
         self.assertIn("| 站点A | 77.06 CNY | 手动更新 |", markdown)
+
+    def test_billing_update_method_uses_config_balance_when_no_cache(self):
+        """balance/total_usage billing 配置，无缓存余额时仍显示自动更新。"""
+        billing_config = BillingConfig(
+            type="balance",
+            balance_url="https://api.example.com/balance",
+        )
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                }
+            }
+        }
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [_provider(billing=billing_config)],
+            billing_stats={},
+        )
+        self.assertIn("| 站点A | - | 自动更新 |", markdown)
+
+    def test_billing_update_method_uses_config_total_usage_when_no_cache(self):
+        """total_usage billing 配置，无缓存余额时仍显示自动更新。"""
+        billing_config = BillingConfig(
+            type="total_usage",
+            total_url="https://api.example.com/total",
+            usage_url="https://api.example.com/usage",
+        )
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                }
+            }
+        }
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [_provider(billing=billing_config)],
+            billing_stats={},
+        )
+        self.assertIn("| 站点A | - | 自动更新 |", markdown)
+
+    def test_billing_update_method_uses_config_fixed_when_no_cache(self):
+        """fixed billing 配置，无缓存余额时仍显示手动更新。"""
+        billing_config = BillingConfig(
+            type="fixed",
+            success_cost=0.1,
+            failure_cost=0.0,
+        )
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                }
+            }
+        }
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [_provider(billing=billing_config)],
+            billing_stats={},
+        )
+        self.assertIn("| 站点A | - | 手动更新 |", markdown)
+
+    def test_billing_update_method_manual_anchor_still_manual(self):
+        """history-only provider（无配置）的 manual_anchor_estimate 缓存仍显示手动更新。"""
+        billing_config = BillingConfig(
+            type="balance",
+            balance_url="https://api.example.com/balance",
+        )
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                },
+                "pid-history": {
+                    "name": "历史站点",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                },
+            }
+        }
+        billing_stats = {
+            "providers": {
+                "pid-history": {
+                    "currency": "CNY",
+                    "last_balance_after": 50.0,
+                    "last_converted_balance": 50.0,
+                    "total_cost": 2.0,
+                    "balance_source": "manual_anchor_estimate",
+                }
+            }
+        }
+        # show_all 下 pid-history 没有对应的 provider config
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [_provider(provider_id="pid-a", billing=billing_config)],
+            billing_stats=billing_stats,
+            show_all=True,
+        )
+        self.assertIn("| 历史站点 | 50 CNY | 手动更新 |", markdown)
 
     def test_format_elapsed_ms_units(self):
         """毫秒和秒级耗时格式化符合展示约定。"""
