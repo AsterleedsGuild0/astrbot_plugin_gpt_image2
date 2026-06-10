@@ -188,8 +188,8 @@ class BillingRecords:
             current = 0.0
         item[key] = current + float(amount)
 
-    def record_event(self, record: dict) -> None:
-        """Append one billing event and update aggregate stats."""
+    def record_event(self, record: dict) -> dict:
+        """追加费用事件、更新聚合统计，并返回更新后的 Provider 统计项。"""
 
         record = dict(record)
         record.setdefault("timestamp", time())
@@ -247,6 +247,7 @@ class BillingRecords:
         self._update_summary(stats)
         self.save_billing_stats()
         self._append_event(record)
+        return item
 
     def _update_summary(self, stats: dict) -> None:
         providers = stats.get("providers")

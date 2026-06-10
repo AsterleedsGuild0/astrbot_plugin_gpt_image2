@@ -26,6 +26,21 @@ def format_observation_cost(obs: BillingObservation | None) -> str:
     return f"，开销：{format_money(obs.cost, obs.currency)}"
 
 
+def format_observation_balance_notice(obs: BillingObservation | None) -> str:
+    """构建任务提示中的余额片段；没有余额信息时返回空字符串。"""
+    if obs is None:
+        return ""
+    # 优先使用展示币种换算余额；没有时退回站点余额数值。
+    balance = obs.converted_balance_after
+    if balance is None:
+        balance = obs.balance_after
+    if balance is None:
+        return ""
+    if obs.balance_source == "manual_anchor_estimate":
+        return f"，余额约 {format_money(balance, obs.currency)}（手动估算）"
+    return f"，余额 {format_money(balance, obs.currency)}"
+
+
 def build_costs_summary_markdown(stats: dict) -> str:
     providers = stats.get("providers", {}) if isinstance(stats, dict) else {}
     providers = providers if isinstance(providers, dict) else {}

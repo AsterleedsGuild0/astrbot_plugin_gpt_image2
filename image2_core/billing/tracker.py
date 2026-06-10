@@ -36,6 +36,7 @@ class BillingObservation:
     converted_balance_before: float | None = None
     converted_balance_after: float | None = None
     cost_source: str = ""
+    balance_source: str = ""
     error: str = ""
 
     @property
@@ -441,7 +442,7 @@ class BillingTracker:
         api_mode: str,
     ) -> None:
         host, path = provider_url_parts(str(provider.base_url))
-        self.records.record_event(
+        item = self.records.record_event(
             {
                 "timestamp": time(),
                 "provider_id": obs.provider_id,
@@ -467,3 +468,12 @@ class BillingTracker:
                 "error_preview": obs.error[:240] if obs.error else "",
             }
         )
+        # 将持久化统计中的余额信息（如固定成本事件后的手动锚点估算）回填
+        # 到本次观测，供成功提示展示。实时余额类观测已有最新数据，不覆盖。
+        if isinstance(item, dict) and not billing.uses_balance:
+            if item.get("last_balance_after") is not None:
+                obs.balance_after = item["last_balance_after"]
+            if item.get("last_converted_balance") is not None:
+                obs.converted_balance_after = item["last_converted_balance"]
+            if item.get("balance_source"):
+                obs.balance_source = item["balance_source"]

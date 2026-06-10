@@ -20,6 +20,7 @@ from image2_core.billing.config import parse_billing_config  # noqa: E402
 from image2_core.billing.messages import (  # noqa: E402
     build_balance_markdown,
     build_costs_summary_markdown,
+    format_observation_balance_notice,
 )
 from image2_core.billing.records import BillingRecords  # noqa: E402
 from image2_core.billing.tracker import BillingObservation, BillingTracker  # noqa: E402
@@ -432,6 +433,46 @@ class TestBillingTracker(unittest.TestCase):
 class TestBillingRecordsManualAnchor(unittest.TestCase):
     """验证手动余额锚点估算。"""
 
+    def test_record_event_returns_item_with_balance_source(self):
+        """record_event() now returns the updated provider item dict containing
+        manual anchor estimate fields."""
+        with tempfile.TemporaryDirectory() as tmp:
+            records = BillingRecords("test-plugin")
+            stats_path = Path(tmp) / "billing_stats.json"
+            records.billing_stats_path = lambda: stats_path  # type: ignore[method-assign]
+            records.billing_events_jsonl_path = lambda: (  # type: ignore[method-assign]
+                Path(tmp) / "billing_events.jsonl"
+            )
+
+            records.set_balance_anchor(
+                provider_id="pid2",
+                provider_name="FixedProvider",
+                base_url="https://fixed.example/v1",
+                role="normal",
+                amount=100.0,
+                currency="CNY",
+                balance_multiplier=1,
+            )
+            item = records.record_event(
+                {
+                    "provider_id": "pid2",
+                    "provider_name": "FixedProvider",
+                    "base_url": "https://fixed.example/v1",
+                    "role": "normal",
+                    "billing_type": "fixed",
+                    "success": True,
+                    "cost": 1.5,
+                    "cost_units": 1,
+                    "currency": "CNY",
+                    "cost_source": "fixed",
+                }
+            )
+
+            self.assertIsInstance(item, dict)
+            self.assertEqual(item.get("balance_source"), "manual_anchor_estimate")
+            self.assertAlmostEqual(item.get("last_balance_after", 0), 98.5)
+            self.assertAlmostEqual(item.get("last_converted_balance", 0), 98.5)
+
     def test_manual_anchor_updates_estimated_balance_after_fixed_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             records = BillingRecords("test-plugin")
@@ -586,6 +627,49 @@ class TestBillingMessages(unittest.TestCase):
 
         self.assertIn("计费：balance", markdown)
         self.assertIn("固定参考 成功单张 0.03 USD / 失败单次 0.001 USD", markdown)
+
+    def test_balance_notice_format_auto_balance(self):
+        notice = format_observation_balance_notice(
+            BillingObservation(
+                provider_id="pid",
+                provider_name="test",
+                billing_type="balance",
+                success=True,
+                currency="CNY",
+                balance_after=12.1,
+                converted_balance_after=12.1,
+            )
+        )
+        self.assertEqual(notice, "，余额 12.1 CNY")
+
+    def test_balance_notice_format_manual_anchor(self):
+        notice = format_observation_balance_notice(
+            BillingObservation(
+                provider_id="pid",
+                provider_name="test",
+                billing_type="fixed",
+                success=True,
+                currency="CNY",
+                balance_after=77.06,
+                converted_balance_after=77.06,
+                balance_source="manual_anchor_estimate",
+            )
+        )
+        self.assertEqual(notice, "，余额约 77.06 CNY（手动估算）")
+
+    def test_balance_notice_format_no_balance(self):
+        notice = format_observation_balance_notice(
+            BillingObservation(
+                provider_id="pid",
+                provider_name="test",
+                billing_type="fixed",
+                success=True,
+            )
+        )
+        self.assertEqual(notice, "")
+
+    def test_balance_notice_format_none(self):
+        self.assertEqual(format_observation_balance_notice(None), "")
 
     def test_providers_status_marks_manual_anchor_estimate(self):
         manager = ProviderManager(

@@ -90,6 +90,7 @@ from .image2_core.billing.messages import (
     build_costs_recent_markdown,
     build_costs_summary_markdown,
     format_money,
+    format_observation_balance_notice,
 )
 from .image2_core.billing.config import BillingConfig
 from .image2_core.billing.records import BillingRecords
@@ -1765,15 +1766,18 @@ class GPTImage2Plugin(Star):
     def _task_cost_notice(cls, observations: list[BillingObservation]) -> str:
         if len(observations) == 1:
             obs = observations[0]
+            balance_part = format_observation_balance_notice(obs)
             if obs.cost is None:
-                return "，开销 未知"
+                return f"，开销 未知{balance_part}"
             details: list[str] = []
             if obs.success and obs.cost_units > 1:
                 details.append(f"{obs.cost_units} 张")
             if obs.cost_source:
                 details.append(cls._billing_cost_source_label(obs.cost_source))
             suffix = f"（{'，'.join(details)}）" if details else ""
-            return f"，开销 {format_money(obs.cost, obs.currency)}{suffix}"
+            return (
+                f"，开销 {format_money(obs.cost, obs.currency)}{suffix}{balance_part}"
+            )
 
         known: dict[str, float] = {}
         unknown = 0
@@ -1792,14 +1796,34 @@ class GPTImage2Plugin(Star):
             parts.append(f"计费 {units} 张")
         if unknown:
             parts.append(f"{unknown} 次未知")
-        return f"，开销 {' / '.join(parts)}" if parts else ""
+
+        # 多次观测时取最后一个成功且带余额信息的观测，避免展示早期失败站点
+        # 的过期余额。
+        balance_obs: BillingObservation | None = None
+        for obs_ in reversed(observations):
+            if obs_.success and (
+                obs_.balance_after is not None
+                or obs_.converted_balance_after is not None
+                or obs_.balance_source
+            ):
+                balance_obs = obs_
+                break
+        balance_part = (
+            format_observation_balance_notice(balance_obs)
+            if balance_obs is not None
+            else ""
+        )
+        result = f"，开销 {' / '.join(parts)}" if parts else ""
+        result += balance_part
+        return result
 
     @classmethod
     def _task_cost_markdown(cls, observations: list[BillingObservation]) -> str:
         notice = cls._task_cost_notice(observations)
         if not notice:
             return ""
-        return "\n\n费用观测：" + notice.removeprefix("，开销 ")
+        notice = notice.removeprefix("，开销 ").removeprefix("，")
+        return "\n\n费用观测：" + notice
 
     async def _call_draw_api(
         self,
