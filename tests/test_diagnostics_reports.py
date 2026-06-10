@@ -274,11 +274,45 @@ class TestStatsSummaryMarkdown(unittest.TestCase):
         )
 
         self.assertIn("### 各站点余额", markdown)
-        self.assertIn("| 站点A | 39.9 CNY |", markdown)
+        self.assertIn("| 站点A | 39.9 CNY | 自动更新 |", markdown)
         self.assertIn("### 各站点费用周期", markdown)
         self.assertIn(
             "| 站点A | 1.2 CNY | 0.1 CNY | 0.2 CNY | 0.3 CNY | 0.7 CNY |", markdown
         )
+
+    def test_billing_stats_manual_anchor_estimate(self):
+        """手动锚点估算站点的余额不带标注，更新方式显示'手动更新'。"""
+        stats_data = {
+            "providers": {
+                "pid-a": {
+                    "name": "站点A",
+                    "role": "primary",
+                    "success_count": 1,
+                    "failure_count": 0,
+                }
+            }
+        }
+        billing_stats = {
+            "providers": {
+                "pid-a": {
+                    "currency": "CNY",
+                    "last_balance_after": 77.06,
+                    "last_converted_balance": 77.06,
+                    "total_cost": 5.0,
+                    "last_cost": 0.5,
+                    "balance_source": "manual_anchor_estimate",
+                }
+            }
+        }
+        markdown = build_stats_summary_markdown(
+            stats_data,
+            [_provider()],
+            billing_stats=billing_stats,
+        )
+
+        self.assertIn("### 各站点余额", markdown)
+        # 余额列只显示金额，不再拼接"（手动锚点估算）"
+        self.assertIn("| 站点A | 77.06 CNY | 手动更新 |", markdown)
 
     def test_format_elapsed_ms_units(self):
         """毫秒和秒级耗时格式化符合展示约定。"""

@@ -391,11 +391,13 @@ def build_stats_summary_markdown(
             raw_balance = _format_money(billing_item.get("last_balance_after"), "")
             if balance == "-" and raw_balance != "-":
                 balance = f"余额数值 {raw_balance}"
-            if (
-                balance != "-"
-                and billing_item.get("balance_source") == "manual_anchor_estimate"
-            ):
-                balance = f"{balance}（手动锚点估算）"
+            # 单独展示余额更新方式，避免和余额数值混在一起。
+            if billing_item.get("balance_source") == "manual_anchor_estimate":
+                balance_update_method = "手动更新"
+            elif balance != "-":
+                balance_update_method = "自动更新"
+            else:
+                balance_update_method = "-"
             total_cost = _format_money(billing_item.get("total_cost"), currency)
             period_costs = billing_period_costs.get(pid, {})
             has_billing = bool(billing_item)
@@ -429,6 +431,7 @@ def build_stats_summary_markdown(
                         "top_reason": top_reason,
                         "last_error": last_err,
                         "balance": balance,
+                        "balance_update_method": balance_update_method,
                         "total_cost": total_cost,
                         "today_cost": today_cost,
                         "yesterday_cost": yesterday_cost,
@@ -464,9 +467,11 @@ def build_stats_summary_markdown(
         lines.append("\n")
 
         lines.append("### 各站点余额\n\n")
-        lines.append("| 站点 | 缓存余额 |\n|------|----------|\n")
+        lines.append("| 站点 | 缓存余额 | 更新方式 |\n|------|----------|----------|\n")
         for _, row in provider_rows:
-            lines.append(f"| {row['name']} | {row['balance']} |\n")
+            lines.append(
+                f"| {row['name']} | {row['balance']} | {row['balance_update_method']} |\n"
+            )
         lines.append("\n")
 
         lines.append("### 各站点费用周期\n\n")
