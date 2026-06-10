@@ -89,6 +89,7 @@
 | --- | --- | --- |
 | MICU | `/dashboard/billing/subscription` 返回总额度，`/dashboard/billing/usage` 返回已用量，需要用“总额 - 用量 = 余额” | `total_url` + `usage_url`，并可配固定参考成本兜底 |
 | LTCraft | `sk-` API key 可访问 OpenAI 兼容接口，但不能访问控制台余额接口；控制台虽然显示 USD，但余额数值当前可按 CNY 1:1 估算 | 固定参考成本 + `/image2 balance set` 手动余额锚点估算 |
+| sub2api-like 网关 | `sk-` API key 可访问 OpenAI 兼容接口；`/v1/usage` 如果返回 `quota_limited`、`quota.remaining` 等字段，通常表示 API Key 配额，不是控制台钱包余额 | 固定参考成本 + `/image2 balance set` 手动余额锚点估算 |
 
 这些结论只代表已实测站点。其它 NewAPI、One API 或二次封装站点可能改过接口、字段和单位，需要按本文的 REST Client 模板逐站验证。
 
@@ -178,6 +179,51 @@ LTCraft（`https://ai.ltcraft.cn`）当前实测情况：
 ```
 
 后续每次固定参考成本事件都会从该锚点余额中扣减。
+
+---
+
+## sub2api-like 网关固定费用余额估算
+
+sub2api 官方实现中，账户钱包余额和 API Key 配额是两个不同维度：
+
+- 用户账户余额通常在 Web/JWT 用户接口中返回，例如 `GET /api/v1/user/profile` 的 `balance` 字段。
+- API Key 配额通常通过 `quota`、`quota_used`、`quota.remaining` 等字段表达，表示单个 Key 的限制或已用量。
+- `/v1/usage` 可能返回 `quota_limited`、`unrestricted` 等模式。它适合判断当前 Key 或订阅的配额/用量，但不能默认等同于控制台钱包余额。
+
+因此，看到 sub2api-like 网关时不要只因为 `/v1/usage` 返回 200 就把它配置为 `balance_url`。必须先把接口返回值和控制台钱包余额对比：
+
+- 如果接口返回值能直接对上控制台钱包余额，才可作为 `balance_url`。
+- 如果接口返回的是 Key 配额、订阅额度、限额窗口或上游平台 quota，应视为配额信息，不要作为钱包余额。
+- 如果钱包余额只存在于 Web/JWT 接口，不建议为了实时余额在插件中长期保存 Web 登录 Cookie/JWT。
+
+以 Matrcode 这类 sub2api-like 站点为例，实测 `/v1/usage` 返回的是 Key 级配额，而控制台钱包余额另有数值；这种情况下推荐使用“固定参考成本 + 手动余额锚点”。
+
+备用站示例：
+
+```json
+{
+  "name": "MatrCodeFree1x",
+  "base_url": "https://hk-01-slb.matrcode.com/v1",
+  "api_key": "sk-xxx",
+  "capabilities": "all",
+  "model": "gpt-image-2",
+  "responses_model": "gpt5.5",
+  "billing": {
+    "currency": "CNY",
+    "balance_multiplier": 1,
+    "success_cost": 0.02,
+    "failure_cost": 0
+  }
+}
+```
+
+部署后用控制台钱包余额手动校准：
+
+```text
+/image2 balance set MatrCodeFree1x <控制台余额>
+```
+
+后续估算余额按固定成本扣减。充值、站外消耗、管理员调整余额或更换 API Key 后，应重新执行 `balance set`。
 
 ---
 
@@ -362,6 +408,7 @@ MICU 示例返回：
 
 - MICU：使用 `total_url` + `usage_url`，按“总额度 - 已用量”算余额。
 - LTCraft：使用 `success_cost` / `failure_cost` + `/image2 balance set <Provider> <amount>`，按固定成本和手动锚点估算余额。
+- sub2api-like 网关：如果 `/v1/usage` 返回 Key 配额而非钱包余额，使用 `success_cost` / `failure_cost` + `/image2 balance set <Provider> <amount>`。
 - 真实美元余额站点：`currency` 填 `CNY`，`balance_multiplier` 填你希望使用的美元到人民币换算倍率。
 - 显示 USD 但余额数值按人民币 1:1 扣减的中转站：`currency` 填 `CNY`，`balance_multiplier` 填 `1`。
 - 站长自定义点数站点：`currency` 填 `CNY`，`balance_multiplier` 填“1 个余额数值约等于多少 CNY”。
@@ -449,6 +496,33 @@ Authorization: Bearer {{api_key}}
 Accept: application/json
 ```
 
+### sub2api-like 网关
+
+sub2api-like 网关的关键验证点是：`sk-` API key 能访问 OpenAI 兼容接口；`/v1/usage` 可能只表示 Key 配额或订阅用量；账户钱包余额如果只存在于 Web/JWT 接口，不建议配置为插件自动查询接口。
+
+```http
+@api_key = sk-替换成你的-key
+@site_url = https://hk-01-slb.matrcode.com
+@base_url = {{site_url}}/v1
+
+### 1. OpenAI compatible models should work
+GET {{base_url}}/models
+Authorization: Bearer {{api_key}}
+Accept: application/json
+
+
+### 2. Usage may be API key quota, not wallet balance
+GET {{base_url}}/usage
+Authorization: Bearer {{api_key}}
+Accept: application/json
+
+
+### 3. User profile usually requires Web/JWT auth, not sk key
+GET {{site_url}}/api/v1/user/profile
+Authorization: Bearer {{api_key}}
+Accept: application/json
+```
+
 ---
 
 ## 配置后验证
@@ -493,6 +567,12 @@ MICU 实测该接口返回总额度。请同时测试 `/dashboard/billing/usage`
 `/api/user/self` 通常需要 Web 登录 Cookie，不适合机器人长期自动查询。优先使用 API Key 可访问的接口。
 
 如果只有网页登录态能看到余额，可以改用固定参考成本，并通过 `/image2 balance set <Provider> <amount>` 手动校准估算余额。单位、展示货币和换算倍率会从该 Provider 的 `billing` 配置读取。
+
+### sub2api-like 网关的 `/v1/usage` 可以当余额吗
+
+通常不建议直接当钱包余额。sub2api 官方模型里，账户钱包余额通常是用户资料里的 `balance`，需要 Web/JWT 鉴权；API Key 配额则是 `quota`、`quota_used` 或 `quota.remaining`。如果 `/v1/usage` 返回 `quota_limited`、`quota.remaining`、`quota.used` 等字段，它更可能是 Key 配额或订阅用量，不是控制台钱包余额。
+
+只有当 `/v1/usage` 的数值能和控制台钱包余额逐项对上时，才考虑配置为余额接口。否则使用固定参考成本，并通过 `/image2 balance set <Provider> <amount>` 手动校准。
 
 ### `/image2 balance` 查询失败，但生图正常
 
