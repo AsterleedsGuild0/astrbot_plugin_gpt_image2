@@ -50,7 +50,7 @@ def _redact_url(value: str) -> str:
 def _redact_fallback_provider_string(value: str) -> str:
     """Redact api_key-like values in a comma/separator-delimited key=value string.
 
-    e.g. ``"name=x, api_key=sk-abc, model=..."``
+    e.g. ``"name=x, api_key=<OpenAI-like key>, model=..."``
     -> ``"name=x, api_key=***REDACTED***, model=..."``
 
     Preserves all other fields without destroying formatting.
@@ -159,7 +159,7 @@ def redact_config_value(value: object, depth: int = 0) -> object:
         if value.startswith(("http://", "https://")):
             return _redact_url(value)
 
-        # --- Bare API key heuristic (sk-xxx / fk-xxx) ---
+        # --- Bare API key heuristic (OpenAI-like / fk-like key prefixes) ---
         stripped_val = value.strip()
         if stripped_val.startswith(("sk-", "fk-")) and 20 <= len(stripped_val) <= 300:
             return "***REDACTED***"

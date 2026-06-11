@@ -56,7 +56,7 @@
   {
     "name": "backup-1",
     "base_url": "https://api-backup.example.com/v1",
-    "api_key": "sk-xxx",
+    "api_key": "<api-key>",
     "capabilities": "images",
     "billing": {
       "currency": "CNY",
@@ -161,7 +161,7 @@ LTCraft（`https://ai.ltcraft.cn`）当前实测情况：
 {
   "name": "LTCraftAI",
   "base_url": "https://ai.ltcraft.cn/v1",
-  "api_key": "sk-xxx",
+  "api_key": "<api-key>",
   "capabilities": "images",
   "billing": {
     "currency": "CNY",
@@ -204,7 +204,7 @@ sub2api 官方实现中，账户钱包余额和 API Key 配额是两个不同维
 {
   "name": "MatrCodeFree1x",
   "base_url": "https://hk-01-slb.matrcode.com/v1",
-  "api_key": "sk-xxx",
+  "api_key": "<api-key>",
   "capabilities": "all",
   "model": "gpt-image-2",
   "responses_model": "gpt5.5",
@@ -319,7 +319,7 @@ MICU 示例返回：
 {
   "name": "Micu",
   "base_url": "https://api-slb.micuapi.ai/v1",
-  "api_key": "sk-xxx",
+  "api_key": "<api-key>",
   "capabilities": "images",
   "force_single_image_requests": true,
   "billing": {

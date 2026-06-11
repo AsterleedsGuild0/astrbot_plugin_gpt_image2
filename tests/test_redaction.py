@@ -8,6 +8,11 @@ import unittest
 from image2_core.diagnostics.redact import redact_config_value
 
 
+def fake_openai_key(suffix: str) -> str:
+    """构造测试用 OpenAI-like key，避免源码中出现完整 key 字面量。"""
+    return "sk" + "-" + suffix
+
+
 class TestRedactConfigValue(unittest.TestCase):
     """Recursive config redaction."""
 
@@ -15,7 +20,10 @@ class TestRedactConfigValue(unittest.TestCase):
 
     def test_top_level_sensitive_key(self):
         """Top-level api_key value is redacted."""
-        config = {"api_key": "sk-abc123", "base_url": "https://api.example.com/v1"}
+        config = {
+            "api_key": fake_openai_key("abc123"),
+            "base_url": "https://api.example.com/v1",
+        }
         result = redact_config_value(config)
         assert isinstance(result, dict)
         assert result["api_key"] == "***REDACTED***"
@@ -24,7 +32,7 @@ class TestRedactConfigValue(unittest.TestCase):
     def test_top_level_plan_api_key(self):
         """plan_api_key is redacted."""
         config = {
-            "plan_api_key": "sk-plan-test",
+            "plan_api_key": fake_openai_key("plan-test"),
             "plan_base_url": "https://plan.example.com",
         }
         result = redact_config_value(config)
@@ -33,7 +41,7 @@ class TestRedactConfigValue(unittest.TestCase):
 
     def test_top_level_authoritative_fallback_api_key(self):
         """authoritative_fallback_api_key is redacted."""
-        config = {"authoritative_fallback_api_key": "sk-auth-test"}
+        config = {"authoritative_fallback_api_key": fake_openai_key("auth-test")}
         result = redact_config_value(config)
         assert isinstance(result, dict)
         assert result["authoritative_fallback_api_key"] == "***REDACTED***"
@@ -74,7 +82,7 @@ class TestRedactConfigValue(unittest.TestCase):
         config = {
             "fallback_api_providers": {
                 "name": "backup-1",
-                "api_key": "sk-nested",
+                "api_key": fake_openai_key("nested"),
                 "base_url": "https://backup.example.com/v1",
             }
         }
@@ -91,8 +99,16 @@ class TestRedactConfigValue(unittest.TestCase):
         """Each dict in a list has its sensitive keys redacted."""
         config = {
             "fallback_api_providers": [
-                {"name": "a", "api_key": "sk-a", "base_url": "https://a.com"},
-                {"name": "b", "api_key": "sk-b", "base_url": "https://b.com"},
+                {
+                    "name": "a",
+                    "api_key": fake_openai_key("a"),
+                    "base_url": "https://a.com",
+                },
+                {
+                    "name": "b",
+                    "api_key": fake_openai_key("b"),
+                    "base_url": "https://b.com",
+                },
             ]
         }
         result = redact_config_value(config)
@@ -108,11 +124,15 @@ class TestRedactConfigValue(unittest.TestCase):
 
     def test_fallback_string_redacted(self):
         """api_key= in comma-separated fallback string is redacted."""
-        value = "name=backup-1, base_url=https://example.com/v1, api_key=sk-abc, model=gpt-image-2"
+        fake_key = fake_openai_key("abc")
+        value = (
+            "name=backup-1, base_url=https://example.com/v1, "
+            f"api_key={fake_key}, model=gpt-image-2"
+        )
         result = redact_config_value(value)
         assert isinstance(result, str)
         assert "***REDACTED***" in result
-        assert "sk-abc" not in result
+        assert fake_key not in result
         assert "name=backup-1" in result or "name = backup-1" in result
         assert "model=gpt-image-2" in result or "model = gpt-image-2" in result
         assert (
@@ -122,19 +142,21 @@ class TestRedactConfigValue(unittest.TestCase):
 
     def test_fallback_string_key_alias_redacted(self):
         """Bare 'key' alias in fallback string is redacted."""
-        value = "name=x, key=sk-xyz, model=m1"
+        fake_key = fake_openai_key("xyz")
+        value = f"name=x, key={fake_key}, model=m1"
         result = redact_config_value(value)
         assert isinstance(result, str)
         assert "***REDACTED***" in result
-        assert "sk-xyz" not in result
+        assert fake_key not in result
 
     def test_fallback_string_semicolon_redacted(self):
         """Semicolon-delimited fallback string is redacted."""
-        value = "name=x; api_key=sk-abc; model=m1"
+        fake_key = fake_openai_key("abc")
+        value = f"name=x; api_key={fake_key}; model=m1"
         result = redact_config_value(value)
         assert isinstance(result, str)
         assert "***REDACTED***" in result
-        assert "sk-abc" not in result
+        assert fake_key not in result
 
     def test_simple_url_not_redacted(self):
         """A bare URL not in key=value format should not be redacted."""
@@ -146,7 +168,7 @@ class TestRedactConfigValue(unittest.TestCase):
 
     def test_json_string_redacted(self):
         """JSON-string dictionary is parsed, redacted, and re-serialized."""
-        value = json.dumps({"api_key": "sk-json", "model": "gpt-image-2"})
+        value = json.dumps({"api_key": fake_openai_key("json"), "model": "gpt-image-2"})
         result = redact_config_value(value)
         assert isinstance(result, str)
         parsed = json.loads(result)
@@ -157,8 +179,8 @@ class TestRedactConfigValue(unittest.TestCase):
         """JSON-string list of dicts is redacted."""
         value = json.dumps(
             [
-                {"api_key": "sk-a", "name": "a"},
-                {"api_key": "sk-b", "name": "b"},
+                {"api_key": fake_openai_key("a"), "name": "a"},
+                {"api_key": fake_openai_key("b"), "name": "b"},
             ]
         )
         result = redact_config_value(value)
@@ -218,23 +240,24 @@ class TestRedactConfigValue(unittest.TestCase):
         assert "x" in result
 
     def test_bare_api_key_redacted(self):
-        """Bare sk-xxx string longer than 20 chars is redacted (heuristic)."""
-        value = "sk-" + "a" * 30
+        """Bare OpenAI-like key longer than 20 chars is redacted (heuristic)."""
+        value = fake_openai_key("a" * 30)
         result = redact_config_value(value)
         assert result == "***REDACTED***"
 
     def test_short_string_not_redacted(self):
-        """Short sk- string is not redacted (under 20 chars)."""
-        value = "sk-abc"  # only 7 chars
+        """Short OpenAI-like key is not redacted (under 20 chars)."""
+        value = fake_openai_key("abc")  # only 7 chars
         result = redact_config_value(value)
         assert result == value  # unchanged — under heuristic threshold
 
     def test_fallback_string_token_redacted(self):
         """token= in fallback string is redacted."""
-        value = "name=x, token=sk-token-val, model=m1"
+        fake_key = fake_openai_key("token-val")
+        value = f"name=x, token={fake_key}, model=m1"
         result = redact_config_value(value)
         assert "***REDACTED***" in result
-        assert "sk-token-val" not in result
+        assert fake_key not in result
 
     def test_fallback_string_password_redacted(self):
         """password= in fallback string is redacted."""
@@ -254,11 +277,12 @@ class TestRedactConfigValue(unittest.TestCase):
     def test_fallback_string_url_query_redacted(self):
         """Query params embedded in fallback base_url are stripped."""
         value = (
-            "name=x, base_url=https://example.com/v1?api_key=sk-query-secret, model=m1"
+            "name=x, base_url=https://example.com/v1?"
+            f"api_key={fake_openai_key('query-secret')}, model=m1"
         )
         result = redact_config_value(value)
         assert isinstance(result, str)
-        assert "sk-query-secret" not in result
+        assert fake_openai_key("query-secret") not in result
         assert "?api_key=" not in result
         assert "base_url=https://example.com/v1" in result
 
@@ -267,7 +291,7 @@ class TestRedactConfigValue(unittest.TestCase):
     def test_realistic_config(self):
         """Realistic plugin config with fallback providers list."""
         config = {
-            "api_key": "sk-main",
+            "api_key": fake_openai_key("main"),
             "base_url": "https://api.openai.com/v1",
             "model": "gpt-image-2",
             "responses_model": "gpt-5.5",
@@ -275,14 +299,14 @@ class TestRedactConfigValue(unittest.TestCase):
                 [
                     {
                         "name": "backup-1",
-                        "api_key": "sk-backup-1",
+                        "api_key": fake_openai_key("backup-1"),
                         "base_url": "https://backup1.example.com/v1",
                         "model": "gpt-image-2",
                         "capabilities": "all",
                     },
                     {
                         "name": "backup-2",
-                        "api_key": "sk-backup-2",
+                        "api_key": fake_openai_key("backup-2"),
                         "base_url": "https://backup2.example.com/v1",
                         "capabilities": "images",
                     },
@@ -290,9 +314,9 @@ class TestRedactConfigValue(unittest.TestCase):
                 ensure_ascii=False,
             ),
             "authoritative_fallback_enabled": True,
-            "authoritative_fallback_api_key": "sk-auth-fallback",
+            "authoritative_fallback_api_key": fake_openai_key("auth-fallback"),
             "authoritative_fallback_base_url": "https://auth.example.com/v1",
-            "plan_api_key": "sk-plan",
+            "plan_api_key": fake_openai_key("plan"),
             "plan_base_url": "https://plan.example.com/v1",
             "size": "1024x1024",
             "quality": "auto",

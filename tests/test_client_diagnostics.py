@@ -23,6 +23,11 @@ from image2_core.api.client import (  # noqa: E402
 )
 
 
+def fake_openai_key(suffix: str) -> str:
+    """构造测试用 OpenAI-like key，避免源码中出现完整 key 字面量。"""
+    return "sk" + "-" + suffix
+
+
 class TestResponseJsonSummary(unittest.TestCase):
     """_response_json_summary 生成安全的结构摘要。"""
 
@@ -169,16 +174,18 @@ class TestSanitizedResponsePreview(unittest.TestCase):
         self.assertNotIn("AAA", preview)
 
     def test_bearer_token_redacted(self):
-        text = "Authorization: Bearer sk-abc123def456ghi789jkl"
+        fake_key = fake_openai_key("abc123def456ghi789jkl")
+        text = f"Authorization: Bearer {fake_key}"
         preview, truncated = GPTImageClient._sanitized_response_preview(text)
         self.assertIn("***REDACTED***", preview)
-        self.assertNotIn("sk-abc123def456ghi789jkl", preview)
+        self.assertNotIn(fake_key, preview)
 
     def test_api_key_pattern_redacted(self):
-        text = '{"api_key": "sk-xxxxxxxxxxxxxxxxxxxx"}'
+        fake_key = fake_openai_key("xxxxxxxxxxxxxxxxxxxx")
+        text = f'{{"api_key": "{fake_key}"}}'
         preview, truncated = GPTImageClient._sanitized_response_preview(text)
         self.assertIn("***REDACTED***", preview)
-        self.assertNotIn("sk-xxxx", preview)
+        self.assertNotIn(fake_key[:7], preview)
 
     def test_empty_string(self):
         preview, truncated = GPTImageClient._sanitized_response_preview("")

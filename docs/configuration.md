@@ -71,7 +71,7 @@
   {
     "name": "backup-1",
     "base_url": "https://api-backup.example.com/v1",
-    "api_key": "sk-xxx",
+    "api_key": "<api-key>",
     "capabilities": "images",
     "model": "gpt-image-2",
     "force_single_image_requests": true,

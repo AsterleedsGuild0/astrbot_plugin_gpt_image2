@@ -31,13 +31,18 @@ from image2_core.providers.manager import (  # noqa: E402
 from image2_core.providers.messages import build_providers_status_markdown  # noqa: E402
 
 
+def fake_openai_key(suffix: str) -> str:
+    """构造测试用 OpenAI-like key，避免源码中出现完整 key 字面量。"""
+    return "sk" + "-" + suffix
+
+
 class TestBillingConfig(unittest.TestCase):
     """验证 billing 配置解析和 Provider 绑定。"""
 
     def test_primary_billing_json_is_bound_to_primary_provider(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-test",
+                "api_key": fake_openai_key("test"),
                 "base_url": "https://primary.example/v1",
                 "primary_billing_json": (
                     '{"balance_url":"https://primary.example/balance",'
@@ -63,7 +68,7 @@ class TestBillingConfig(unittest.TestCase):
     def test_primary_force_single_image_requests_is_bound_to_primary_provider(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-test",
+                "api_key": fake_openai_key("test"),
                 "base_url": "https://primary.example/v1",
                 "primary_force_single_image_requests": True,
             },
@@ -78,13 +83,13 @@ class TestBillingConfig(unittest.TestCase):
     def test_fallback_json_billing_is_bound_to_fallback_provider(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-main",
+                "api_key": fake_openai_key("main"),
                 "base_url": "https://primary.example/v1",
                 "fallback_api_providers": [
                     {
                         "name": "backup",
                         "base_url": "https://backup.example/v1",
-                        "api_key": "sk-backup",
+                        "api_key": fake_openai_key("backup"),
                         "billing": {
                             "success_cost": 0.03,
                             "failure_cost": 0.001,
@@ -107,11 +112,12 @@ class TestBillingConfig(unittest.TestCase):
     def test_fallback_json_force_single_image_requests_is_bound_to_provider(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-main",
+                "api_key": fake_openai_key("main"),
                 "base_url": "https://primary.example/v1",
                 "fallback_api_providers": (
                     '[{"name":"backup","base_url":"https://backup.example/v1",'
-                    '"api_key":"sk-backup","force_single_image_requests":true}]'
+                    f'"api_key":"{fake_openai_key("backup")}",'
+                    '"force_single_image_requests":true}]'
                 ),
             },
             "test-plugin",
@@ -125,7 +131,7 @@ class TestBillingConfig(unittest.TestCase):
     def test_authoritative_fallback_force_single_image_requests_is_bound(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-main",
+                "api_key": fake_openai_key("main"),
                 "base_url": "https://primary.example/v1",
                 "authoritative_fallback_enabled": True,
                 "authoritative_fallback_name": "auth",
@@ -143,11 +149,12 @@ class TestBillingConfig(unittest.TestCase):
     def test_fallback_provider_json_text_is_supported(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-main",
+                "api_key": fake_openai_key("main"),
                 "base_url": "https://primary.example/v1",
                 "fallback_api_providers": (
                     '[{"name":"backup","base_url":"https://backup.example/v1",'
-                    '"api_key":"sk-backup","capabilities":"images"}]'
+                    f'"api_key":"{fake_openai_key("backup")}",'
+                    '"capabilities":"images"}]'
                 ),
             },
             "test-plugin",
@@ -157,14 +164,14 @@ class TestBillingConfig(unittest.TestCase):
         fallback = next(p for p in providers if p.name == "backup")
 
         self.assertEqual(fallback.base_url, "https://backup.example/v1")
-        self.assertEqual(fallback.api_key, "sk-backup")
+        self.assertEqual(fallback.api_key, fake_openai_key("backup"))
         self.assertTrue(fallback.images_supported)
         self.assertFalse(fallback.responses_supported)
 
     def test_fallback_provider_string_items_are_ignored(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-main",
+                "api_key": fake_openai_key("main"),
                 "base_url": "https://primary.example/v1",
                 "fallback_api_providers": '["https://backup.example/v1"]',
             },
@@ -178,7 +185,8 @@ class TestBillingConfig(unittest.TestCase):
     def test_migrates_legacy_fallback_list_to_json_text(self):
         config = {
             "fallback_api_providers": [
-                "name=backup-1, base_url=https://backup.example/v1, api_key=sk-old, capabilities=images",
+                "name=backup-1, base_url=https://backup.example/v1, "
+                f"api_key={fake_openai_key('old')}, capabilities=images",
                 {
                     "name": "backup-2",
                     "base_url": "https://backup2.example/v1",
@@ -194,7 +202,7 @@ class TestBillingConfig(unittest.TestCase):
         parsed = json.loads(value)
         self.assertEqual(parsed[0]["name"], "backup-1")
         self.assertEqual(parsed[0]["base_url"], "https://backup.example/v1")
-        self.assertEqual(parsed[0]["api_key"], "sk-old")
+        self.assertEqual(parsed[0]["api_key"], fake_openai_key("old"))
         self.assertEqual(parsed[1]["name"], "backup-2")
 
     def test_migrates_legacy_fallback_dict_to_json_text(self):
@@ -586,7 +594,7 @@ class TestBillingMessages(unittest.TestCase):
     def test_providers_status_includes_lightweight_billing(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-test",
+                "api_key": fake_openai_key("test"),
                 "primary_billing_json": '{"type":"fixed","success_cost":0.03,"currency":"USD"}',
             },
             "test-plugin",
@@ -607,7 +615,7 @@ class TestBillingMessages(unittest.TestCase):
     def test_providers_status_shows_balance_fixed_fallback(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-test",
+                "api_key": fake_openai_key("test"),
                 "primary_billing_json": (
                     '{"balance_url":"https://example.com/balance",'
                     '"success_cost":0.03,"failure_cost":0.001,"currency":"USD"}'
@@ -674,7 +682,7 @@ class TestBillingMessages(unittest.TestCase):
     def test_providers_status_marks_manual_anchor_estimate(self):
         manager = ProviderManager(
             {
-                "api_key": "sk-test",
+                "api_key": fake_openai_key("test"),
                 "primary_billing_json": '{"success_cost":0.03,"currency":"USD"}',
             },
             "test-plugin",
@@ -711,7 +719,7 @@ class TestProviderNativeNFallbackMemory(unittest.TestCase):
 
         self._manager = ProviderManager(
             {
-                "api_key": "sk-test",
+                "api_key": fake_openai_key("test"),
                 "base_url": "https://primary.example/v1",
                 "model": "gpt-image-2",
                 "responses_model": "gpt-5.5",
@@ -821,7 +829,7 @@ class TestProviderNativeNFallbackMemory(unittest.TestCase):
         # 创建一个不同的 provider
         other_manager = ProviderManager(
             {
-                "api_key": "sk-other",
+                "api_key": fake_openai_key("other"),
                 "base_url": "https://other.example/v1",
             },
             "test-plugin-native-n",
