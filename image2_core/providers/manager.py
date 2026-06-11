@@ -1634,6 +1634,69 @@ class ProviderManager:
         stats["version"] = PROVIDER_STATS_SCHEMA_VERSION
         self.save_provider_stats()
 
+    # ── Native n unsupported memory ─────────────────────────
+
+    def provider_images_native_n_unsupported(
+        self, provider: ImageAPIProviderConfig
+    ) -> bool:
+        """Check whether the provider is known to reject native n (n>1).
+
+        Reads from ``provider_stats.json`` independent of adaptive priority
+        configuration.
+        """
+        stats = self.load_provider_stats()
+        providers = stats.get("providers", {})
+        if not isinstance(providers, dict):
+            return False
+        item = providers.get(provider.provider_id)
+        if not isinstance(item, dict):
+            return False
+        return bool(item.get("images_native_n_unsupported", False))
+
+    def mark_provider_images_native_n_unsupported(
+        self, provider: ImageAPIProviderConfig, reason: str = ""
+    ) -> None:
+        """Persist that this provider does not support native n.
+
+        Writes to ``provider_stats.json`` regardless of adaptive priority
+        setting, so the knowledge survives restarts.
+        """
+        stats = self.load_provider_stats()
+        providers = stats.setdefault("providers", {})
+        if not isinstance(providers, dict):
+            providers = {}
+            stats["providers"] = providers
+
+        item = providers.get(provider.provider_id)
+        if not isinstance(item, dict):
+            item = {}
+            providers[provider.provider_id] = item
+
+        now = time()
+        item.update(
+            {
+                "images_native_n_unsupported": True,
+                "images_native_n_unsupported_at": now,
+                "name": provider.name,
+                "base_url": provider.base_url,
+                "model": provider.model,
+                "responses_model": provider.responses_model,
+                "configured_order": provider.configured_order,
+                "role": provider.role,
+                "adaptive": provider.adaptive,
+                "updated_at": now,
+            }
+        )
+        if reason:
+            item["images_native_n_unsupported_reason"] = safe_markdown_preview(
+                reason, limit=240
+            )
+
+        # Also set api_mode as a convenience field
+        item["api_mode"] = self.config.get("api_mode", "images")
+
+        self.save_provider_stats()
+
     # ── Failures JSONL ──────────────────────────────────────
 
     def append_provider_failure_record(

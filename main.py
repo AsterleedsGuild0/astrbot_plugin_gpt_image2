@@ -956,6 +956,10 @@ class GPTImage2Plugin(Star):
         self,
         provider: ImageAPIProviderConfig,
     ) -> GPTImageClient:
+        force_single = (
+            provider.force_single_image_requests
+            or self._provider_manager.provider_images_native_n_unsupported(provider)
+        )
         return GPTImageClient(
             api_key=provider.api_key,
             base_url=provider.base_url,
@@ -969,7 +973,7 @@ class GPTImage2Plugin(Star):
             responses_prompt_rewrite_guard=self._provider_manager.prompt_rewrite_guard_enabled(
                 "responses"
             ),
-            force_single_image_requests=provider.force_single_image_requests,
+            force_single_image_requests=force_single,
         )
 
     def _send_copyable_prompt_after_success_enabled(self) -> bool:
@@ -2002,6 +2006,10 @@ class GPTImage2Plugin(Star):
                 )
                 if billing_obs is not None:
                     billing_observations.append(billing_obs)
+                if client.native_n_fallback_used:
+                    self._provider_manager.mark_provider_images_native_n_unsupported(
+                        provider, client.native_n_fallback_reason
+                    )
                 self._provider_manager.record_image_provider_result(
                     provider,
                     success=True,
@@ -2016,6 +2024,10 @@ class GPTImage2Plugin(Star):
                 if billing_obs is not None:
                     billing_observations.append(billing_obs)
                 provider_elapsed = self._provider_exception_elapsed_ms(e)
+                if client.native_n_fallback_used:
+                    self._provider_manager.mark_provider_images_native_n_unsupported(
+                        provider, client.native_n_fallback_reason
+                    )
                 self._provider_manager.record_image_provider_result(
                     provider,
                     success=False,
@@ -2088,6 +2100,10 @@ class GPTImage2Plugin(Star):
                 billing_obs = self._billing_observation_from_error(e)
                 if billing_obs is not None:
                     billing_observations.append(billing_obs)
+                if client.native_n_fallback_used:
+                    self._provider_manager.mark_provider_images_native_n_unsupported(
+                        provider, client.native_n_fallback_reason
+                    )
                 logger.error(
                     "[GPTImage2] draw unexpected error "
                     f"action={action} provider={provider.name} "

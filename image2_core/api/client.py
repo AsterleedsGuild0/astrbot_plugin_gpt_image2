@@ -104,6 +104,8 @@ class GPTImageClient:
         self.force_single_image_requests = force_single_image_requests
         self.last_request_elapsed_ms: int | None = None
         self._request_group_started_at: float | None = None
+        self.native_n_fallback_used: bool = False
+        self.native_n_fallback_reason: str = ""
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -337,6 +339,11 @@ class GPTImageClient:
         mentions_n = any(
             marker in lower for marker in ('"n"', "'n'", "`n`", " n ", "parameter n")
         )
+        # 检查参数路径嵌套引用 .n（如 tools[0].n、'tools[0].n'）
+        if not mentions_n:
+            import re as _re
+
+            mentions_n = bool(_re.search(r"\.n(?:'|\"|\s|$)", lower))
         unsupported = any(
             phrase in lower
             for phrase in {
@@ -436,6 +443,8 @@ class GPTImageClient:
         自动使用多次单图请求补足。
         """
         self._reset_last_request_elapsed_ms()
+        self.native_n_fallback_used = False
+        self.native_n_fallback_reason = ""
         n = self._normalize_n(params.n)
         params = self._params_with_n(params, n)
         if n == 1:
@@ -455,6 +464,8 @@ class GPTImageClient:
                 "[GPTImage2] Images API native n unsupported, "
                 f"fallback to batch generate n={n} error={e}"
             )
+            self.native_n_fallback_used = True
+            self.native_n_fallback_reason = str(e)[:500]
             return await self._generate_images_api_batch(prompt, params, n=n)
 
         if len(results) >= n:
@@ -671,6 +682,8 @@ class GPTImageClient:
         自动使用多次单图请求补足。
         """
         self._reset_last_request_elapsed_ms()
+        self.native_n_fallback_used = False
+        self.native_n_fallback_reason = ""
         n = self._normalize_n(params.n)
         params = self._params_with_n(params, n)
         if n == 1:
@@ -691,6 +704,8 @@ class GPTImageClient:
                 "[GPTImage2] Images API native n unsupported, "
                 f"fallback to batch edit n={n} error={e}"
             )
+            self.native_n_fallback_used = True
+            self.native_n_fallback_reason = str(e)[:500]
             return await self._edit_images_api_batch(prompt, image_paths, params, n=n)
 
         if len(results) >= n:

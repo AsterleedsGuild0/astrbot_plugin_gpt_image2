@@ -702,5 +702,141 @@ class TestBillingMessages(unittest.TestCase):
         self.assertIn("手动锚点估算", markdown)
 
 
+class TestProviderNativeNFallbackMemory(unittest.TestCase):
+    """``provider_images_native_n_unsupported`` / ``mark_provider_images_native_n_unsupported`` 持久化与读取。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._stats_path = Path(self._tmpdir) / "provider_stats.json"
+
+        self._manager = ProviderManager(
+            {
+                "api_key": "sk-test",
+                "base_url": "https://primary.example/v1",
+                "model": "gpt-image-2",
+                "responses_model": "gpt-5.5",
+            },
+            "test-plugin-native-n",
+        )
+        # 将 stats 路径指向临时目录
+        self._manager.provider_stats_path = lambda: self._stats_path  # type: ignore[method-assign]
+
+        self._provider = self._manager.get_image_api_provider_configs()[0]
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_fresh_provider_returns_false(self):
+        """新 Provider 的 images_native_n_unsupported 应为 False。"""
+        self.assertFalse(
+            self._manager.provider_images_native_n_unsupported(self._provider)
+        )
+
+    def test_mark_then_check_returns_true(self):
+        """mark 后 provider_images_native_n_unsupported 返回 True。"""
+        self._manager.mark_provider_images_native_n_unsupported(
+            self._provider, "HTTP 400 Unknown parameter: 'n'."
+        )
+        self.assertTrue(
+            self._manager.provider_images_native_n_unsupported(self._provider)
+        )
+
+    def test_mark_without_reason_still_reads_true(self):
+        """不带 reason 调用 mark，unsupported 仍为 True。"""
+        self._manager.mark_provider_images_native_n_unsupported(self._provider)
+        self.assertTrue(
+            self._manager.provider_images_native_n_unsupported(self._provider)
+        )
+
+    def test_mark_persists_to_disk(self):
+        """mark 写入磁盘后，重新加载 reader 仍为 True。"""
+        self._manager.mark_provider_images_native_n_unsupported(
+            self._provider, "HTTP 400 Unknown parameter: 'n'."
+        )
+        # 清理缓存，重新加载
+        self._manager._provider_stats_cache = None
+        self.assertTrue(
+            self._manager.provider_images_native_n_unsupported(self._provider)
+        )
+
+    def test_mark_stores_reason_field(self):
+        """mark 时写入 reason 字段。"""
+        reason = "HTTP 400 Unknown parameter: 'tools[0].n'."
+        self._manager.mark_provider_images_native_n_unsupported(self._provider, reason)
+        stats = self._manager.load_provider_stats()
+        item = stats["providers"].get(self._provider.provider_id, {})
+        self.assertTrue(item.get("images_native_n_unsupported"))
+        self.assertIn("tools[0]", item.get("images_native_n_unsupported_reason", ""))
+        self.assertIn("images_native_n_unsupported_at", item)
+
+    def test_mark_stores_provider_metadata(self):
+        """mark 也会更新 provider 基础元信息字段。"""
+        self._manager.mark_provider_images_native_n_unsupported(
+            self._provider, "some error"
+        )
+        stats = self._manager.load_provider_stats()
+        item = stats["providers"].get(self._provider.provider_id, {})
+        self.assertEqual(item.get("name"), self._provider.name)
+        self.assertEqual(item.get("base_url"), self._provider.base_url)
+        self.assertEqual(item.get("model"), self._provider.model)
+        self.assertEqual(item.get("role"), self._provider.role)
+        self.assertIn("updated_at", item)
+
+    def test_independent_of_adaptive_priority_off(self):
+        """adaptive priority 关闭时仍能读取和标记。"""
+        # 不启用 adaptive
+        self._manager.mark_provider_images_native_n_unsupported(
+            self._provider, "n not supported"
+        )
+        # 验证已写入
+        self.assertTrue(
+            self._manager.provider_images_native_n_unsupported(self._provider)
+        )
+        # 再次确认磁盘持久化
+        self._manager._provider_stats_cache = None
+        self.assertTrue(
+            self._manager.provider_images_native_n_unsupported(self._provider)
+        )
+
+    def test_survives_cache_clear_not_file_content(self):
+        """缓存清除后不改变已持久化的值。"""
+        self._manager.mark_provider_images_native_n_unsupported(self._provider, "error")
+        # 直接修改文件中的值
+        stats = self._manager.load_provider_stats()
+        stats["providers"][self._provider.provider_id][
+            "images_native_n_unsupported"
+        ] = False
+        self._manager.save_provider_stats()
+
+        self._manager._provider_stats_cache = None
+        self.assertFalse(
+            self._manager.provider_images_native_n_unsupported(self._provider)
+        )
+
+    def test_different_provider_does_not_interfere(self):
+        """另一个 Provider 的标记不影响当前 Provider。"""
+        self._manager.mark_provider_images_native_n_unsupported(self._provider, "error")
+        # 创建一个不同的 provider
+        other_manager = ProviderManager(
+            {
+                "api_key": "sk-other",
+                "base_url": "https://other.example/v1",
+            },
+            "test-plugin-native-n",
+        )
+        other_manager.provider_stats_path = lambda: self._stats_path  # type: ignore[method-assign]
+        other_providers = other_manager.get_image_api_provider_configs()
+        other_provider = other_providers[0]
+
+        self.assertTrue(
+            self._manager.provider_images_native_n_unsupported(self._provider)
+        )
+        self.assertFalse(
+            self._manager.provider_images_native_n_unsupported(other_provider)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

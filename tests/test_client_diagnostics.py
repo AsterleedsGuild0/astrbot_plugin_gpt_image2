@@ -15,7 +15,12 @@ astrbot_api.logger = MagicMock()
 sys.modules["astrbot"] = MagicMock()
 sys.modules["astrbot.api"] = astrbot_api
 
-from image2_core.api.client import GPTImageClient, HTTPDiagnostics, ImageParams  # noqa: E402
+from image2_core.api.client import (  # noqa: E402
+    GPTImageClient,
+    HTTPDiagnostics,
+    ImageParams,
+    ImageResult,
+)
 
 
 class TestResponseJsonSummary(unittest.TestCase):
@@ -284,6 +289,165 @@ class TestForceSingleImageRequests(unittest.IsolatedAsyncioTestCase):
         client._edit_images_api_batch.assert_awaited_once()
         batch_kwargs = client._edit_images_api_batch.await_args.kwargs
         self.assertEqual(batch_kwargs["n"], 2)
+
+
+class TestShouldFallbackImagesNativeNError(unittest.TestCase):
+    """_should_fallback_images_native_n_error 对 nested 参数路径错误返回 True。"""
+
+    def test_tools_0_n_quoted(self):
+        """'tools[0].n' 应触发 fallback。"""
+        msg = "HTTP 400 Unknown parameter: 'tools[0].n'."
+        self.assertTrue(GPTImageClient._should_fallback_images_native_n_error(msg))
+
+    def test_tools_0_n_unquoted(self):
+        """tools[0].n (无引号) 应触发 fallback。"""
+        msg = "HTTP 400 unknown parameter: tools[0].n"
+        self.assertTrue(GPTImageClient._should_fallback_images_native_n_error(msg))
+
+    def test_non_n_param_does_not_trigger(self):
+        """tools[0].size 等非 n 参数不应触发 fallback。"""
+        msg = "HTTP 400 Unknown parameter: 'tools[0].size'."
+        self.assertFalse(GPTImageClient._should_fallback_images_native_n_error(msg))
+
+    def test_standard_unknown_param_n_still_detected(self):
+        """原有的 'unknown parameter: n' 仍能被检测。"""
+        msg = "HTTP 400 Unknown parameter: 'n'."
+        self.assertTrue(GPTImageClient._should_fallback_images_native_n_error(msg))
+
+    def test_http_422_nested_n(self):
+        """HTTP 422 + nested .n 也应触发 fallback。"""
+        msg = "HTTP 422 Unprocessable: unknown parameter 'tools[0].n'"
+        self.assertTrue(GPTImageClient._should_fallback_images_native_n_error(msg))
+
+
+class TestNativeNFallbackTracking(unittest.IsolatedAsyncioTestCase):
+    """``native_n_fallback_used`` / ``native_n_fallback_reason`` 正确标记。"""
+
+    def _client(self, force_single: bool = False) -> GPTImageClient:
+        return GPTImageClient(
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            model="gpt-image-2",
+            responses_model="gpt-5.5",
+            force_single_image_requests=force_single,
+        )
+
+    async def test_native_n_unsupported_error_sets_fallback_flag(self):
+        """原生 n 不兼容错误触发 fallback 时标记为 True。"""
+        client = self._client()
+        client._generate_images_api_once = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("HTTP 400 Unknown parameter: 'tools[0].n'.")
+        )
+        client._generate_images_api_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=[ImageResult(b64_json="abc")]
+        )
+
+        params = ImageParams(n=2)
+        await client.generate_images_api("prompt", params)
+
+        self.assertTrue(client.native_n_fallback_used)
+        self.assertIn("Unknown parameter", client.native_n_fallback_reason)
+
+    async def test_force_single_does_not_set_fallback_flag(self):
+        """force_single_image_requests 时不标记 fallback。"""
+        client = self._client(force_single=True)
+        client._generate_images_api_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=[ImageResult(b64_json="abc")]
+        )
+
+        params = ImageParams(n=2)
+        await client.generate_images_api("prompt", params)
+
+        self.assertFalse(client.native_n_fallback_used)
+        self.assertEqual(client.native_n_fallback_reason, "")
+
+    async def test_n_1_does_not_set_fallback_flag(self):
+        """n=1 时直接返回，不标记 fallback。"""
+        client = self._client()
+        client._generate_images_api_once = AsyncMock(  # type: ignore[method-assign]
+            return_value=[ImageResult(b64_json="abc")]
+        )
+
+        params = ImageParams(n=1)
+        await client.generate_images_api("prompt", params)
+
+        self.assertFalse(client.native_n_fallback_used)
+        self.assertEqual(client.native_n_fallback_reason, "")
+
+    async def test_partial_results_supplement_not_fallback(self):
+        """原生 n 返回数量不足后的补请求不应误标记。"""
+        client = self._client()
+        first_call = True
+
+        async def _generate_images_api_once(prompt, params):  # noqa: ARG001
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                return [ImageResult(b64_json="abc")]
+            return [ImageResult(b64_json="def")]
+
+        client._generate_images_api_once = (  # type: ignore[method-assign]
+            _generate_images_api_once
+        )
+        client._generate_images_api_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=[ImageResult(b64_json="extra")]
+        )
+
+        params = ImageParams(n=2)
+        await client.generate_images_api("prompt", params)
+
+        # native n returned len(results)=1 < n=2, supplement triggered
+        self.assertFalse(client.native_n_fallback_used)
+        self.assertEqual(client.native_n_fallback_reason, "")
+
+    async def test_non_n_error_does_not_set_fallback_flag(self):
+        """非 n 相关 RuntimeError 不会触发 fallback 标记。"""
+        client = self._client()
+        client._generate_images_api_once = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("HTTP 500 Internal Server Error")
+        )
+        client._generate_images_api_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=[ImageResult(b64_json="abc")]
+        )
+
+        params = ImageParams(n=2)
+        with self.assertRaises(RuntimeError):
+            await client.generate_images_api("prompt", params)
+
+        self.assertFalse(client.native_n_fallback_used)
+        self.assertEqual(client.native_n_fallback_reason, "")
+
+    async def test_edit_native_n_unsupported_sets_fallback_flag(self):
+        """edit_images_api 原生 n 不兼容也标记。"""
+        client = self._client()
+        error_msg = "HTTP 400 Unknown parameter: 'n'."
+        client._edit_images_api_once = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError(error_msg)
+        )
+        client._edit_images_api_batch = AsyncMock(  # type: ignore[method-assign]
+            return_value=[ImageResult(b64_json="abc")]
+        )
+
+        params = ImageParams(n=2)
+        await client.edit_images_api("prompt", ["input.png"], params)
+
+        self.assertTrue(client.native_n_fallback_used)
+        self.assertIn("Unknown parameter", client.native_n_fallback_reason)
+
+    async def test_fallback_flag_reset_on_new_call(self):
+        """每次 generate 或 edit 开始时重置标记。"""
+        client = self._client()
+        client.native_n_fallback_used = True
+        client.native_n_fallback_reason = "old"
+
+        client._generate_images_api_once = AsyncMock(  # type: ignore[method-assign]
+            return_value=[ImageResult(b64_json="abc")]
+        )
+        params = ImageParams(n=1)
+        await client.generate_images_api("prompt", params)
+
+        self.assertFalse(client.native_n_fallback_used)
+        self.assertEqual(client.native_n_fallback_reason, "")
 
 
 if __name__ == "__main__":
