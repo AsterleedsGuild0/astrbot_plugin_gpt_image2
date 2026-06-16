@@ -46,6 +46,8 @@
 | `/plan quit` | 退出 Plan 会话 |
 | `/image2 mode [images\|responses]` | 查看或切换全局 API 模式（管理员） |
 | `/image2 guard [images\|responses\|all] [on\|off]` | 切换 Prompt Guard（管理员） |
+| `/image2 on` / `/image2 off` | 启用/关闭当前群/会话 Image2，默认开启（管理员） |
+| `/image2 status` | 查看当前群/会话 Image2 开关状态 |
 | `/image2 retry [global\|here\|interval] ...` | 控制备用站点重试提示（管理员） |
 | `/image2 providers` | 查看站点状态、可用模式、健康和固定参考成本（管理员） |
 | `/image2 balance` | 实时查询已配置余额接口的站点余额（管理员） |

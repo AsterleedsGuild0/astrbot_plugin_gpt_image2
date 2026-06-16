@@ -204,6 +204,7 @@
 | `response_format_b64_json` | bool | `true` | 请求返回 Base64 图片 |
 | `max_input_images` | int | `4` | 最多输入参考图数量 |
 | `draw_aliases` | list | `[]` | 触发统一 `/image2 draw` 的自定义前缀 |
+| `image2_enabled_sessions` | text/json | `{}` | 按群/会话覆盖 Image2 开关的 JSON；缺失或未配置的键默认开启 |
 | `save_outputs` | bool | `true` | 保存生成结果到本地 |
 | `send_copyable_prompt_after_success` | bool | `true` | Plan 成功后发送合并转发可复制命令 |
 | `render_text_as_image` | bool | `true` | 文本回复优先渲染为卡片图片 |
