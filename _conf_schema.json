@@ -147,6 +147,12 @@
     "default": "{}",
     "hint": "JSON 对象，key 为群号或会话来源，value 为 true/false。通常不需要手动编辑，推荐使用 /image2 retry here on/off 在当前群或私聊会话中切换。"
   },
+  "image2_enabled_sessions": {
+    "description": "按群/会话控制 Image2 开关",
+    "type": "string",
+    "default": "{}",
+    "hint": "JSON 对象，key 为群号或会话来源，value 为 true/false。未配置的群/会话默认允许使用 Image2。通常不需要手动编辑，推荐由群管理员/群主或 Bot 管理员（例如猫猫头的管理员）使用 /image2 on/off 在当前群或私聊会话中切换。关闭后普通 Image2 功能会被拒绝，管理员仍可使用开关、状态、帮助和诊断类命令。"
+  },
   "size": {
     "description": "图片尺寸",
     "type": "string",

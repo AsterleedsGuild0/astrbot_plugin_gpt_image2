@@ -10,6 +10,7 @@
   /image2 mode [模式]    查看/切换 API 模式（管理员）
   /image2 guard          查看/切换 Prompt Guard（管理员）
   /image2 retry          查看/切换备用站点重试提示（管理员）
+  /image2 on|off         启用/关闭当前群/会话 Image2（管理员）
   /image2 providers      查看生图站点状态（管理员）
   /image2 stats          查看 Provider 统计与诊断（管理员）
   /image2 diag           生成诊断包（管理员）
@@ -20,9 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Iterable
 import hashlib
 import io
 import inspect
+import json
 from pathlib import Path
 import time as _time_module
 from time import perf_counter, time
@@ -217,6 +220,7 @@ class GPTImage2Plugin(Star):
         self._provider_retry_notice_state = (
             self._provider_manager._provider_retry_notice_state
         )
+        self._bot_display_name_cache: dict[str, str] = {}
 
     # ── 工具方法 ────────────────────────────────────────────────
 
@@ -989,6 +993,266 @@ class GPTImage2Plugin(Star):
         session_key = self._provider_retry_notice_session_key(event)
         sessions = self._provider_manager.provider_retry_notice_session_config()
         return sessions.get(session_key, True)
+
+    def _image2_session_key(self, event: AstrMessageEvent) -> str:
+        """Image2 开关按群优先隔离；私聊退化为会话来源。"""
+        return str(event.get_group_id() or event.unified_msg_origin or "-")
+
+    def _image2_session_config(self) -> dict[str, bool]:
+        value = self.config.get("image2_enabled_sessions", {})
+        if isinstance(value, dict):
+            items = value.items()
+        elif isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = {}
+            items = parsed.items() if isinstance(parsed, dict) else []
+        else:
+            items = []
+
+        result: dict[str, bool] = {}
+        for key, raw in items:
+            session_key = str(key or "").strip()
+            if not session_key:
+                continue
+            result[session_key] = normalize_bool(raw, default=True)
+        return result
+
+    def _set_image2_session_enabled(self, session_key: str, enabled: bool) -> None:
+        sessions = self._image2_session_config()
+        sessions[session_key] = enabled
+        self.config["image2_enabled_sessions"] = json.dumps(
+            sessions,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _image2_session_enabled(self, event: AstrMessageEvent) -> bool:
+        session_key = self._image2_session_key(event)
+        return self._image2_session_config().get(session_key, True)
+
+    async def _image2_status_text(self, event: AstrMessageEvent) -> str:
+        session_key = self._image2_session_key(event)
+        enabled = self._image2_session_enabled(event)
+        bot_name = await self._bot_display_name(event)
+        return (
+            "## 🔌 当前群/会话 Image2 开关\n\n"
+            f"- 会话键：`{session_key}`\n"
+            f"- 当前状态：{prompt_rewrite_guard_status(enabled)}\n\n"
+            f"{bot_name}现在{'可以' if enabled else '暂时不能'}在这里帮大家处理 Image2 请求。\n\n"
+            "用法：`/image2 on` / `/image2 off` / `/image2 status`\n\n"
+            "关闭后，本群/会话内普通 Image2 功能会被拒绝；"
+            "管理员仍可使用开关、状态、帮助和诊断类命令。"
+        )
+
+    async def _image2_disabled_text(self, event: AstrMessageEvent) -> str:
+        session_key = self._image2_session_key(event)
+        bot_name = await self._bot_display_name(event)
+        bot_admin_label = await self._bot_admin_label(event)
+        return (
+            f"## 💤 {bot_name}的 Image2 暂时休息中\n\n"
+            f"- 会话键：`{session_key}`\n\n"
+            f"如果需要{bot_name}继续帮忙处理图片，请让群管理员/群主或 {bot_admin_label}发送 "
+            "`/image2 on`。"
+        )
+
+    @staticmethod
+    def _clean_display_name(value: object) -> str | None:
+        if callable(value):
+            return None
+        text = str(value or "").strip()
+        if not text or text.lower() in {"none", "null", "unknown"}:
+            return None
+        if any(
+            marker in text
+            for marker in (
+                "functools.partial",
+                "<bound method",
+                "<function",
+                " object at 0x",
+            )
+        ):
+            return None
+        return text
+
+    async def _maybe_await_value(self, value: object) -> object:
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    def _bot_display_name_cache_key(self, event: AstrMessageEvent, scope: str) -> str:
+        return ":".join(
+            (
+                scope,
+                str(event.get_platform_name() or "-"),
+                str(event.get_platform_id() or "-"),
+                str(event.get_group_id() or "-"),
+                str(event.get_self_id() or "-"),
+            )
+        )
+
+    async def _bot_display_name_from_group(self, event: AstrMessageEvent) -> str | None:
+        group_id = event.get_group_id()
+        self_id = event.get_self_id()
+        if not group_id or not self_id:
+            return None
+
+        cache_key = self._bot_display_name_cache_key(event, "group")
+        cached = self._bot_display_name_cache.get(cache_key)
+        if cached:
+            return cached
+
+        bot = self._event_bot(event)
+        if bot is None:
+            return None
+        call_action = getattr(bot, "call_action", None)
+        if not callable(call_action):
+            return None
+
+        try:
+            info = await self._maybe_await_value(
+                call_action(
+                    "get_group_member_info",
+                    group_id=int(group_id),
+                    user_id=int(self_id),
+                    no_cache=False,
+                )
+            )
+        except Exception as e:
+            logger.debug(
+                "[GPTImage2] get bot group display name failed "
+                f"{self._event_context(event)} error={type(e).__name__}: {e}"
+            )
+            return None
+
+        if not isinstance(info, dict):
+            return None
+        data = info.get("data")
+        if isinstance(data, dict):
+            info = data
+        name = self._clean_display_name(info.get("card")) or self._clean_display_name(
+            info.get("nickname")
+        )
+        if name:
+            self._bot_display_name_cache[cache_key] = name
+        return name
+
+    async def _bot_display_name_from_login(self, event: AstrMessageEvent) -> str | None:
+        cache_key = self._bot_display_name_cache_key(event, "login")
+        cached = self._bot_display_name_cache.get(cache_key)
+        if cached:
+            return cached
+
+        bot = self._event_bot(event)
+        if bot is None:
+            return None
+        call_action = getattr(bot, "call_action", None)
+        if not callable(call_action):
+            return None
+
+        try:
+            info = await self._maybe_await_value(call_action("get_login_info"))
+        except Exception as e:
+            logger.debug(
+                "[GPTImage2] get bot login display name failed "
+                f"{self._event_context(event)} error={type(e).__name__}: {e}"
+            )
+            return None
+
+        if not isinstance(info, dict):
+            return None
+        data = info.get("data")
+        if isinstance(data, dict):
+            info = data
+        name = self._clean_display_name(info.get("nickname"))
+        if name:
+            self._bot_display_name_cache[cache_key] = name
+        return name
+
+    def _bot_display_name_from_static_fields(
+        self, event: AstrMessageEvent
+    ) -> str | None:
+        """Best-effort bot display name for friendlier user-facing messages."""
+        candidates: list[object] = []
+        for obj in (event, getattr(event, "message_obj", None), self.context):
+            if obj is None:
+                continue
+            for attr in (
+                "bot_name",
+                "bot_nickname",
+                "self_name",
+                "self_nickname",
+                "nickname",
+                "nick_name",
+                "display_name",
+                "name",
+            ):
+                candidates.append(getattr(obj, attr, None))
+
+        for key in ("bot_name", "bot_nickname", "self_name", "nickname"):
+            candidates.append(self.config.get(key))
+
+        for candidate in candidates:
+            name = self._clean_display_name(candidate)
+            if name:
+                return name
+        return None
+
+    async def _bot_display_name(self, event: AstrMessageEvent) -> str:
+        return (
+            await self._bot_display_name_from_login(event)
+            or await self._bot_display_name_from_group(event)
+            or self._bot_display_name_from_static_fields(event)
+            or "我"
+        )
+
+    async def _bot_admin_label(self, event: AstrMessageEvent) -> str:
+        bot_name = await self._bot_display_name(event)
+        if bot_name == "我":
+            return "我的管理员"
+        return f"{bot_name}的管理员"
+
+    @staticmethod
+    def _string_set(values: object) -> set[str]:
+        if values is None:
+            return set()
+        if isinstance(values, (str, int)):
+            return {str(values).strip()} if str(values).strip() else set()
+        if isinstance(values, dict):
+            values = values.values()
+        if isinstance(values, Iterable):
+            return {str(item).strip() for item in values if str(item).strip()}
+        value = str(values).strip()
+        return {value} if value else set()
+
+    def _is_group_image2_admin(self, event: AstrMessageEvent) -> bool:
+        sender_id = str(event.get_sender_id() or "").strip()
+        if not sender_id:
+            return False
+
+        get_message_obj = getattr(event, "get_message_obj", None)
+        message_obj = get_message_obj() if callable(get_message_obj) else None
+        group = getattr(message_obj, "group", None)
+        if group is None:
+            group = getattr(event, "group", None)
+        if group is None:
+            return False
+
+        owners = self._string_set(
+            getattr(group, "group_owner", None)
+            or getattr(group, "owner", None)
+            or getattr(group, "owner_id", None)
+        )
+        admins = self._string_set(
+            getattr(group, "group_admins", None)
+            or getattr(group, "admins", None)
+            or getattr(group, "admin_ids", None)
+        )
+        return sender_id in owners or sender_id in admins
+
+    def _can_manage_image2_switch(self, event: AstrMessageEvent) -> bool:
+        return bool(event.is_admin() or self._is_group_image2_admin(event))
 
     def _provider_retry_notice_enabled(self, event: AstrMessageEvent) -> bool:
         return (
@@ -2216,6 +2480,8 @@ class GPTImage2Plugin(Star):
             self._provider_manager.provider_retry_notice_global_enabled()
         )
         retry_notice_interval = self._provider_manager.provider_retry_notice_interval()
+        image2_status = prompt_rewrite_guard_status(self._image2_session_enabled(event))
+        image2_session_key = self._image2_session_key(event)
         images_guard_status = prompt_rewrite_guard_status(
             self._provider_manager.prompt_rewrite_guard_enabled("images")
         )
@@ -2258,6 +2524,8 @@ class GPTImage2Plugin(Star):
             "查看/切换 Prompt Guard（管理员）\n"
             "- `/image2 retry [global|here|interval] ...` — "
             "查看/切换备用站点重试提示（管理员）\n"
+            "- `/image2 on` / `/image2 off` — 启用/关闭当前群/会话 Image2（管理员）\n"
+            "- `/image2 status` — 查看当前群/会话 Image2 开关状态\n"
             "- `/image2 providers` — 查看生图站点状态与当前模式可用性（管理员）\n"
             "- `/image2 costs` — 查看费用统计（管理员）\n"
             "- `/image2 costs recent [N]` — 查看最近 N 条费用事件（管理员）\n"
@@ -2281,6 +2549,7 @@ class GPTImage2Plugin(Star):
             f"| 生图 API 站点 | {image_provider_count} 个（当前模式可用 {viable_provider_count} 个） |\n"
             f"| 自适应站点优先级 | {adaptive_status} |\n"
             f"| 备用站点重试提示 | {retry_notice_status}，间隔 {format_duration(retry_notice_interval)} |\n"
+            f"| 当前群/会话 Image2 开关 | {image2_status}（`{image2_session_key}`） |\n"
             f"| draw 别名 | {draw_aliases_status} |\n"
             f"| Plan 模型 | `{cfg.get('plan_model', 'gpt-5.4')}` |\n"
             f"| Plan 空闲超时 | {cfg.get('plan_timeout', 300)} 秒 |\n"
@@ -2294,6 +2563,7 @@ class GPTImage2Plugin(Star):
             f"- `/image2 mode` 是全局模式，会影响 draw/edit 的站点过滤。\n"
             f"- draw/edit 只会尝试支持当前模式的站点；不支持的站点会被跳过。\n"
             f"- `/image2 retry here off` 可关闭当前群/会话的备用站点切换提示。\n"
+            f"- `/image2 off` 可关闭当前群/会话 Image2，默认开启。\n"
             f"- draw 别名只在消息开头匹配，且要求别名后接空白和提示词。\n"
             f"- 站点明细请使用 `/image2 providers` 查看。\n"
             f"- `/image2 plan` 进入后，下面缩进的是 Plan 子命令。"
@@ -2586,6 +2856,56 @@ class GPTImage2Plugin(Star):
             "可用目标：`global` / `here` / `interval`\n\n"
             + self._provider_retry_notice_status_text(event),
             action="retry-invalid-target",
+        )
+
+    async def _handle_image2_switch(self, event: AstrMessageEvent, enabled: bool):
+        """切换当前群/会话 Image2 开关。"""
+        logger.info(
+            "[GPTImage2] image2 switch command received "
+            f"{self._event_context(event)} enabled={enabled}"
+        )
+
+        if not self._can_manage_image2_switch(event):
+            bot_admin_label = await self._bot_admin_label(event)
+            return await self._text_result(
+                event,
+                "## 🚫 权限不足\n\n"
+                f"需要群管理员/群主或 {bot_admin_label}才能切换当前群/会话 Image2 开关。",
+                action="image2-switch-permission-denied",
+            )
+
+        session_key = self._image2_session_key(event)
+        old_value = self._image2_session_enabled(event)
+        self._set_image2_session_enabled(session_key, enabled)
+        saved = self._save_config()
+        suffix = "已保存到插件配置。" if saved else "但当前配置对象不支持自动保存。"
+        return await self._text_result(
+            event,
+            "## ✅ 当前群/会话 Image2 开关已更新\n\n"
+            f"- 会话键：`{session_key}`\n"
+            f"- 状态：{prompt_rewrite_guard_status(old_value)} → "
+            f"{prompt_rewrite_guard_status(enabled)}\n\n"
+            f"{suffix}",
+            action="image2-switch-updated",
+        )
+
+    @image2.command("on")
+    async def image2_on(self, event: AstrMessageEvent):
+        """启用当前群/会话 Image2（管理员）"""
+        yield await self._handle_image2_switch(event, True)
+
+    @image2.command("off")
+    async def image2_off(self, event: AstrMessageEvent):
+        """关闭当前群/会话 Image2（管理员）"""
+        yield await self._handle_image2_switch(event, False)
+
+    @image2.command("status")
+    async def image2_status(self, event: AstrMessageEvent):
+        """查看当前群/会话 Image2 开关状态"""
+        yield await self._text_result(
+            event,
+            await self._image2_status_text(event),
+            action="image2-status",
         )
 
     @image2.command("providers")
@@ -3168,6 +3488,17 @@ class GPTImage2Plugin(Star):
             )
             return
 
+        if not self._image2_session_enabled(event):
+            logger.info(
+                f"[GPTImage2] plan rejected image2 disabled {self._event_context(event)}"
+            )
+            yield await self._text_result(
+                event,
+                await self._image2_disabled_text(event),
+                action="plan-image2-disabled",
+            )
+            return
+
         if not bool(self.config.get("plan_enabled", True)):
             yield await self._text_result(
                 event,
@@ -3276,6 +3607,16 @@ class GPTImage2Plugin(Star):
                 controller.stop()
                 return
 
+            if not self._image2_session_enabled(next_event):
+                await self._send_text(
+                    next_event,
+                    await self._image2_disabled_text(next_event),
+                    action="plan-image2-disabled-active",
+                )
+                self._cleanup_plan(session_id)
+                controller.stop()
+                return
+
             # ── 重试上一条失败的 Plan 输入 ─────────────────────
             if text_lower in {
                 "/image2 plan retry",
@@ -3352,6 +3693,23 @@ class GPTImage2Plugin(Star):
                 }
                 or plan_input_lower == "confirm"
             ):
+                if not self._image2_session_enabled(next_event):
+                    await self._send_text(
+                        next_event,
+                        await self._image2_disabled_text(next_event),
+                        action="plan-confirm-image2-disabled",
+                    )
+                    controller.keep(
+                        timeout=self._waiter_timeout(plan_config.timeout),
+                        reset_timeout=True,
+                    )
+                    self._reset_plan_timeout_watchdog(
+                        session_id,
+                        next_event.unified_msg_origin,
+                        plan_config.timeout,
+                    )
+                    return
+
                 session = self._plan_sessions.get(session_id)
                 if session and session.final_prompt:
                     self._dedupe_plan_reference_images(session)
@@ -3626,6 +3984,17 @@ class GPTImage2Plugin(Star):
     ):
         """统一 draw 实现：自动根据消息/引用中的图片决定是否图生图。"""
         started = task_started if task_started is not None else perf_counter()
+        if not self._image2_session_enabled(event):
+            logger.info(
+                f"[GPTImage2] draw rejected image2 disabled {self._event_context(event)}"
+            )
+            yield await self._text_result(
+                event,
+                await self._image2_disabled_text(event),
+                action=f"{action}-image2-disabled",
+            )
+            return
+
         if not prompt or not prompt.strip():
             logger.info(
                 f"[GPTImage2] draw rejected empty prompt {self._event_context(event)}"
@@ -3713,6 +4082,17 @@ class GPTImage2Plugin(Star):
     ):
         """显式 `/image2 edit` 实现：必须检测到输入图片。"""
         started = task_started if task_started is not None else perf_counter()
+        if not self._image2_session_enabled(event):
+            logger.info(
+                f"[GPTImage2] edit rejected image2 disabled {self._event_context(event)}"
+            )
+            yield await self._text_result(
+                event,
+                await self._image2_disabled_text(event),
+                action="edit-image2-disabled",
+            )
+            return
+
         if not prompt or not prompt.strip():
             logger.info(
                 f"[GPTImage2] edit rejected empty prompt {self._event_context(event)}"
