@@ -114,6 +114,17 @@ git diff --check
 
 ---
 
+## 致谢
+
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot)：提供插件运行框架与生态。
+- [CookSleep/gpt_image_playground](https://github.com/CookSleep/gpt_image_playground)：本项目的 GPT Image2 API 交互、文生图/参考图/编辑等核心逻辑主要从该项目的设计与实现中提取并改写为 AstrBot 插件形态。
+- [exynos967/AstrBot_plugin_openai_image-command](https://github.com/exynos967/AstrBot_plugin_openai_image-command)：本项目开发过程中参考了其 AstrBot 图像生成插件实现与项目组织方式。
+- [miaoxutao123/AstrBot_plugin_gemini2point5image-openrouter](https://github.com/miaoxutao123/AstrBot_plugin_gemini2point5image-openrouter)：上述参考项目的上游来源之一。
+
+---
+
 ## 许可证
 
-MIT
+本项目采用 [GNU Affero General Public License v3.0](./LICENSE)（AGPL-3.0）开源。
+
+参考项目 `CookSleep/gpt_image_playground` 使用 MIT License；`exynos967/AstrBot_plugin_openai_image-command` 使用 AGPL-3.0。MIT License 与 AGPL-3.0 兼容，本项目结合上述参考来源后以 AGPL-3.0 发布。使用、修改或分发本项目时，请遵守 `LICENSE` 中的完整条款。
