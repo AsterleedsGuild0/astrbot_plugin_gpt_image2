@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 Git tag，例如 v0.5.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyyaml pytest pytest-asyncio
+
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import tomllib
+          from pathlib import Path
+
+          import yaml
+
+          tag = os.environ["RELEASE_TAG"]
+          metadata = yaml.safe_load(Path("metadata.yaml").read_text(encoding="utf-8"))
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+          metadata_version = metadata.get("version")
+          project_version = project["project"]["version"]
+          expected_project_version = tag.removeprefix("v")
+
+          errors = []
+          if metadata_version != tag:
+              errors.append(f"metadata.yaml version {metadata_version!r} != tag {tag!r}")
+          if project_version != expected_project_version:
+              errors.append(
+                  f"pyproject.toml version {project_version!r} != {expected_project_version!r}"
+              )
+
+          if errors:
+              raise SystemExit("\n".join(errors))
+          PY
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Build plugin archive
+        run: python scripts/package_plugin.py
+
+      - name: Extract release notes
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import os
+          import re
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = re.compile(
+              rf"^##\s+{re.escape(tag)}(?:\s+-\s+[^\n]+)?\n(?P<body>.*?)(?=\n---\n\n##\s+|\n##\s+v|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          match = pattern.search(changelog)
+          if not match:
+              raise SystemExit(f"Cannot find {tag} section in CHANGELOG.md")
+
+          body = match.group("body").strip()
+          Path("release-notes.md").write_text(body + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-release-${{ inputs.tag || github.ref_name }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          body_path: release-notes.md
+          files: dist/*.zip
+          fail_on_unmatched_files: true
+          make_latest: true
